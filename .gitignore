@@ -11,3 +11,10 @@ send-workflow.sh
 
 # Workflows de test locaux
 *_test.json
+
+# Workflows UI (on garde seulement la version API)
+medusa_i2v_adapter_v5_very_fast_upscale_cleaned.json
+workflow_api.json
+
+# Example requests modifiés
+example-request.json
