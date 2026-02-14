@@ -3,6 +3,7 @@ FROM runpod/worker-comfyui:5.5.1-base
 
 # install custom nodes into comfyui
 RUN comfy node install --exit-on-fail comfyui-videohelpersuite@1.7.9 --mode remote
+RUN comfy node install --exit-on-fail ComfyUI_essentials --mode remote
 
 # download models into comfyui
 RUN comfy model download --url https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-dev-fp8.safetensors --relative-path models/checkpoints --filename ltx-2-19b-dev-fp8.safetensors
@@ -14,3 +15,6 @@ RUN comfy model download --url https://huggingface.co/Lightricks/LTX-2/resolve/m
 RUN comfy model download --url https://huggingface.co/MachineDelusions/LTX-2_Image2Video_Adapter_LoRa/resolve/main/LTX-2-Image2Vid-Adapter.safetensors --relative-path models/loras --filename LTX-2-Image2Vid-Adapter.safetensors
 
 RUN comfy model download --url https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-In/resolve/main/ltx-2-19b-lora-camera-control-dolly-in.safetensors --relative-path models/loras --filename ltx-2-19b-lora-camera-control-dolly-in.safetensors
+
+# Copy workflow API into image (pour simplifier les requêtes)
+COPY medusa_i2v_adapter_v5_very_fast_upscale_cleaned_api.json /comfyui/workflows/default.json

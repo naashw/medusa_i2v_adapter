@@ -1,0 +1,13 @@
+# Scripts de test (ne pas committer)
+*.sh
+test-*.sh
+check-status.sh
+run-test.sh
+send-workflow.sh
+
+# Fichiers temporaires
+*.log
+*.tmp
+
+# Workflows de test locaux
+*_test.json
