@@ -1,5 +1,5 @@
 # clean base image containing only comfyui, comfy-cli and comfyui-manager
-FROM runpod/worker-comfyui:5.5.1-base
+FROM runpod/worker-comfyui:5.7.1-base
 
 # install custom nodes into comfyui (rebuild 2026-02-14 v3)
 RUN comfy node install --exit-on-fail comfyui-videohelpersuite@1.7.9 --mode remote
