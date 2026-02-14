@@ -1,0 +1,2 @@
+# medusa_i2v_adapter_v5_very_fast_upscale_cleaned.json
+Dockerized ComfyUI workflow: medusa_i2v_adapter_v5_very_fast_upscale_cleaned.json
