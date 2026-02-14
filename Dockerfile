@@ -1,9 +1,10 @@
 # clean base image containing only comfyui, comfy-cli and comfyui-manager
 FROM runpod/worker-comfyui:5.5.1-base
 
-# install custom nodes into comfyui (rebuild 2026-02-14 v2)
+# install custom nodes into comfyui (rebuild 2026-02-14 v3)
 RUN comfy node install --exit-on-fail comfyui-videohelpersuite@1.7.9 --mode remote
 RUN comfy node install --exit-on-fail ComfyUI_essentials --mode remote
+RUN comfy node install --exit-on-fail https://github.com/Lightricks/ComfyUI-LTXVideo --mode remote
 
 # download models into comfyui
 RUN comfy model download --url https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-dev-fp8.safetensors --relative-path models/checkpoints --filename ltx-2-19b-dev-fp8.safetensors
