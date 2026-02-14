@@ -1,0 +1,452 @@
+{
+  "1": {
+    "inputs": {
+      "ckpt_name": "ltx-2-19b-dev-fp8.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {
+      "title": "Checkpoint LTX-2 fp8"
+    }
+  },
+  "2": {
+    "inputs": {
+      "text_encoder": "gemma-3-12b-it-fp8.safetensors",
+      "ckpt_name": "ltx-2-19b-dev-fp8.safetensors",
+      "device": "cpu"
+    },
+    "class_type": "LTXAVTextEncoderLoader",
+    "_meta": {
+      "title": "Text Encoder (CPU)"
+    }
+  },
+  "3": {
+    "inputs": {
+      "text": "A steady dolly-in camera movement, smooth forward motion, cinematic.",
+      "clip": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "✏️ Positive Prompt"
+    }
+  },
+  "4": {
+    "inputs": {
+      "text": "blurry, out of focus, low quality, distorted, watermark, logo, text, subtitle, banner, signature, username, compressed artifacts, jpeg artifacts, noise, grainy",
+      "clip": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "Negative Prompt"
+    }
+  },
+  "5": {
+    "inputs": {
+      "lora_name": "ltx-2-19b-distilled-lora-384.safetensors",
+      "strength_model": 0.7,
+      "model": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "LoRA Distilled (fast)"
+    }
+  },
+  "6": {
+    "inputs": {
+      "lora_name": "ltx-2-i2v-adapter.safetensors",
+      "strength_model": 0.8,
+      "model": [
+        "5",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "LoRA I2V Adapter"
+    }
+  },
+  "7": {
+    "inputs": {
+      "lora_name": "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
+      "strength_model": 1,
+      "model": [
+        "6",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "🎬 LoRA Camera — SWAP ICI"
+    }
+  },
+  "10": {
+    "inputs": {
+      "image": "Screenshot_20260213_093123.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "📸 Input Image"
+    }
+  },
+  "11": {
+    "inputs": {
+      "resize_type": "scale total pixels",
+      "resize_type.megapixels": 2,
+      "scale_method": "area",
+      "input": [
+        "10",
+        0
+      ]
+    },
+    "class_type": "ResizeImageMaskNode",
+    "_meta": {
+      "title": "Scale to ~2M pixels"
+    }
+  },
+  "12": {
+    "inputs": {
+      "resize_type": "scale to multiple",
+      "resize_type.multiple": 8,
+      "scale_method": "area",
+      "input": [
+        "11",
+        0
+      ]
+    },
+    "class_type": "ResizeImageMaskNode",
+    "_meta": {
+      "title": "Align to 64px (keeps ratio)"
+    }
+  },
+  "13": {
+    "inputs": {
+      "resize_type": "scale by multiplier",
+      "resize_type.multiplier": 0.5,
+      "scale_method": "area",
+      "input": [
+        "12",
+        0
+      ]
+    },
+    "class_type": "ResizeImageMaskNode",
+    "_meta": {
+      "title": "Half-res for Pass 1"
+    }
+  },
+  "14": {
+    "inputs": {
+      "image": [
+        "13",
+        0
+      ]
+    },
+    "class_type": "GetImageSize",
+    "_meta": {
+      "title": "Get Half-Res Dimensions"
+    }
+  },
+  "15": {
+    "inputs": {
+      "img_compression": 35,
+      "image": [
+        "12",
+        0
+      ]
+    },
+    "class_type": "LTXVPreprocess",
+    "_meta": {
+      "title": "Preprocess Image"
+    }
+  },
+  "20": {
+    "inputs": {
+      "width": [
+        "14",
+        0
+      ],
+      "height": [
+        "14",
+        1
+      ],
+      "length": 25,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLTXVLatentVideo",
+    "_meta": {
+      "title": "Empty Latent — 25 frames (half-res)"
+    }
+  },
+  "21": {
+    "inputs": {
+      "strength": 1,
+      "bypass": false,
+      "vae": [
+        "1",
+        2
+      ],
+      "image": [
+        "15",
+        0
+      ],
+      "latent": [
+        "20",
+        0
+      ]
+    },
+    "class_type": "LTXVImgToVideoInplace",
+    "_meta": {
+      "title": "Inject Image → Latent"
+    }
+  },
+  "24": {
+    "inputs": {
+      "frame_rate": 24,
+      "positive": [
+        "3",
+        0
+      ],
+      "negative": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "LTXVConditioning",
+    "_meta": {
+      "title": "Conditioning (24fps)"
+    }
+  },
+  "30": {
+    "inputs": {
+      "cfg": 1,
+      "model": [
+        "7",
+        0
+      ],
+      "positive": [
+        "24",
+        0
+      ],
+      "negative": [
+        "24",
+        1
+      ]
+    },
+    "class_type": "CFGGuider",
+    "_meta": {
+      "title": "CFG Guider Pass 1"
+    }
+  },
+  "31": {
+    "inputs": {
+      "scheduler": "simple",
+      "steps": 8,
+      "denoise": 1,
+      "model": [
+        "7",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "Scheduler Pass 1 — 8 steps"
+    }
+  },
+  "32": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "Euler Sampler"
+    }
+  },
+  "33": {
+    "inputs": {
+      "noise_seed": 616686607859868
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "Random Noise Pass 1"
+    }
+  },
+  "34": {
+    "inputs": {
+      "noise": [
+        "33",
+        0
+      ],
+      "guider": [
+        "30",
+        0
+      ],
+      "sampler": [
+        "32",
+        0
+      ],
+      "sigmas": [
+        "31",
+        0
+      ],
+      "latent_image": [
+        "21",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "⚡ PASS 1 — Generate Half-Res"
+    }
+  },
+  "80": {
+    "inputs": {
+      "model_name": "ltx-2-spatial-upscaler-x2-1.0.safetensors"
+    },
+    "class_type": "LatentUpscaleModelLoader",
+    "_meta": {
+      "title": "Load Spatial Upscaler x2"
+    }
+  },
+  "81": {
+    "inputs": {
+      "samples": [
+        "34",
+        0
+      ],
+      "upscale_model": [
+        "80",
+        0
+      ],
+      "vae": [
+        "1",
+        2
+      ]
+    },
+    "class_type": "LTXVLatentUpsampler",
+    "_meta": {
+      "title": "🔺 Upscale Latent 2x"
+    }
+  },
+  "85": {
+    "inputs": {
+      "cfg": 1,
+      "model": [
+        "7",
+        0
+      ],
+      "positive": [
+        "24",
+        0
+      ],
+      "negative": [
+        "24",
+        1
+      ]
+    },
+    "class_type": "CFGGuider",
+    "_meta": {
+      "title": "CFG Guider Pass 2"
+    }
+  },
+  "86": {
+    "inputs": {
+      "scheduler": "simple",
+      "steps": 4,
+      "denoise": 0.4,
+      "model": [
+        "7",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "Scheduler Pass 2 — 4 steps refinement"
+    }
+  },
+  "87": {
+    "inputs": {
+      "noise_seed": 616686607859868
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "Random Noise Pass 2"
+    }
+  },
+  "88": {
+    "inputs": {
+      "noise": [
+        "87",
+        0
+      ],
+      "guider": [
+        "85",
+        0
+      ],
+      "sampler": [
+        "32",
+        0
+      ],
+      "sigmas": [
+        "86",
+        0
+      ],
+      "latent_image": [
+        "81",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "✨ PASS 2 — Refine Full-Res"
+    }
+  },
+  "60": {
+    "inputs": {
+      "tile_size": 512,
+      "overlap": 64,
+      "temporal_size": 4096,
+      "temporal_overlap": 8,
+      "samples": [
+        "88",
+        0
+      ],
+      "vae": [
+        "1",
+        2
+      ]
+    },
+    "class_type": "VAEDecodeTiled",
+    "_meta": {
+      "title": "VAE Decode Tiled (safe VRAM)"
+    }
+  },
+  "61": {
+    "inputs": {
+      "frame_rate": 24,
+      "loop_count": 0,
+      "filename_prefix": "medusa_spatial_upscale",
+      "format": "video/h264-mp4",
+      "pix_fmt": "yuv420p",
+      "crf": 19,
+      "save_metadata": true,
+      "trim_to_audio": false,
+      "pingpong": false,
+      "save_output": true,
+      "images": [
+        "60",
+        0
+      ]
+    },
+    "class_type": "VHS_VideoCombine",
+    "_meta": {
+      "title": "🎬 Output Video (Full-Res)"
+    }
+  }
+}
