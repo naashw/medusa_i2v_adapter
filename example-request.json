@@ -1,0 +1,341 @@
+{
+  "input": {
+    "workflow": {
+      "1": {
+        "inputs": {
+          "ckpt_name": "ltx-2-19b-dev-fp8.safetensors"
+        },
+        "class_type": "CheckpointLoaderSimple",
+        "_meta": {
+          "title": "Checkpoint LTX-2 fp8"
+        }
+      },
+      "2": {
+        "inputs": {
+          "filename": "gemma_3_12B_it_fp8_scaled.safetensors"
+        },
+        "class_type": "LTXAVTextEncoderLoader",
+        "_meta": {
+          "title": "Text Encoder (CPU)"
+        }
+      },
+      "3": {
+        "inputs": {
+          "text": "A steady dolly-in camera movement, smooth forward motion, cinematic.",
+          "clip": [
+            "2",
+            0
+          ]
+        },
+        "class_type": "CLIPTextEncode",
+        "_meta": {
+          "title": "✏️ Positive Prompt"
+        }
+      },
+      "4": {
+        "inputs": {
+          "text": "blurry, out of focus, low quality, distorted, watermark, logo, text, subtitle, banner, signature, username, compressed artifacts, jpeg artifacts, noise, grainy   ",
+          "clip": [
+            "2",
+            0
+          ]
+        },
+        "class_type": "CLIPTextEncode",
+        "_meta": {
+          "title": "Negative Prompt"
+        }
+      },
+      "5": {
+        "inputs": {
+          "filename": "ltx-2-19b-distilled-lora-384.safetensors",
+          "model": [
+            "1",
+            0
+          ]
+        },
+        "class_type": "LoraLoaderModelOnly",
+        "_meta": {
+          "title": "LoRA Distilled (fast)"
+        }
+      },
+      "6": {
+        "inputs": {
+          "filename": "LTX-2-Image2Vid-Adapter.safetensors",
+          "model": [
+            "5",
+            0
+          ]
+        },
+        "class_type": "LoraLoaderModelOnly",
+        "_meta": {
+          "title": "LoRA I2V Adapter"
+        }
+      },
+      "7": {
+        "inputs": {
+          "filename": "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
+          "model": [
+            "6",
+            0
+          ]
+        },
+        "class_type": "LoraLoaderModelOnly",
+        "_meta": {
+          "title": "🎬 LoRA Camera — SWAP ICI"
+        }
+      },
+      "10": {
+        "inputs": {
+          "image": "Screenshot_20260213_093123.png"
+        },
+        "class_type": "LoadImage",
+        "_meta": {
+          "title": "📸 Input Image"
+        }
+      },
+      "11": {
+        "inputs": {
+          "text": "scale total pixels",
+          "input": [
+            "10",
+            0
+          ]
+        },
+        "class_type": "ResizeImageMaskNode",
+        "_meta": {
+          "title": "Scale to ~2M pixels"
+        }
+      },
+      "12": {
+        "inputs": {
+          "text": "scale to multiple",
+          "input": [
+            "11",
+            0
+          ]
+        },
+        "class_type": "ResizeImageMaskNode",
+        "_meta": {
+          "title": "Align to 64px (keeps ratio)"
+        }
+      },
+      "13": {
+        "inputs": {
+          "text": "scale by multiplier",
+          "input": [
+            "12",
+            0
+          ]
+        },
+        "class_type": "ResizeImageMaskNode",
+        "_meta": {
+          "title": "Half-res for Pass 1"
+        }
+      },
+      "14": {
+        "inputs": {
+          "text": "width: 972, height: 536\n batch size: 1",
+          "image": [
+            "13",
+            0
+          ]
+        },
+        "class_type": "GetImageSize",
+        "_meta": {
+          "title": "Get Half-Res Dimensions"
+        }
+      },
+      "15": {
+        "inputs": {
+          "value": 35,
+          "image": [
+            "12",
+            0
+          ]
+        },
+        "class_type": "LTXVPreprocess",
+        "_meta": {
+          "title": "Preprocess Image"
+        }
+      },
+      "20": {
+        "inputs": {
+          "value": 768,
+          "width": [
+            "14",
+            0
+          ],
+          "height": [
+            "14",
+            1
+          ]
+        },
+        "class_type": "EmptyLTXVLatentVideo",
+        "_meta": {
+          "title": "Empty Latent — 25 frames"
+        }
+      },
+      "21": {
+        "inputs": {
+          "value": 1,
+          "vae": [
+            "1",
+            2
+          ],
+          "image": [
+            "15",
+            0
+          ],
+          "latent": [
+            "20",
+            0
+          ]
+        },
+        "class_type": "LTXVImgToVideoInplace",
+        "_meta": {
+          "title": "Inject Image → Latent"
+        }
+      },
+      "24": {
+        "inputs": {
+          "value": 24,
+          "positive": [
+            "3",
+            0
+          ],
+          "negative": [
+            "4",
+            0
+          ]
+        },
+        "class_type": "LTXVConditioning",
+        "_meta": {
+          "title": "Conditioning (24fps)"
+        }
+      },
+      "30": {
+        "inputs": {
+          "value": 1,
+          "model": [
+            "7",
+            0
+          ],
+          "positive": [
+            "24",
+            0
+          ],
+          "negative": [
+            "24",
+            1
+          ]
+        },
+        "class_type": "CFGGuider",
+        "_meta": {
+          "title": "CFG Guider"
+        }
+      },
+      "31": {
+        "inputs": {
+          "text": "simple",
+          "model": [
+            "7",
+            0
+          ]
+        },
+        "class_type": "BasicScheduler",
+        "_meta": {
+          "title": "Scheduler — 8 steps"
+        }
+      },
+      "32": {
+        "inputs": {
+          "text": "euler"
+        },
+        "class_type": "KSamplerSelect",
+        "_meta": {
+          "title": "Euler Sampler"
+        }
+      },
+      "33": {
+        "inputs": {
+          "value": 616686607859868
+        },
+        "class_type": "RandomNoise",
+        "_meta": {
+          "title": "Random Noise"
+        }
+      },
+      "34": {
+        "inputs": {
+          "noise": [
+            "33",
+            0
+          ],
+          "guider": [
+            "30",
+            0
+          ],
+          "sampler": [
+            "32",
+            0
+          ],
+          "sigmas": [
+            "31",
+            0
+          ],
+          "latent_image": [
+            "21",
+            0
+          ]
+        },
+        "class_type": "SamplerCustomAdvanced",
+        "_meta": {
+          "title": "⚡ GENERATE VIDEO"
+        }
+      },
+      "60": {
+        "inputs": {
+          "value": 512,
+          "samples": [
+            "34",
+            0
+          ],
+          "vae": [
+            "1",
+            2
+          ]
+        },
+        "class_type": "VAEDecodeTiled",
+        "_meta": {
+          "title": "VAE Decode Tiled (safe VRAM)"
+        }
+      },
+      "61": {
+        "inputs": {
+          "value": 24,
+          "images": [
+            "70",
+            0
+          ]
+        },
+        "class_type": "VHS_VideoCombine",
+        "_meta": {
+          "title": "🎬 Output Video"
+        }
+      },
+      "70": {
+        "inputs": {
+          "text": "scale total pixels",
+          "input": [
+            "60",
+            0
+          ]
+        },
+        "class_type": "ResizeImageMaskNode",
+        "_meta": {
+          "title": "📐 Scale to 720p"
+        }
+      }
+    }
+  }
+}
