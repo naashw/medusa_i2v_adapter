@@ -12,7 +12,8 @@ import time
 import requests
 import runpod
 
-# Import du handler original
+# Import du handler original (chdir requis pour les imports internes de worker-comfyui)
+os.chdir("/worker-comfyui")
 sys.path.insert(0, "/worker-comfyui")
 from handler import handler as original_handler
 
