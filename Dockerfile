@@ -9,33 +9,19 @@ RUN comfy node install comfyui-videohelpersuite@1.7.9 && \
     comfy node install ComfyUI_essentials && \
     comfy node install https://github.com/Lightricks/ComfyUI-LTXVideo
 
-# Download LTX-2 models
-RUN comfy model download \
-    --url https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-dev-fp8.safetensors \
-    --relative-path models/checkpoints \
-    --filename ltx-2-19b-dev-fp8.safetensors
-
-RUN comfy model download \
-    --url https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors \
-    --relative-path models/clip \
-    --filename gemma_3_12B_it_fp8_scaled.safetensors
-
-RUN comfy model download \
-    --url https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-distilled-lora-384.safetensors \
-    --relative-path models/loras \
-    --filename ltx-2-19b-distilled-lora-384.safetensors
-
-RUN comfy model download \
-    --url https://huggingface.co/MachineDelusions/LTX-2_Image2Video_Adapter_LoRa/resolve/main/LTX-2-Image2Vid-Adapter.safetensors \
-    --relative-path models/loras \
-    --filename LTX-2-Image2Vid-Adapter.safetensors
-
-RUN comfy model download \
-    --url https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-In/resolve/main/ltx-2-19b-lora-camera-control-dolly-in.safetensors \
-    --relative-path models/loras \
-    --filename ltx-2-19b-lora-camera-control-dolly-in.safetensors
-
-RUN comfy model download \
-    --url https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-spatial-upscaler-x2-1.0.safetensors \
-    --relative-path models/latent_upscale_models \
-    --filename ltx-2-spatial-upscaler-x2-1.0.safetensors
+# Download LTX-2 models in parallel for faster build
+RUN mkdir -p /comfyui/models/{checkpoints,clip,loras,latent_upscale_models} && \
+    cd /comfyui && \
+    wget -q -O models/checkpoints/ltx-2-19b-dev-fp8.safetensors \
+    https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-dev-fp8.safetensors & \
+    wget -q -O models/clip/gemma_3_12B_it_fp8_scaled.safetensors \
+    https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors & \
+    wget -q -O models/loras/ltx-2-19b-distilled-lora-384.safetensors \
+    https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-distilled-lora-384.safetensors & \
+    wget -q -O models/loras/LTX-2-Image2Vid-Adapter.safetensors \
+    https://huggingface.co/MachineDelusions/LTX-2_Image2Video_Adapter_LoRa/resolve/main/LTX-2-Image2Vid-Adapter.safetensors & \
+    wget -q -O models/loras/ltx-2-19b-lora-camera-control-dolly-in.safetensors \
+    https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-In/resolve/main/ltx-2-19b-lora-camera-control-dolly-in.safetensors & \
+    wget -q -O models/latent_upscale_models/ltx-2-spatial-upscaler-x2-1.0.safetensors \
+    https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-spatial-upscaler-x2-1.0.safetensors & \
+    wait
