@@ -1,9 +1,11 @@
 """
 Wrapper autour du handler worker-comfyui pour RunPod Serverless.
+- Supporte les images en input via URL (https) ou base64
 - Copie les videos/images generees vers le network volume
 - Cleanup du disque ephemere apres chaque job
 """
 
+import base64
 import glob
 import os
 import shutil
@@ -99,11 +101,41 @@ def purge_comfyui_history() -> None:
         print(f"[wrapper] Erreur purge historique: {e}")
 
 
+def resolve_image_urls(job: dict) -> dict:
+    """Convertit les URLs d'images en base64 avant de passer au handler original."""
+    images = job.get("input", {}).get("images")
+    if not images:
+        return job
+
+    for img in images:
+        image_data = img.get("image", "")
+        if not image_data.startswith(("http://", "https://")):
+            continue
+
+        url = image_data
+        name = img.get("name", "input.png")
+        print(f"[wrapper] Telechargement image: {url}")
+        try:
+            resp = requests.get(url, timeout=30)
+            resp.raise_for_status()
+            img["image"] = base64.b64encode(resp.content).decode("utf-8")
+            size_kb = len(resp.content) / 1024
+            print(f"[wrapper] Image {name}: {size_kb:.0f} KB telecharge, converti en base64")
+        except requests.RequestException as e:
+            print(f"[wrapper] Erreur telechargement {url}: {e}")
+            raise ValueError(f"Impossible de telecharger l'image: {url} - {e}")
+
+    return job
+
+
 def wrapped_handler(job: dict) -> dict:
     """Handler avec collecte des outputs sur le volume et cleanup post-job."""
     job_id = job.get("id", f"unknown-{int(time.time())}")
     disk_before = get_disk_usage_mb()
     print(f"[wrapper] Job {job_id} - Disque avant: {disk_before:.0f} MB")
+
+    # Convertir les URLs en base64 si necessaire
+    job = resolve_image_urls(job)
 
     try:
         result = original_handler(job)
