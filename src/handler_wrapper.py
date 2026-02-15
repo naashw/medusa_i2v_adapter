@@ -11,6 +11,7 @@ import glob
 import hashlib
 import json
 import os
+import random
 import shutil
 import sys
 import time
@@ -145,6 +146,33 @@ def clear_comfyui_cache() -> None:
         print(f"[wrapper] Erreur vidage cache: {e}")
 
 
+def inject_random_seed(job: dict) -> dict:
+    """Injecte des seeds aleatoires dans tous les noeuds RandomNoise du workflow."""
+    workflow = job.get("input", {}).get("workflow")
+    if not workflow or not isinstance(workflow, dict):
+        return job
+
+    for node_id, node_data in workflow.items():
+        if not isinstance(node_data, dict):
+            continue
+
+        class_type = node_data.get("class_type")
+        if class_type != "RandomNoise":
+            continue
+
+        inputs = node_data.get("inputs")
+        if not inputs or not isinstance(inputs, dict):
+            continue
+
+        if "noise_seed" in inputs:
+            old_seed = inputs["noise_seed"]
+            new_seed = random.randint(0, 2**53 - 1)
+            inputs["noise_seed"] = new_seed
+            print(f"[wrapper] Node {node_id} ({class_type}): seed {old_seed} -> {new_seed}")
+
+    return job
+
+
 def compute_input_hash(job: dict) -> str:
     """Hash deterministe du workflow + images pour dedup."""
     payload = job.get("input", {})
@@ -223,6 +251,9 @@ def wrapped_handler(job: dict) -> dict:
     print(f"[wrapper] Job {job_id} - Disque avant: {disk_before:.0f} MB")
 
     job = resolve_image_urls(job)
+
+    # Injecter des seeds aleatoires pour eviter cache dedup avec memes inputs
+    job = inject_random_seed(job)
 
     # Dedup : si meme workflow + memes images, retourner le cache
     input_hash = compute_input_hash(job)

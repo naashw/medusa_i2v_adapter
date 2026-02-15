@@ -51,7 +51,6 @@ echo "[medusa] Models dir: $MODELS_DIR"
 mkdir -p "${MODELS_DIR}/checkpoints"
 mkdir -p "${MODELS_DIR}/text_encoders"
 mkdir -p "${MODELS_DIR}/loras"
-mkdir -p "${MODELS_DIR}/latent_upscale_models"
 
 # -----------------------------------------------
 # 3. extra_model_paths.yaml (ComfyUI -> workspace)
@@ -66,7 +65,6 @@ medusa:
     checkpoints: checkpoints
     loras: loras
     text_encoders: text_encoders
-    latent_upscale_models: latent_upscale_models
 EOF
     echo "[medusa] extra_model_paths.yaml configure (genere dynamiquement)"
 fi
@@ -142,18 +140,6 @@ download_model \
     "${MODELS_DIR}/loras" 100000000 &
 DOWNLOAD_PIDS+=($!)
 
-# --- Spatial upscaler (>50MB) ---
-download_model \
-    "https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-spatial-upscaler-x2-1.0.safetensors" \
-    "${MODELS_DIR}/latent_upscale_models" 50000000 &
-DOWNLOAD_PIDS+=($!)
-
-# --- Temporal upscaler (>50MB) ---
-download_model \
-    "https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-temporal-upscaler-x2-1.0.safetensors" \
-    "${MODELS_DIR}/latent_upscale_models" 50000000 &
-DOWNLOAD_PIDS+=($!)
-
 # --- Camera LoRAs (>100MB each) ---
 CAMERA_LORAS=(
     "https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-In/resolve/main/ltx-2-19b-lora-camera-control-dolly-in.safetensors"
@@ -216,6 +202,7 @@ EOF
         --port 8188 \
         --disable-auto-launch \
         --disable-metadata \
+        --disable-smart-memory \
         --extra-model-paths-config "${COMFYUI_DIR}/extra_model_paths.yaml" &
     COMFYUI_PID=$!
     CHILD_PIDS+=($COMFYUI_PID)
