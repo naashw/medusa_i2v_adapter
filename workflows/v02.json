@@ -47,24 +47,12 @@
           "title": "Negative Prompt"
         }
       },
-      "8": {
-        "inputs": {
-          "model": [
-            "1",
-            0
-          ]
-        },
-        "class_type": "LTXQ8Patch",
-        "_meta": {
-          "title": "Q8 Kernels Patcher"
-        }
-      },
       "5": {
         "inputs": {
           "lora_name": "ltx-2-19b-distilled-lora-384.safetensors",
           "strength_model": 0.7,
           "model": [
-            "8",
+            "1",
             0
           ]
         },
