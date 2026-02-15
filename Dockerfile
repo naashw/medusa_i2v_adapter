@@ -2,19 +2,23 @@
 # Image legere : les modeles sont telecharges au runtime sur le network volume
 # Supporte 2 modes : GPU Pod (interactif) et RunPod Serverless (API)
 #
+# Multi-stage build : devel (compile) -> runtime (execute)
 # Build:  DOCKER_BUILDKIT=1 docker build -t medusa-i2v .
 #
 # GPU Pod:     docker run --gpus all -p 8188:8188 -p 8888:8888 -v /workspace:/workspace medusa-i2v
 # Serverless:  docker run --gpus all -e SERVERLESS=true -v /workspace:/workspace medusa-i2v
 
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+# ============================================================
+# Stage 1 : builder (compile PyTorch, Q8-Kernels, extensions)
+# ============================================================
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_PREFER_BINARY=1 \
     PYTHONUNBUFFERED=1 \
     CMAKE_BUILD_PARALLEL_LEVEL=8
 
-# --- System dependencies ---
+# --- Build dependencies + Python 3.11 ---
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && \
     apt-get install -y --no-install-recommends software-properties-common && \
@@ -22,9 +26,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         python3.11 python3.11-venv python3.11-dev python3-pip \
-        curl ffmpeg ninja-build git aria2 git-lfs wget \
-        libgl1 libglib2.0-0 build-essential gcc \
-        google-perftools tini && \
+        build-essential gcc ninja-build git && \
     ln -sf /usr/bin/python3.11 /usr/bin/python && \
     ln -sf /usr/bin/pip3 /usr/bin/pip && \
     python3.11 -m venv /opt/venv && \
@@ -83,7 +85,35 @@ RUN git clone https://github.com/runpod-workers/worker-comfyui.git /worker-comfy
     cd /worker-comfyui && git checkout 0e2bf226f9ee3d7b6725f61ffbee652b67b6d172 && \
     rm -rf .git
 
-# --- Workflows API (seuls les workflows API sont copies dans l'image) ---
+# ============================================================
+# Stage 2 : runtime (pas de compilateur, pas de headers)
+# ============================================================
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH"
+
+# --- Runtime dependencies only ---
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends software-properties-common && \
+    add-apt-repository ppa:deadsnakes/ppa && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python3.11 \
+        curl ffmpeg aria2 git-lfs wget \
+        libgl1 libglib2.0-0 \
+        google-perftools tini && \
+    ln -sf /usr/bin/python3.11 /usr/bin/python && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# --- Copy depuis builder ---
+COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /ComfyUI /ComfyUI
+COPY --from=builder /worker-comfyui /worker-comfyui
+
+# --- Workflows API ---
 RUN mkdir -p /workflows
 COPY workflows/medusa_i2v_v5_fast_api.json /workflows/
 COPY workflows/medusa_i2v_1pass_upscale_api.json /workflows/
