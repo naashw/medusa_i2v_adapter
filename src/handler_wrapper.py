@@ -1,8 +1,8 @@
 """
 Wrapper autour du handler worker-comfyui pour RunPod Serverless.
 - Supporte les images en input via URL (https) ou base64
-- Retourne les outputs via URL presignee S3 (si configure) ou base64 (fallback)
-- Backup sur le network volume
+- Sauvegarde les outputs sur le network volume
+- Retourne les paths volume (accessible via RunPod S3 API + boto3)
 - Cleanup du disque ephemere apres chaque job
 """
 
@@ -11,12 +11,10 @@ import glob
 import os
 import shutil
 import sys
-import tempfile
 import time
 
 import requests
 import runpod
-from runpod.serverless.utils import rp_upload
 
 # Import du handler original
 sys.path.insert(0, "/worker-comfyui")
@@ -28,7 +26,8 @@ CLEANUP_DIRS = ["/ComfyUI/output", "/ComfyUI/input", "/ComfyUI/temp"]
 VIDEO_EXTENSIONS = {".mp4", ".webm", ".gif", ".webp"}
 SKIP_FILES = {"_output_images_will_be_put_here"}
 OUTPUT_VOLUME_DIR = os.environ.get("OUTPUT_VOLUME_DIR", "/runpod-volume/output")
-S3_ENABLED = bool(os.environ.get("BUCKET_ENDPOINT_URL"))
+# Chemin racine du volume (pour calculer les paths relatifs S3)
+VOLUME_ROOT = os.environ.get("VOLUME_ROOT", "/runpod-volume")
 
 
 def get_disk_usage_mb(path: str = "/") -> float:
@@ -37,13 +36,8 @@ def get_disk_usage_mb(path: str = "/") -> float:
     return stat.used / (1024 * 1024)
 
 
-def upload_to_s3(job_id: str, filepath: str) -> str:
-    """Upload un fichier vers S3 via le SDK RunPod, retourne l'URL presignee."""
-    return rp_upload.upload_image(job_id, filepath)
-
-
 def collect_outputs(source_dir: str, job_id: str) -> list[dict]:
-    """Collecte les outputs : upload S3 (presigned URL) ou encode base64."""
+    """Copie les outputs sur le volume et retourne les paths relatifs."""
     outputs: list[dict] = []
 
     if not os.path.isdir(source_dir):
@@ -57,12 +51,8 @@ def collect_outputs(source_dir: str, job_id: str) -> list[dict]:
     if not files:
         return outputs
 
-    # Backup sur le network volume
     dest_dir = os.path.join(OUTPUT_VOLUME_DIR, job_id)
     os.makedirs(dest_dir, exist_ok=True)
-
-    mode = "s3" if S3_ENABLED else "base64"
-    print(f"[wrapper] Mode output: {mode}")
 
     for filepath in files:
         filename = os.path.basename(filepath)
@@ -71,33 +61,22 @@ def collect_outputs(source_dir: str, job_id: str) -> list[dict]:
         size_mb = os.path.getsize(filepath) / (1024 * 1024)
 
         try:
-            # Backup sur le volume
-            shutil.copy2(filepath, os.path.join(dest_dir, filename))
+            dest_path = os.path.join(dest_dir, filename)
+            shutil.copy2(filepath, dest_path)
 
-            if S3_ENABLED:
-                s3_url = upload_to_s3(job_id, filepath)
-                outputs.append({
-                    "filename": filename,
-                    "type": "s3_url",
-                    "content_type": file_type,
-                    "size_mb": round(size_mb, 2),
-                    "data": s3_url,
-                })
-                print(f"[wrapper] {filename}: {size_mb:.1f} MB -> S3: {s3_url[:80]}...")
-            else:
-                with open(filepath, "rb") as f:
-                    raw = f.read()
-                b64_data = base64.b64encode(raw).decode("utf-8")
-                outputs.append({
-                    "filename": filename,
-                    "type": "base64",
-                    "content_type": file_type,
-                    "size_mb": round(size_mb, 2),
-                    "data": b64_data,
-                })
-                print(f"[wrapper] {filename}: {size_mb:.1f} MB -> base64")
-        except Exception as e:
-            print(f"[wrapper] Erreur traitement {filename}: {e}")
+            # Path relatif au volume (= cle S3 pour boto3)
+            s3_key = os.path.relpath(dest_path, VOLUME_ROOT)
+
+            outputs.append({
+                "filename": filename,
+                "content_type": file_type,
+                "size_mb": round(size_mb, 2),
+                "volume_path": dest_path,
+                "s3_key": s3_key,
+            })
+            print(f"[wrapper] {filename}: {size_mb:.1f} MB ({file_type}) -> {dest_dir}/")
+        except OSError as e:
+            print(f"[wrapper] Erreur copie {filepath}: {e}")
 
     return outputs
 
@@ -160,12 +139,11 @@ def resolve_image_urls(job: dict) -> dict:
 
 
 def wrapped_handler(job: dict) -> dict:
-    """Handler avec outputs S3/base64 dans la reponse et cleanup post-job."""
+    """Handler avec sauvegarde volume et cleanup post-job."""
     job_id = job.get("id", f"unknown-{int(time.time())}")
     disk_before = get_disk_usage_mb()
     print(f"[wrapper] Job {job_id} - Disque avant: {disk_before:.0f} MB")
 
-    # Convertir les URLs en base64 si necessaire
     job = resolve_image_urls(job)
 
     try:
@@ -175,7 +153,7 @@ def wrapped_handler(job: dict) -> dict:
         purge_comfyui_history()
         raise
 
-    # Collecter et uploader/encoder les outputs AVANT cleanup
+    # Sauvegarder les outputs sur le volume AVANT cleanup
     outputs = collect_outputs(COMFYUI_OUTPUT_DIR, job_id)
 
     # Cleanup du disque ephemere
@@ -189,15 +167,14 @@ def wrapped_handler(job: dict) -> dict:
         f"disque apres: {disk_after:.0f} MB (libere: {freed:.0f} MB)"
     )
 
-    # Construire la reponse avec les outputs
+    # Construire la reponse avec les paths volume
     if not isinstance(result, dict):
         result = {"original_result": result}
 
     if outputs:
         videos = [o for o in outputs if o["content_type"] == "video"]
         images = [o for o in outputs if o["content_type"] == "image"]
-        mode = "S3 presigned" if S3_ENABLED else "base64"
-        print(f"[wrapper] Reponse: {len(videos)} video(s), {len(images)} image(s) via {mode}")
+        print(f"[wrapper] Reponse: {len(videos)} video(s), {len(images)} image(s)")
 
         result["images"] = outputs
         result.pop("status", None)
