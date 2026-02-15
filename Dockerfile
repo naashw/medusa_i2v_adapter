@@ -44,7 +44,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # --- LTX-Video Q8 Kernels (FP8 optimise, requiert CUDA 12.8+) ---
 # Le setup.py appelle torch.cuda.get_device_capability() au build,
 # ce qui echoue sans GPU. On patche pour utiliser un fallback env var.
-# TORCH_CUDA_ARCH_LIST cible: A100(8.0), A40(8.6), L40S(8.9), H100(9.0)
+# TORCH_CUDA_ARCH_LIST cible: RTX 4090 / L40S (8.9)
 RUN --mount=type=cache,target=/root/.cache/pip \
     git clone --filter=blob:none --quiet https://github.com/Lightricks/LTX-Video-Q8-Kernels.git /tmp/q8-kernels && \
     cd /tmp/q8-kernels && git submodule update --init --recursive -q && \
@@ -55,7 +55,7 @@ old = 'major, minor = torch.cuda.get_device_capability(0)'
 new = '''try:\n        major, minor = torch.cuda.get_device_capability(0)\n    except RuntimeError:\n        import os; return os.environ.get('Q8_DEVICE_ARCH', 'ada')'''
 open(p, 'w').write(t.replace(old, new))
 " && \
-    TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0" Q8_DEVICE_ARCH=ada \
+    TORCH_CUDA_ARCH_LIST="8.9" Q8_DEVICE_ARCH=ada \
     pip install --no-build-isolation . && \
     rm -rf /tmp/q8-kernels
 
