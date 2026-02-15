@@ -89,6 +89,9 @@ COPY src/extra_model_paths.yaml /extra_model_paths.yaml
 COPY src/start.sh /start.sh
 RUN chmod +x /start.sh
 
+# --- Handler wrapper (cleanup post-job) ---
+COPY src/handler_wrapper.py /handler_wrapper.py
+
 EXPOSE 8188 8888
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \

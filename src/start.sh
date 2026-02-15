@@ -222,8 +222,7 @@ if [ "${SERVERLESS:-}" = "true" ] || [ -n "${RUNPOD_ENDPOINT_ID:-}" ]; then
     fi
 
     echo "[medusa] Demarrage du handler RunPod..."
-    cd /worker-comfyui
-    exec python handler.py
+    exec python /handler_wrapper.py
 
 else
     # ===== MODE GPU POD =====
