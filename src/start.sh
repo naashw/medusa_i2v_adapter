@@ -227,8 +227,7 @@ EOF
     COMFYUI_PID=$!
     CHILD_PIDS+=($COMFYUI_PID)
 
-    # Le handler_wrapper.py gere l'attente de readiness (poll /object_info + verification noeuds)
-    echo "[medusa] Demarrage du handler RunPod (readiness geree par le wrapper)..."
+    echo "[medusa] Demarrage du handler RunPod..."
     exec python /handler_wrapper.py
 
 else

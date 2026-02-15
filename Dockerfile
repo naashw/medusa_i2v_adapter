@@ -39,8 +39,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install torch \
         torchvision torchaudio \
         --index-url https://download.pytorch.org/whl/cu128
-# NOTE: torchvision/torchaudio ajoutent ~1.5GB. Tester sans si besoin de reduire l'image.
-# ComfyUI_essentials peut dependre de torchvision. Valider avant de retirer.
 
 # --- Core Python tooling (requis avant Q8-Kernels avec --no-build-isolation) ---
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -102,7 +100,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     RUNPOD_INIT_TIMEOUT=600
 
 # --- Runtime dependencies only ---
-# wget et git-lfs retires : aria2c + curl suffisent pour les telechargements
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && \
     apt-get install -y --no-install-recommends software-properties-common && \
