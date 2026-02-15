@@ -129,18 +129,29 @@ def cleanup_ephemeral(directories: list[str]) -> int:
     return removed
 
 
+def clear_comfyui_history() -> None:
+    """Vide l'historique ComfyUI sans toucher aux modeles en memoire."""
+    try:
+        requests.post(
+            f"{COMFYUI_URL}/history", json={"clear": True}, timeout=5
+        )
+        print("[wrapper] Historique ComfyUI vide")
+    except requests.RequestException as e:
+        print(f"[wrapper] Erreur vidage historique: {e}")
+
+
 def clear_comfyui_cache() -> None:
-    """Vide le cache d'execution et l'historique ComfyUI (sans decharger les modeles)."""
+    """Vide le cache d'execution, l'historique ET decharge les modeles de la VRAM."""
     try:
         requests.post(
             f"{COMFYUI_URL}/free",
-            json={"unload_models": False, "free_memory": True},
+            json={"unload_models": True, "free_memory": True},
             timeout=5,
         )
         requests.post(
             f"{COMFYUI_URL}/history", json={"clear": True}, timeout=5
         )
-        print("[wrapper] Cache + historique ComfyUI vides")
+        print("[wrapper] Cache + historique + modeles ComfyUI vides")
     except requests.RequestException as e:
         print(f"[wrapper] Erreur vidage cache: {e}")
 
@@ -232,8 +243,8 @@ def wrapped_handler(job: dict) -> dict:
         print(f"[wrapper] Cache hit ({input_hash}) - {len(cached)} fichier(s), skip execution")
         return {"images": cached, "cached": True}
 
-    # Vider le cache ComfyUI avant execution
-    clear_comfyui_cache()
+    # Vider l'historique ComfyUI (garde les modeles en VRAM)
+    clear_comfyui_history()
 
     # Execution avec retry pour cold start (models pas encore en VRAM)
     result = None
@@ -258,7 +269,7 @@ def wrapped_handler(job: dict) -> dict:
                 f"retry {attempt + 1}/{MAX_RETRIES} dans {RETRY_DELAY}s "
                 f"(probable cold start, models pas encore en VRAM)..."
             )
-            clear_comfyui_cache()
+            clear_comfyui_history()
             time.sleep(RETRY_DELAY)
             continue
 
