@@ -127,18 +127,20 @@ def cleanup_ephemeral(directories: list[str]) -> int:
     return removed
 
 
-def purge_comfyui_history() -> None:
-    """Purge l'historique ComfyUI pour liberer la memoire."""
+def clear_comfyui_cache() -> None:
+    """Vide le cache d'execution et l'historique ComfyUI (sans decharger les modeles)."""
     try:
-        resp = requests.post(
+        requests.post(
+            f"{COMFYUI_URL}/free",
+            json={"unload_models": False, "free_memory": True},
+            timeout=5,
+        )
+        requests.post(
             f"{COMFYUI_URL}/history", json={"clear": True}, timeout=5
         )
-        if resp.ok:
-            print("[wrapper] Historique ComfyUI purge")
-        else:
-            print(f"[wrapper] Purge historique: HTTP {resp.status_code}")
+        print("[wrapper] Cache + historique ComfyUI vides")
     except requests.RequestException as e:
-        print(f"[wrapper] Erreur purge historique: {e}")
+        print(f"[wrapper] Erreur vidage cache: {e}")
 
 
 def resolve_image_urls(job: dict) -> dict:
@@ -176,6 +178,10 @@ def wrapped_handler(job: dict) -> dict:
 
     job = resolve_image_urls(job)
 
+    # Vider le cache avant execution (evite que ComfyUI retourne un resultat cache
+    # alors que les fichiers output ont ete supprimes au cleanup du job precedent)
+    clear_comfyui_cache()
+
     # Execution avec retry pour cold start (models pas encore en VRAM)
     result = None
     for attempt in range(MAX_RETRIES + 1):
@@ -184,7 +190,7 @@ def wrapped_handler(job: dict) -> dict:
             result = original_handler(job)
         except Exception:
             cleanup_ephemeral(CLEANUP_DIRS)
-            purge_comfyui_history()
+            clear_comfyui_cache()
             raise
 
         elapsed = time.time() - start_time
@@ -199,7 +205,7 @@ def wrapped_handler(job: dict) -> dict:
                 f"retry {attempt + 1}/{MAX_RETRIES} dans {RETRY_DELAY}s "
                 f"(probable cold start, models pas encore en VRAM)..."
             )
-            purge_comfyui_history()
+            clear_comfyui_cache()
             time.sleep(RETRY_DELAY)
             continue
 
@@ -212,7 +218,6 @@ def wrapped_handler(job: dict) -> dict:
 
     # Cleanup du disque ephemere
     removed = cleanup_ephemeral(CLEANUP_DIRS)
-    purge_comfyui_history()
 
     disk_after = get_disk_usage_mb()
     freed = disk_before - disk_after
