@@ -81,8 +81,11 @@ RUN cd /ComfyUI/custom_nodes && \
     rm -rf ComfyUI_essentials/.git
 
 # --- RunPod Serverless handler (pinned commit) ---
+# Le Dockerfile upstream aplatit src/ a la racine (ADD src/network_volume.py ./),
+# on reproduit ce comportement pour que handler.py trouve ses imports
 RUN git clone https://github.com/runpod-workers/worker-comfyui.git /worker-comfyui && \
     cd /worker-comfyui && git checkout 0e2bf226f9ee3d7b6725f61ffbee652b67b6d172 && \
+    cp src/network_volume.py . && \
     rm -rf .git
 
 # ============================================================
