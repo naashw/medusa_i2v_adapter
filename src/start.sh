@@ -72,16 +72,6 @@ EOF
 fi
 
 # -----------------------------------------------
-# 4. Copie des workflows
-# -----------------------------------------------
-WORKFLOW_DEST="${COMFYUI_DIR}/user/default/workflows"
-mkdir -p "$WORKFLOW_DEST"
-if [ -d /workflows ] && ls /workflows/*.json 1>/dev/null 2>&1; then
-    cp -n /workflows/*.json "$WORKFLOW_DEST/" 2>/dev/null || true
-    echo "[medusa] Workflows copies dans ComfyUI"
-fi
-
-# -----------------------------------------------
 # 5. Fonction de telechargement
 # -----------------------------------------------
 download_model() {

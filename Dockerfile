@@ -118,9 +118,6 @@ COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /ComfyUI /ComfyUI
 COPY --from=builder /worker-comfyui /worker-comfyui
 
-# --- Workflows API (single layer) ---
-COPY workflows/*.json /workflows/
-
 # --- Extra model paths template ---
 COPY src/extra_model_paths.yaml /extra_model_paths.yaml
 
