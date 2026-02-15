@@ -192,11 +192,14 @@ if [ "${SERVERLESS:-}" = "true" ] || [ -n "${RUNPOD_ENDPOINT_ID:-}" ]; then
     # ===== MODE SERVERLESS =====
     echo "[medusa] Mode: SERVERLESS (RunPod API)"
 
-    # Dossier output sur le network volume (persistant entre jobs)
+    # Dossiers persistants sur le network volume
     OUTPUT_DIR="${WORKSPACE}/output"
-    mkdir -p "$OUTPUT_DIR"
+    CACHE_DIR="${WORKSPACE}/cache"
+    mkdir -p "$OUTPUT_DIR" "$CACHE_DIR"
     export OUTPUT_VOLUME_DIR="$OUTPUT_DIR"
+    export CACHE_DIR="$CACHE_DIR"
     echo "[medusa] Output dir: $OUTPUT_DIR"
+    echo "[medusa] Cache dir: $CACHE_DIR"
 
     # Desactiver ComfyUI-Manager network checks (economise ~2min au cold start)
     MANAGER_DIR="${COMFYUI_DIR}/user/__manager"

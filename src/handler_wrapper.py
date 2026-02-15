@@ -8,6 +8,8 @@ Wrapper autour du handler worker-comfyui pour RunPod Serverless.
 
 import base64
 import glob
+import hashlib
+import json
 import os
 import shutil
 import sys
@@ -26,7 +28,7 @@ CLEANUP_DIRS = ["/ComfyUI/output", "/ComfyUI/input", "/ComfyUI/temp"]
 VIDEO_EXTENSIONS = {".mp4", ".webm", ".gif", ".webp"}
 SKIP_FILES = {"_output_images_will_be_put_here"}
 OUTPUT_VOLUME_DIR = os.environ.get("OUTPUT_VOLUME_DIR", "/runpod-volume/output")
-# Chemin racine du volume (pour calculer les paths relatifs S3)
+CACHE_DIR = os.environ.get("CACHE_DIR", "/runpod-volume/cache")
 VOLUME_ROOT = os.environ.get("VOLUME_ROOT", "/runpod-volume")
 
 # Cold start : noeuds requis et retry
@@ -143,6 +145,50 @@ def clear_comfyui_cache() -> None:
         print(f"[wrapper] Erreur vidage cache: {e}")
 
 
+def compute_input_hash(job: dict) -> str:
+    """Hash deterministe du workflow + images pour dedup."""
+    payload = job.get("input", {})
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def lookup_cache(input_hash: str) -> list[dict] | None:
+    """Cherche des outputs existants dans le cache volume pour ce hash."""
+    cache_path = os.path.join(CACHE_DIR, input_hash)
+    if not os.path.isdir(cache_path):
+        return None
+
+    files = [f for f in os.listdir(cache_path) if os.path.isfile(os.path.join(cache_path, f))]
+    if not files:
+        return None
+
+    outputs = []
+    for filename in files:
+        filepath = os.path.join(cache_path, filename)
+        ext = os.path.splitext(filename)[1].lower()
+        file_type = "video" if ext in VIDEO_EXTENSIONS else "image"
+        size_mb = os.path.getsize(filepath) / (1024 * 1024)
+        s3_key = os.path.relpath(filepath, VOLUME_ROOT)
+        outputs.append({
+            "filename": filename,
+            "content_type": file_type,
+            "size_mb": round(size_mb, 2),
+            "volume_path": filepath,
+            "s3_key": s3_key,
+        })
+    return outputs
+
+
+def save_to_cache(input_hash: str, source_dir: str) -> None:
+    """Copie les outputs dans le cache volume indexe par hash."""
+    cache_path = os.path.join(CACHE_DIR, input_hash)
+    os.makedirs(cache_path, exist_ok=True)
+    for f in os.listdir(source_dir):
+        src = os.path.join(source_dir, f)
+        if os.path.isfile(src) and f not in SKIP_FILES:
+            shutil.copy2(src, os.path.join(cache_path, f))
+
+
 def resolve_image_urls(job: dict) -> dict:
     """Convertit les URLs d'images en base64 avant de passer au handler original."""
     images = job.get("input", {}).get("images")
@@ -178,8 +224,14 @@ def wrapped_handler(job: dict) -> dict:
 
     job = resolve_image_urls(job)
 
-    # Vider le cache avant execution (evite que ComfyUI retourne un resultat cache
-    # alors que les fichiers output ont ete supprimes au cleanup du job precedent)
+    # Dedup : si meme workflow + memes images, retourner le cache
+    input_hash = compute_input_hash(job)
+    cached = lookup_cache(input_hash)
+    if cached:
+        print(f"[wrapper] Cache hit ({input_hash}) - {len(cached)} fichier(s), skip execution")
+        return {"images": cached, "cached": True}
+
+    # Vider le cache ComfyUI avant execution
     clear_comfyui_cache()
 
     # Execution avec retry pour cold start (models pas encore en VRAM)
@@ -215,6 +267,11 @@ def wrapped_handler(job: dict) -> dict:
 
     # Sauvegarder les outputs sur le volume AVANT cleanup
     outputs = collect_outputs(COMFYUI_OUTPUT_DIR, job_id)
+
+    # Sauvegarder dans le cache dedup
+    if outputs:
+        save_to_cache(input_hash, COMFYUI_OUTPUT_DIR)
+        print(f"[wrapper] Cache sauvegarde ({input_hash})")
 
     # Cleanup du disque ephemere
     removed = cleanup_ephemeral(CLEANUP_DIRS)
