@@ -29,6 +29,33 @@ OUTPUT_VOLUME_DIR = os.environ.get("OUTPUT_VOLUME_DIR", "/runpod-volume/output")
 # Chemin racine du volume (pour calculer les paths relatifs S3)
 VOLUME_ROOT = os.environ.get("VOLUME_ROOT", "/runpod-volume")
 
+# Cold start : noeuds requis et retry
+REQUIRED_NODES = {"LTXVImgToVideoInplace", "LTXVConditioning", "VHS_VideoCombine"}
+COMFYUI_READY_TIMEOUT = 120
+MAX_RETRIES = 10
+RETRY_DELAY = 5  # secondes entre chaque retry
+MIN_EXEC_TIME = 10  # secondes - en dessous, execution suspecte
+
+
+def wait_for_comfyui_ready(timeout: int = COMFYUI_READY_TIMEOUT) -> None:
+    """Attend que les custom nodes ComfyUI soient charges avant d'accepter des jobs."""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            resp = requests.get(f"{COMFYUI_URL}/object_info", timeout=10)
+            if resp.ok:
+                nodes = set(resp.json().keys())
+                missing = REQUIRED_NODES - nodes
+                if not missing:
+                    elapsed = time.time() - start
+                    print(f"[wrapper] ComfyUI pret ({elapsed:.0f}s, {len(nodes)} noeuds charges)")
+                    return
+                print(f"[wrapper] Attente noeuds manquants: {missing}")
+        except requests.RequestException:
+            pass
+        time.sleep(2)
+    print(f"[wrapper] WARNING: timeout {timeout}s, noeuds pas confirmes - demarrage quand meme")
+
 
 def get_disk_usage_mb(path: str = "/") -> float:
     """Retourne l'espace utilise en MB."""
@@ -139,19 +166,43 @@ def resolve_image_urls(job: dict) -> dict:
 
 
 def wrapped_handler(job: dict) -> dict:
-    """Handler avec sauvegarde volume et cleanup post-job."""
+    """Handler avec sauvegarde volume, retry cold start et cleanup post-job."""
     job_id = job.get("id", f"unknown-{int(time.time())}")
     disk_before = get_disk_usage_mb()
     print(f"[wrapper] Job {job_id} - Disque avant: {disk_before:.0f} MB")
 
     job = resolve_image_urls(job)
 
-    try:
-        result = original_handler(job)
-    except Exception:
-        cleanup_ephemeral(CLEANUP_DIRS)
-        purge_comfyui_history()
-        raise
+    # Execution avec retry pour cold start (models pas encore en VRAM)
+    result = None
+    for attempt in range(MAX_RETRIES + 1):
+        start_time = time.time()
+        try:
+            result = original_handler(job)
+        except Exception:
+            cleanup_ephemeral(CLEANUP_DIRS)
+            purge_comfyui_history()
+            raise
+
+        elapsed = time.time() - start_time
+        output_files = [
+            f for f in glob.glob(os.path.join(COMFYUI_OUTPUT_DIR, "*"))
+            if os.path.isfile(f) and os.path.basename(f) not in SKIP_FILES
+        ]
+
+        if elapsed < MIN_EXEC_TIME and not output_files and attempt < MAX_RETRIES:
+            print(
+                f"[wrapper] Execution suspecte ({elapsed:.1f}s, 0 output) - "
+                f"retry {attempt + 1}/{MAX_RETRIES} dans {RETRY_DELAY}s "
+                f"(probable cold start, models pas encore en VRAM)..."
+            )
+            purge_comfyui_history()
+            time.sleep(RETRY_DELAY)
+            continue
+
+        if not output_files and elapsed < MIN_EXEC_TIME:
+            print(f"[wrapper] WARNING: execution {elapsed:.1f}s sans output apres {MAX_RETRIES} retries")
+        break
 
     # Sauvegarder les outputs sur le volume AVANT cleanup
     outputs = collect_outputs(COMFYUI_OUTPUT_DIR, job_id)
@@ -184,4 +235,6 @@ def wrapped_handler(job: dict) -> dict:
     return result
 
 
+print("[wrapper] Verification noeuds custom ComfyUI...")
+wait_for_comfyui_ready()
 runpod.serverless.start({"handler": wrapped_handler})
