@@ -32,10 +32,14 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 ENV PATH="/opt/venv/bin:$PATH"
 
-# --- PyTorch nightly (CUDA 12.8) ---
+# --- PyTorch stable (CUDA 12.8) ---
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --pre torch torchvision torchaudio \
-        --index-url https://download.pytorch.org/whl/nightly/cu128
+    pip install torch torchvision torchaudio \
+        --index-url https://download.pytorch.org/whl/cu128
+
+# --- LTX-Video Q8 Kernels (FP8 optimise, requiert CUDA 12.8+) ---
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-build-isolation git+https://github.com/Lightricks/LTX-Video-Q8-Kernels.git
 
 # --- Core Python tooling ---
 RUN --mount=type=cache,target=/root/.cache/pip \
