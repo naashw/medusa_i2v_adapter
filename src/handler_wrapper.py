@@ -12,9 +12,11 @@ import time
 import requests
 import runpod
 
-# Import du handler original (chdir requis pour les imports internes de worker-comfyui)
-os.chdir("/worker-comfyui")
+# Import du handler original
+# network_volume est dans /worker-comfyui/src/, handler.py a la racine
+sys.path.insert(0, "/worker-comfyui/src")
 sys.path.insert(0, "/worker-comfyui")
+os.chdir("/worker-comfyui")
 from handler import handler as original_handler
 
 COMFYUI_URL = "http://127.0.0.1:8188"
