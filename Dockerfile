@@ -37,13 +37,27 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install torch torchvision torchaudio \
         --index-url https://download.pytorch.org/whl/cu128
 
-# --- LTX-Video Q8 Kernels (FP8 optimise, requiert CUDA 12.8+) ---
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-build-isolation git+https://github.com/Lightricks/LTX-Video-Q8-Kernels.git
-
-# --- Core Python tooling ---
+# --- Core Python tooling (requis avant Q8-Kernels avec --no-build-isolation) ---
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install packaging setuptools wheel
+
+# --- LTX-Video Q8 Kernels (FP8 optimise, requiert CUDA 12.8+) ---
+# Le setup.py appelle torch.cuda.get_device_capability() au build,
+# ce qui echoue sans GPU. On patche pour utiliser un fallback env var.
+# TORCH_CUDA_ARCH_LIST cible: A100(8.0), A40(8.6), L40S(8.9), H100(9.0)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    git clone --filter=blob:none --quiet https://github.com/Lightricks/LTX-Video-Q8-Kernels.git /tmp/q8-kernels && \
+    cd /tmp/q8-kernels && git submodule update --init --recursive -q && \
+    python -c "
+p = 'setup.py'
+t = open(p).read()
+old = 'major, minor = torch.cuda.get_device_capability(0)'
+new = '''try:\n        major, minor = torch.cuda.get_device_capability(0)\n    except RuntimeError:\n        import os; return os.environ.get('Q8_DEVICE_ARCH', 'ada')'''
+open(p, 'w').write(t.replace(old, new))
+" && \
+    TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0" Q8_DEVICE_ARCH=ada \
+    pip install --no-build-isolation . && \
+    rm -rf /tmp/q8-kernels
 
 # --- ComfyUI + Python dependencies ---
 COPY requirements.txt /tmp/requirements.txt
