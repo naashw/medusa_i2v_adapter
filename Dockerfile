@@ -54,13 +54,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python -c "t=open('setup.py').read(); open('setup.py','w').write(t.replace('major, minor = torch.cuda.get_device_capability(0)','try:\n        major, minor = torch.cuda.get_device_capability(0)\n    except RuntimeError:\n        import os; return os.environ.get(\"Q8_DEVICE_ARCH\", \"ada\")'))" && \
     TORCH_CUDA_ARCH_LIST="8.9" Q8_DEVICE_ARCH=ada \
     pip install --no-build-isolation . && \
-    rm -rf /tmp/q8-kernels && \
-    python -c "\
-p=__import__('importlib').import_module('q8_kernels.integration').__path__[0]+'/patch_transformer.py'; \
-t=open(p).read(); \
-open(p,'w').write(t.replace( \
-    'transformer, use_fp8_attention=False, transform_weights=True', \
-    'transformer, use_fp8_attention=False, transform_weights=True, quantize_self_attn=True, quantize_cross_attn=True, quantize_ffn=True'))"
+    rm -rf /tmp/q8-kernels
 
 # --- ComfyUI + Python dependencies ---
 COPY requirements.txt /tmp/requirements.txt
