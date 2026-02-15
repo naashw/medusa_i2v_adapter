@@ -35,7 +35,13 @@ fi
 # -----------------------------------------------
 # 2. Workspace / Network volume
 # -----------------------------------------------
-WORKSPACE="${WORKSPACE:-/workspace}"
+# RunPod Serverless monte le network volume sur /runpod-volume
+# GPU Pods utilisent /workspace
+if [ -d "/runpod-volume" ]; then
+    WORKSPACE="${WORKSPACE:-/runpod-volume}"
+else
+    WORKSPACE="${WORKSPACE:-/workspace}"
+fi
 COMFYUI_DIR="/ComfyUI"
 MODELS_DIR="${WORKSPACE}/models"
 
