@@ -48,13 +48,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip \
     git clone --filter=blob:none --quiet https://github.com/Lightricks/LTX-Video-Q8-Kernels.git /tmp/q8-kernels && \
     cd /tmp/q8-kernels && git submodule update --init --recursive -q && \
-    python -c "
-p = 'setup.py'
-t = open(p).read()
-old = 'major, minor = torch.cuda.get_device_capability(0)'
-new = '''try:\n        major, minor = torch.cuda.get_device_capability(0)\n    except RuntimeError:\n        import os; return os.environ.get('Q8_DEVICE_ARCH', 'ada')'''
-open(p, 'w').write(t.replace(old, new))
-" && \
+    python -c "t=open('setup.py').read(); open('setup.py','w').write(t.replace('major, minor = torch.cuda.get_device_capability(0)','try:\n        major, minor = torch.cuda.get_device_capability(0)\n    except RuntimeError:\n        import os; return os.environ.get(\"Q8_DEVICE_ARCH\", \"ada\")'))" && \
     TORCH_CUDA_ARCH_LIST="8.9" Q8_DEVICE_ARCH=ada \
     pip install --no-build-isolation . && \
     rm -rf /tmp/q8-kernels
