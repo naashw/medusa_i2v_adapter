@@ -7,6 +7,8 @@
 *.tmp
 .env
 .env.*
+!.env.example
+!scripts/.env.example
 __pycache__/
 *.pyc
 data/

@@ -89,7 +89,7 @@
   },
   "10": {
     "inputs": {
-      "image": "Screenshot_20260213_093123.png"
+      "image": "input.png"
     },
     "class_type": "LoadImage",
     "_meta": {

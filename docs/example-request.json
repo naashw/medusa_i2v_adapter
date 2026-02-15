@@ -12,7 +12,9 @@
       },
       "2": {
         "inputs": {
-          "filename": "gemma_3_12B_it_fp8_scaled.safetensors"
+          "text_encoder": "gemma_3_12B_it_fp8_scaled.safetensors",
+          "ckpt_name": "ltx-2-19b-dev-fp8.safetensors",
+          "device": "cpu"
         },
         "class_type": "LTXAVTextEncoderLoader",
         "_meta": {
@@ -47,7 +49,8 @@
       },
       "5": {
         "inputs": {
-          "filename": "ltx-2-19b-distilled-lora-384.safetensors",
+          "lora_name": "ltx-2-19b-distilled-lora-384.safetensors",
+          "strength_model": 0.7,
           "model": [
             "1",
             0
@@ -60,7 +63,8 @@
       },
       "6": {
         "inputs": {
-          "filename": "LTX-2-Image2Vid-Adapter.safetensors",
+          "lora_name": "LTX-2-Image2Vid-Adapter.safetensors",
+          "strength_model": 0.8,
           "model": [
             "5",
             0
@@ -73,7 +77,8 @@
       },
       "7": {
         "inputs": {
-          "filename": "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
+          "lora_name": "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
+          "strength_model": 1,
           "model": [
             "6",
             0
@@ -86,7 +91,7 @@
       },
       "10": {
         "inputs": {
-          "image": "Screenshot_20260213_093123.png"
+          "image": "input.png"
         },
         "class_type": "LoadImage",
         "_meta": {
@@ -95,7 +100,9 @@
       },
       "11": {
         "inputs": {
-          "text": "scale total pixels",
+          "resize_type": "scale total pixels",
+          "resize_type.megapixels": 2,
+          "scale_method": "area",
           "input": [
             "10",
             0
@@ -108,7 +115,9 @@
       },
       "12": {
         "inputs": {
-          "text": "scale to multiple",
+          "resize_type": "scale to multiple",
+          "resize_type.multiple": 8,
+          "scale_method": "area",
           "input": [
             "11",
             0
@@ -121,7 +130,9 @@
       },
       "13": {
         "inputs": {
-          "text": "scale by multiplier",
+          "resize_type": "scale by multiplier",
+          "resize_type.multiplier": 0.5,
+          "scale_method": "area",
           "input": [
             "12",
             0
@@ -134,7 +145,6 @@
       },
       "14": {
         "inputs": {
-          "text": "width: 972, height: 536\n batch size: 1",
           "image": [
             "13",
             0
@@ -147,7 +157,7 @@
       },
       "15": {
         "inputs": {
-          "value": 35,
+          "img_compression": 35,
           "image": [
             "12",
             0
@@ -160,7 +170,6 @@
       },
       "20": {
         "inputs": {
-          "value": 768,
           "width": [
             "14",
             0
@@ -168,7 +177,9 @@
           "height": [
             "14",
             1
-          ]
+          ],
+          "length": 25,
+          "batch_size": 1
         },
         "class_type": "EmptyLTXVLatentVideo",
         "_meta": {
@@ -177,7 +188,8 @@
       },
       "21": {
         "inputs": {
-          "value": 1,
+          "strength": 1,
+          "bypass": false,
           "vae": [
             "1",
             2
@@ -198,7 +210,7 @@
       },
       "24": {
         "inputs": {
-          "value": 24,
+          "frame_rate": 24,
           "positive": [
             "3",
             0
@@ -215,7 +227,7 @@
       },
       "30": {
         "inputs": {
-          "value": 1,
+          "cfg": 1,
           "model": [
             "7",
             0
@@ -236,7 +248,9 @@
       },
       "31": {
         "inputs": {
-          "text": "simple",
+          "scheduler": "simple",
+          "steps": 8,
+          "denoise": 1,
           "model": [
             "7",
             0
@@ -249,7 +263,7 @@
       },
       "32": {
         "inputs": {
-          "text": "euler"
+          "sampler_name": "euler"
         },
         "class_type": "KSamplerSelect",
         "_meta": {
@@ -258,7 +272,7 @@
       },
       "33": {
         "inputs": {
-          "value": 616686607859868
+          "noise_seed": 616686607859868
         },
         "class_type": "RandomNoise",
         "_meta": {
@@ -295,7 +309,10 @@
       },
       "60": {
         "inputs": {
-          "value": 512,
+          "tile_size": 512,
+          "overlap": 64,
+          "temporal_size": 4096,
+          "temporal_overlap": 8,
           "samples": [
             "34",
             0
@@ -312,7 +329,16 @@
       },
       "61": {
         "inputs": {
-          "value": 24,
+          "frame_rate": 24,
+          "loop_count": 0,
+          "filename_prefix": "medusa_fast",
+          "format": "video/h264-mp4",
+          "pix_fmt": "yuv420p",
+          "crf": 19,
+          "save_metadata": true,
+          "trim_to_audio": false,
+          "pingpong": false,
+          "save_output": true,
           "images": [
             "70",
             0
@@ -325,7 +351,9 @@
       },
       "70": {
         "inputs": {
-          "text": "scale total pixels",
+          "resize_type": "scale total pixels",
+          "resize_type.megapixels": 0.92,
+          "scale_method": "area",
           "input": [
             "60",
             0

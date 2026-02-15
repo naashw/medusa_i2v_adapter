@@ -24,7 +24,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         python3.11 python3.11-venv python3.11-dev python3-pip \
         curl ffmpeg ninja-build git aria2 git-lfs wget \
         libgl1 libglib2.0-0 build-essential gcc \
-        google-perftools && \
+        google-perftools tini && \
     ln -sf /usr/bin/python3.11 /usr/bin/python && \
     ln -sf /usr/bin/pip3 /usr/bin/pip && \
     python3.11 -m venv /opt/venv && \
@@ -41,33 +41,42 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install packaging setuptools wheel
 
-# --- ComfyUI + utilities ---
+# --- ComfyUI + Python dependencies ---
+COPY requirements.txt /tmp/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install comfy-cli jupyterlab opencv-python && \
+    pip install -r /tmp/requirements.txt && \
     yes | comfy --workspace /ComfyUI install
 
-# --- Custom nodes for LTX-2 I2V ---
+# --- Custom nodes for LTX-2 I2V (pinned commits, 2026-02-15) ---
 RUN cd /ComfyUI/custom_nodes && \
     git clone https://github.com/Lightricks/ComfyUI-LTXVideo.git && \
-    (pip install -r ComfyUI-LTXVideo/requirements.txt 2>/dev/null || true)
+    cd ComfyUI-LTXVideo && git checkout 82bd963cdeb66d023bed8c99324a307020907ef8 && cd .. && \
+    pip install -r ComfyUI-LTXVideo/requirements.txt && \
+    rm -rf ComfyUI-LTXVideo/.git
 
 RUN cd /ComfyUI/custom_nodes && \
     git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git && \
-    (pip install -r ComfyUI-VideoHelperSuite/requirements.txt 2>/dev/null || true)
+    cd ComfyUI-VideoHelperSuite && git checkout 993082e4f2473bf4acaf06f51e33877a7eb38960 && cd .. && \
+    pip install -r ComfyUI-VideoHelperSuite/requirements.txt && \
+    rm -rf ComfyUI-VideoHelperSuite/.git
 
 RUN cd /ComfyUI/custom_nodes && \
     git clone https://github.com/cubiq/ComfyUI_essentials.git && \
-    (pip install -r ComfyUI_essentials/requirements.txt 2>/dev/null || true)
+    cd ComfyUI_essentials && git checkout 9d9f4bedfc9f0321c19faf71855e228c93bd0dc9 && cd .. && \
+    pip install -r ComfyUI_essentials/requirements.txt && \
+    rm -rf ComfyUI_essentials/.git
 
-# --- RunPod Serverless handler ---
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install runpod websocket-client boto3
+# --- RunPod Serverless handler (pinned commit) ---
+RUN git clone https://github.com/runpod-workers/worker-comfyui.git /worker-comfyui && \
+    cd /worker-comfyui && git checkout 0e2bf226f9ee3d7b6725f61ffbee652b67b6d172 && \
+    rm -rf .git
 
-RUN git clone --depth 1 https://github.com/runpod-workers/worker-comfyui.git /worker-comfyui
-
-# --- Workflows (copies dans l'image, deployes au runtime) ---
+# --- Workflows API (seuls les workflows API sont copies dans l'image) ---
 RUN mkdir -p /workflows
-COPY workflows/*.json /workflows/
+COPY workflows/medusa_i2v_v5_fast_api.json /workflows/
+COPY workflows/medusa_i2v_1pass_upscale_api.json /workflows/
+COPY workflows/medusa_i2v_v2_spatial_api.json /workflows/
+COPY workflows/medusa_i2v_v3_native_api.json /workflows/
 
 # --- Extra model paths template ---
 COPY src/extra_model_paths.yaml /extra_model_paths.yaml
@@ -78,4 +87,8 @@ RUN chmod +x /start.sh
 
 EXPOSE 8188 8888
 
+HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
+    CMD curl -sf http://localhost:8188/system_stats || exit 1
+
+ENTRYPOINT ["tini", "--"]
 CMD ["/start.sh"]

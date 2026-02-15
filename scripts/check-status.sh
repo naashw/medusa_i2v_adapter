@@ -4,8 +4,8 @@
 # CHECK JOB STATUS - RUNPOD
 # ==========================================
 
-API_KEY="${RUNPOD_API_KEY:-YOUR_API_KEY}"
-ENDPOINT_ID="***REMOVED_ENDPOINT_ID***"
+API_KEY="${RUNPOD_API_KEY:?RUNPOD_API_KEY non definie}"
+ENDPOINT_ID="${RUNPOD_ENDPOINT_ID:?RUNPOD_ENDPOINT_ID non definie}"
 JOB_ID="${1}"  # Passe le job ID en argument
 
 if [ -z "$JOB_ID" ]; then

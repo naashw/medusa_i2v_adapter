@@ -4,9 +4,10 @@
 # ENVOI DIRECT DU WORKFLOW (sans Dockerfile)
 # ==========================================
 
-API_KEY="***REMOVED_RUNPOD_API_KEY***"
-ENDPOINT_ID="***REMOVED_ENDPOINT_ID***"
-WORKFLOW_FILE="medusa_i2v_adapter_v5_very_fast_upscale_cleaned.json"
+API_KEY="${RUNPOD_API_KEY:?RUNPOD_API_KEY non definie}"
+ENDPOINT_ID="${RUNPOD_ENDPOINT_ID:?RUNPOD_ENDPOINT_ID non definie}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKFLOW_FILE="${1:-${SCRIPT_DIR}/../workflows/medusa_i2v_v5_fast_api.json}"
 
 echo "🎬 Envoi du workflow : $WORKFLOW_FILE"
 echo ""

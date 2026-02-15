@@ -4,8 +4,8 @@
 # TEST WORKFLOW V2 - SPATIAL UPSCALER
 # ==========================================
 
-API_KEY="***REMOVED_RUNPOD_API_KEY***"
-ENDPOINT_ID="***REMOVED_ENDPOINT_ID***"
+API_KEY="${RUNPOD_API_KEY:?RUNPOD_API_KEY non definie}"
+ENDPOINT_ID="${RUNPOD_ENDPOINT_ID:?RUNPOD_ENDPOINT_ID non definie}"
 
 # Image de test
 IMAGE_URL="https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=1024"

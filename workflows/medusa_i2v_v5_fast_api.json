@@ -61,7 +61,7 @@
   },
   "6": {
     "inputs": {
-      "lora_name": "ltx-2-i2v-adapter.safetensors",
+      "lora_name": "LTX-2-Image2Vid-Adapter.safetensors",
       "strength_model": 0.8,
       "model": [
         "5",
@@ -89,7 +89,7 @@
   },
   "10": {
     "inputs": {
-      "image": "Screenshot_20260213_093123.png"
+      "image": "input.png"
     },
     "class_type": "LoadImage",
     "_meta": {
@@ -335,8 +335,8 @@
       "crf": 19,
       "save_metadata": true,
       "trim_to_audio": false,
-      "pingpong": "yuv420p",
-      "save_output": 19,
+      "pingpong": false,
+      "save_output": true,
       "images": [
         "70",
         0

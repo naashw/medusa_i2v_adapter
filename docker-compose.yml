@@ -1,13 +1,17 @@
 services:
   medusa-i2v:
+    container_name: medusa-i2v
     build: .
+    restart: unless-stopped
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              count: 1
               capabilities: [gpu]
+        limits:
+          memory: 32G
     ports:
       - "8188:8188"
       - "8888:8888"
@@ -15,3 +19,14 @@ services:
       - ./data:/workspace
     environment:
       - WORKSPACE=/workspace
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8188/system_stats"]
+      interval: 30s
+      timeout: 10s
+      start_period: 300s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
