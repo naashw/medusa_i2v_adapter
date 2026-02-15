@@ -1,0 +1,10 @@
+.claude/
+.git/
+test-data/
+scripts/
+docs/
+*.md
+!README.md
+.gitignore
+.dockerignore
+docker-compose.yml

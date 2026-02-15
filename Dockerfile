@@ -1,63 +1,81 @@
-# RunPod worker-comfyui with LTX-2 custom nodes (rebuilt 2026-02-15)
-# dev tag = ComfyUI latest (with LTX-2 core support)
-FROM runpod/worker-comfyui:dev
+# Medusa I2V - ComfyUI + LTX-2 19B
+# Image legere : les modeles sont telecharges au runtime sur le network volume
+# Supporte 2 modes : GPU Pod (interactif) et RunPod Serverless (API)
+#
+# Build:  DOCKER_BUILDKIT=1 docker build -t medusa-i2v .
+#
+# GPU Pod:     docker run --gpus all -p 8188:8188 -p 8888:8888 -v /workspace:/workspace medusa-i2v
+# Serverless:  docker run --gpus all -e SERVERLESS=true -v /workspace:/workspace medusa-i2v
 
-# Install custom nodes
-RUN comfy node install comfyui-videohelpersuite@1.7.9 && \
-    comfy node install ComfyUI_essentials && \
-    comfy node install https://github.com/Lightricks/ComfyUI-LTXVideo
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
 
-# Install wget for parallel downloads
-RUN apt-get update && apt-get install -y --no-install-recommends wget && \
-    rm -rf /var/lib/apt/lists/*
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_PREFER_BINARY=1 \
+    PYTHONUNBUFFERED=1 \
+    CMAKE_BUILD_PARALLEL_LEVEL=8
 
-# Create model directories
-RUN mkdir -p /comfyui/models/{checkpoints,clip,loras,latent_upscale_models}
+# --- System dependencies ---
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends software-properties-common && \
+    add-apt-repository ppa:deadsnakes/ppa && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python3.11 python3.11-venv python3.11-dev python3-pip \
+        curl ffmpeg ninja-build git aria2 git-lfs wget \
+        libgl1 libglib2.0-0 build-essential gcc \
+        google-perftools && \
+    ln -sf /usr/bin/python3.11 /usr/bin/python && \
+    ln -sf /usr/bin/pip3 /usr/bin/pip && \
+    python3.11 -m venv /opt/venv && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Download checkpoint + text encoder (biggest files first)
-RUN cd /comfyui/models && \
-    wget -q --show-progress -O checkpoints/ltx-2-19b-dev-fp8.safetensors \
-      https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-dev-fp8.safetensors & \
-    wget -q --show-progress -O clip/gemma_3_12B_it_fp8_scaled.safetensors \
-      https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors & \
-    wget -q --show-progress -O loras/ltx-2-19b-distilled-lora-384.safetensors \
-      https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-distilled-lora-384.safetensors & \
-    wget -q --show-progress -O loras/LTX-2-Image2Vid-Adapter.safetensors \
-      https://huggingface.co/MachineDelusions/LTX-2_Image2Video_Adapter_LoRa/resolve/main/LTX-2-Image2Vid-Adapter.safetensors & \
-    wait
+ENV PATH="/opt/venv/bin:$PATH"
 
-# Download upscalers + IC LoRAs (parallel)
-RUN cd /comfyui/models && \
-    wget -q -O latent_upscale_models/ltx-2-spatial-upscaler-x2-1.0.safetensors \
-      https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-spatial-upscaler-x2-1.0.safetensors & \
-    wget -q -O latent_upscale_models/ltx-2-temporal-upscaler-x2-1.0.safetensors \
-      https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-temporal-upscaler-x2-1.0.safetensors & \
-    wget -q -O loras/ltx-2-19b-ic-lora-union-ref0.5.safetensors \
-      https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-ic-lora-union-ref0.5.safetensors & \
-    wget -q -O loras/ltx-2-19b-ic-lora-canny-control.safetensors \
-      https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-ic-lora-canny-control.safetensors & \
-    wget -q -O loras/ltx-2-19b-ic-lora-depth-control.safetensors \
-      https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-ic-lora-depth-control.safetensors & \
-    wget -q -O loras/ltx-2-19b-ic-lora-detailer.safetensors \
-      https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-ic-lora-detailer.safetensors & \
-    wget -q -O loras/ltx-2-19b-ic-lora-pose-control.safetensors \
-      https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-ic-lora-pose-control.safetensors & \
-    wait
+# --- PyTorch nightly (CUDA 12.8) ---
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --pre torch torchvision torchaudio \
+        --index-url https://download.pytorch.org/whl/nightly/cu128
 
-# Download camera LoRAs (parallel)
-RUN cd /comfyui/models/loras && \
-    wget -q -O ltx-2-19b-lora-camera-control-dolly-in.safetensors \
-      https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-lora-camera-control-dolly-in.safetensors & \
-    wget -q -O ltx-2-19b-lora-camera-control-dolly-out.safetensors \
-      https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-lora-camera-control-dolly-out.safetensors & \
-    wget -q -O ltx-2-19b-lora-camera-control-dolly-left.safetensors \
-      https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-lora-camera-control-dolly-left.safetensors & \
-    wget -q -O ltx-2-19b-lora-camera-control-dolly-right.safetensors \
-      https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-lora-camera-control-dolly-right.safetensors & \
-    wget -q -O ltx-2-19b-lora-camera-control-jib-down.safetensors \
-      https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-lora-camera-control-jib-down.safetensors & \
-    wget -q -O ltx-2-19b-lora-camera-control-jib-up.safetensors \
-      https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-lora-camera-control-jib-up.safetensors & \
-    wget -q -O ltx-2-19b-lora-camera-control-static.safetensors \
-      https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-lora-camera-control-static.safetensors & \
-    wait
+# --- Core Python tooling ---
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install packaging setuptools wheel
+
+# --- ComfyUI + utilities ---
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install comfy-cli jupyterlab opencv-python && \
+    yes | comfy --workspace /ComfyUI install
+
+# --- Custom nodes for LTX-2 I2V ---
+RUN cd /ComfyUI/custom_nodes && \
+    git clone https://github.com/Lightricks/ComfyUI-LTXVideo.git && \
+    (pip install -r ComfyUI-LTXVideo/requirements.txt 2>/dev/null || true)
+
+RUN cd /ComfyUI/custom_nodes && \
+    git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git && \
+    (pip install -r ComfyUI-VideoHelperSuite/requirements.txt 2>/dev/null || true)
+
+RUN cd /ComfyUI/custom_nodes && \
+    git clone https://github.com/cubiq/ComfyUI_essentials.git && \
+    (pip install -r ComfyUI_essentials/requirements.txt 2>/dev/null || true)
+
+# --- RunPod Serverless handler ---
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install runpod websocket-client boto3
+
+RUN git clone --depth 1 https://github.com/runpod-workers/worker-comfyui.git /worker-comfyui
+
+# --- Workflows (copies dans l'image, deployes au runtime) ---
+RUN mkdir -p /workflows
+COPY workflows/*.json /workflows/
+
+# --- Extra model paths template ---
+COPY src/extra_model_paths.yaml /extra_model_paths.yaml
+
+# --- Startup script ---
+COPY src/start.sh /start.sh
+RUN chmod +x /start.sh
+
+EXPOSE 8188 8888
+
+CMD ["/start.sh"]
