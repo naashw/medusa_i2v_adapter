@@ -202,6 +202,21 @@ if [ "${SERVERLESS:-}" = "true" ] || [ -n "${RUNPOD_ENDPOINT_ID:-}" ]; then
     # ===== MODE SERVERLESS =====
     echo "[medusa] Mode: SERVERLESS (RunPod API)"
 
+    # Dossier output sur le network volume (persistant entre jobs)
+    OUTPUT_DIR="${WORKSPACE}/output"
+    mkdir -p "$OUTPUT_DIR"
+    export OUTPUT_VOLUME_DIR="$OUTPUT_DIR"
+    echo "[medusa] Output dir: $OUTPUT_DIR"
+
+    # Desactiver ComfyUI-Manager network checks (economise ~2min au cold start)
+    MANAGER_DIR="${COMFYUI_DIR}/user/__manager"
+    mkdir -p "$MANAGER_DIR"
+    cat > "${MANAGER_DIR}/config.ini" << EOF
+[default]
+network_mode = offline
+EOF
+    echo "[medusa] ComfyUI-Manager: mode offline (serverless)"
+
     cd "${COMFYUI_DIR}"
     python main.py \
         --listen 127.0.0.1 \
