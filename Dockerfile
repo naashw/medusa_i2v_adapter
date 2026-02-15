@@ -125,6 +125,9 @@ COPY src/extra_model_paths.yaml /extra_model_paths.yaml
 COPY src/start.sh /start.sh
 RUN chmod +x /start.sh
 
+# --- Custom nodes Medusa ---
+COPY src/custom_nodes/medusa_cache /ComfyUI/custom_nodes/medusa_cache
+
 # --- Handler wrapper (cleanup post-job) ---
 COPY src/handler_wrapper.py /handler_wrapper.py
 

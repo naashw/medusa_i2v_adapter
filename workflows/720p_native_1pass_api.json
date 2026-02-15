@@ -29,7 +29,7 @@
             0
           ]
         },
-        "class_type": "CLIPTextEncode",
+        "class_type": "CachedCLIPTextEncode",
         "_meta": {
           "title": "Positive Prompt"
         }
@@ -42,7 +42,7 @@
             0
           ]
         },
-        "class_type": "CLIPTextEncode",
+        "class_type": "CachedCLIPTextEncode",
         "_meta": {
           "title": "Negative Prompt"
         }

@@ -32,8 +32,9 @@ CACHE_DIR = os.environ.get("CACHE_DIR", "/runpod-volume/cache")
 VOLUME_ROOT = os.environ.get("VOLUME_ROOT", "/runpod-volume")
 
 # Cold start : noeuds requis et retry
-REQUIRED_NODES = {"LTXVImgToVideoInplace", "LTXVConditioning", "VHS_VideoCombine"}
+REQUIRED_NODES = {"LTXVImgToVideoInplace", "LTXVConditioning", "VHS_VideoCombine", "CachedCLIPTextEncode"}
 COMFYUI_READY_TIMEOUT = 120
+WARMUP_TIMEOUT = 300  # secondes pour le pre-warming
 MAX_RETRIES = 10
 RETRY_DELAY = 5  # secondes entre chaque retry
 MIN_EXEC_TIME = 10  # secondes - en dessous, execution suspecte
@@ -312,6 +313,181 @@ def wrapped_handler(job: dict) -> dict:
     return result
 
 
+def prewarm_models() -> None:
+    """Pre-charge les modeles lourds en VRAM via un workflow minimal.
+
+    Utilise les memes node IDs et inputs que le workflow de production
+    pour maximiser les cache hits ComfyUI sur le premier vrai job.
+    """
+    print("[wrapper] Pre-warming: chargement des modeles en VRAM...")
+    start = time.time()
+
+    # Image 1x1 blanche PNG
+    tiny_png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+        "AAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
+    )
+    try:
+        resp = requests.post(
+            f"{COMFYUI_URL}/upload/image",
+            files={"image": ("warmup.png", tiny_png, "image/png")},
+            data={"overwrite": "true"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f"[wrapper] Pre-warm echec upload ({e}), skip")
+        return
+
+    # Memes node IDs 1-6, 24 que le workflow de production
+    # + chaine de sampling minimale (IDs 90-97) pour forcer le chargement GPU
+    warmup_workflow = {
+        "1": {
+            "inputs": {"ckpt_name": "ltx-2-19b-dev-fp8.safetensors"},
+            "class_type": "CheckpointLoaderSimple",
+        },
+        "2": {
+            "inputs": {
+                "text_encoder": "gemma_3_12B_it_fp8_scaled.safetensors",
+                "ckpt_name": "ltx-2-19b-dev-fp8.safetensors",
+                "device": "cpu",
+            },
+            "class_type": "LTXAVTextEncoderLoader",
+        },
+        "3": {
+            "inputs": {
+                "text": "A steady dolly-in camera movement, smooth forward motion, cinematic.",
+                "clip": ["2", 0],
+            },
+            "class_type": "CachedCLIPTextEncode",
+        },
+        "4": {
+            "inputs": {
+                "text": (
+                    "blurry, out of focus, low quality, distorted, watermark, "
+                    "logo, text, subtitle, banner, signature, username, "
+                    "compressed artifacts, jpeg artifacts, noise, grainy"
+                ),
+                "clip": ["2", 0],
+            },
+            "class_type": "CachedCLIPTextEncode",
+        },
+        "5": {
+            "inputs": {
+                "lora_name": "ltx-2-19b-distilled-lora-384.safetensors",
+                "strength_model": 0.7,
+                "model": ["1", 0],
+            },
+            "class_type": "LoraLoaderModelOnly",
+        },
+        "6": {
+            "inputs": {
+                "lora_name": "LTX-2-Image2Vid-Adapter.safetensors",
+                "strength_model": 0.8,
+                "model": ["5", 0],
+            },
+            "class_type": "LoraLoaderModelOnly",
+        },
+        "24": {
+            "inputs": {
+                "frame_rate": 24,
+                "positive": ["3", 0],
+                "negative": ["4", 0],
+            },
+            "class_type": "LTXVConditioning",
+        },
+        # --- Chaine de sampling minimale (128x128, 1 step) ---
+        "90": {
+            "inputs": {"width": 128, "height": 128, "length": 9, "batch_size": 1},
+            "class_type": "EmptyLTXVLatentVideo",
+        },
+        "91": {
+            "inputs": {
+                "cfg": 1,
+                "model": ["6", 0],
+                "positive": ["24", 0],
+                "negative": ["24", 1],
+            },
+            "class_type": "CFGGuider",
+        },
+        "92": {
+            "inputs": {
+                "scheduler": "simple",
+                "steps": 1,
+                "denoise": 1,
+                "model": ["6", 0],
+            },
+            "class_type": "BasicScheduler",
+        },
+        "93": {
+            "inputs": {"sampler_name": "euler"},
+            "class_type": "KSamplerSelect",
+        },
+        "94": {
+            "inputs": {"noise_seed": 42},
+            "class_type": "RandomNoise",
+        },
+        "95": {
+            "inputs": {
+                "noise": ["94", 0],
+                "guider": ["91", 0],
+                "sampler": ["93", 0],
+                "sigmas": ["92", 0],
+                "latent_image": ["90", 0],
+            },
+            "class_type": "SamplerCustomAdvanced",
+        },
+        "96": {
+            "inputs": {
+                "tile_size": 512,
+                "overlap": 64,
+                "temporal_size": 4096,
+                "temporal_overlap": 8,
+                "samples": ["95", 0],
+                "vae": ["1", 2],
+            },
+            "class_type": "VAEDecodeTiled",
+        },
+        "97": {
+            "inputs": {"filename_prefix": "_warmup", "images": ["96", 0]},
+            "class_type": "SaveImage",
+        },
+    }
+
+    try:
+        resp = requests.post(
+            f"{COMFYUI_URL}/prompt",
+            json={"prompt": warmup_workflow},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        prompt_id = resp.json()["prompt_id"]
+    except requests.RequestException as e:
+        print(f"[wrapper] Pre-warm echec soumission ({e}), skip")
+        return
+
+    # Polling jusqu'a la fin de l'execution
+    while time.time() - start < WARMUP_TIMEOUT:
+        time.sleep(5)
+        try:
+            resp = requests.get(f"{COMFYUI_URL}/history/{prompt_id}", timeout=10)
+            if resp.ok and prompt_id in resp.json():
+                break
+        except requests.RequestException:
+            pass
+    else:
+        print(f"[wrapper] Pre-warm timeout ({WARMUP_TIMEOUT}s)")
+        return
+
+    # Cleanup fichiers generes, garder le cache d'execution (modeles en memoire)
+    cleanup_ephemeral(CLEANUP_DIRS)
+    clear_comfyui_history()
+
+    elapsed = time.time() - start
+    print(f"[wrapper] Pre-warming termine ({elapsed:.0f}s) - modeles prets")
+
+
 print("[wrapper] Verification noeuds custom ComfyUI...")
 wait_for_comfyui_ready()
+prewarm_models()
 runpod.serverless.start({"handler": wrapped_handler})

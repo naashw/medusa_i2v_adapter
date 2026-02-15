@@ -201,6 +201,18 @@ if [ "${SERVERLESS:-}" = "true" ] || [ -n "${RUNPOD_ENDPOINT_ID:-}" ]; then
     echo "[medusa] Output dir: $OUTPUT_DIR"
     echo "[medusa] Cache dir: $CACHE_DIR"
 
+    # Sync embedding cache depuis le volume (persistant entre cold starts)
+    EMBEDDING_CACHE_VOL="${WORKSPACE}/cache/embeddings"
+    EMBEDDING_CACHE_LOCAL="/ComfyUI/cache/embeddings"
+    if [ -d "$EMBEDDING_CACHE_VOL" ]; then
+        PT_COUNT=$(find "$EMBEDDING_CACHE_VOL" -name "*.pt" 2>/dev/null | wc -l)
+        if [ "$PT_COUNT" -gt 0 ]; then
+            mkdir -p "$EMBEDDING_CACHE_LOCAL"
+            cp "$EMBEDDING_CACHE_VOL"/*.pt "$EMBEDDING_CACHE_LOCAL/" 2>/dev/null
+            echo "[medusa] Embeddings cache: $PT_COUNT fichier(s) copies depuis volume"
+        fi
+    fi
+
     # Desactiver ComfyUI-Manager network checks (economise ~2min au cold start)
     MANAGER_DIR="${COMFYUI_DIR}/user/__manager"
     mkdir -p "$MANAGER_DIR"
