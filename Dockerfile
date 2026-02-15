@@ -90,5 +90,5 @@ EXPOSE 8188 8888
 HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
     CMD curl -sf http://localhost:8188/system_stats || exit 1
 
-ENTRYPOINT ["tini", "--"]
+ENTRYPOINT ["tini", "-s", "--"]
 CMD ["/start.sh"]

@@ -103,6 +103,7 @@ download_model() {
         --console-log-level=error \
         --summary-interval=0 \
         --check-certificate=true \
+        --file-allocation=none \
         --max-tries=3 \
         --retry-wait=5 \
         --timeout=600
