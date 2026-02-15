@@ -109,18 +109,21 @@ def collect_outputs(source_dir: str, job_id: str) -> list[dict]:
 
 
 def cleanup_ephemeral(directories: list[str]) -> int:
-    """Supprime tous les fichiers dans les dossiers ephemeres du container."""
+    """Supprime tous les fichiers et sous-dossiers dans les dossiers ephemeres du container."""
     removed = 0
     for directory in directories:
         if not os.path.isdir(directory):
             continue
-        for filepath in glob.glob(os.path.join(directory, "*")):
-            if os.path.isfile(filepath):
-                try:
-                    os.remove(filepath)
-                    removed += 1
-                except OSError as e:
-                    print(f"[wrapper] Erreur suppression {filepath}: {e}")
+        for entry in os.listdir(directory):
+            path = os.path.join(directory, entry)
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+                removed += 1
+            except OSError as e:
+                print(f"[wrapper] Erreur suppression {path}: {e}")
     return removed
 
 

@@ -3,7 +3,7 @@
 # Supporte 2 modes : GPU Pod (interactif) et RunPod Serverless (API)
 #
 # Multi-stage build : devel (compile) -> runtime (execute)
-# Build:  DOCKER_BUILDKIT=1 docker build -t medusa-i2v .
+# Build:  DOCKER_BUILDKIT=1 docker build --platform linux/amd64 -t medusa-i2v .
 #
 # GPU Pod:     docker run --gpus all -p 8188:8188 -p 8888:8888 -v /workspace:/workspace medusa-i2v
 # Serverless:  docker run --gpus all -e SERVERLESS=true -v /workspace:/workspace medusa-i2v
@@ -36,8 +36,11 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # --- PyTorch stable (CUDA 12.8) ---
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install torch torchvision torchaudio \
+    pip install torch \
+        torchvision torchaudio \
         --index-url https://download.pytorch.org/whl/cu128
+# NOTE: torchvision/torchaudio ajoutent ~1.5GB. Tester sans si besoin de reduire l'image.
+# ComfyUI_essentials peut dependre de torchvision. Valider avant de retirer.
 
 # --- Core Python tooling (requis avant Q8-Kernels avec --no-build-isolation) ---
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -95,9 +98,11 @@ FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    PATH="/opt/venv/bin:$PATH"
+    PATH="/opt/venv/bin:$PATH" \
+    RUNPOD_INIT_TIMEOUT=600
 
 # --- Runtime dependencies only ---
+# wget et git-lfs retires : aria2c + curl suffisent pour les telechargements
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && \
     apt-get install -y --no-install-recommends software-properties-common && \
@@ -105,7 +110,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         python3.11 \
-        curl ffmpeg aria2 git-lfs wget \
+        curl ffmpeg aria2 \
         libgl1 libglib2.0-0 \
         google-perftools tini && \
     ln -sf /usr/bin/python3.11 /usr/bin/python && \
@@ -116,12 +121,8 @@ COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /ComfyUI /ComfyUI
 COPY --from=builder /worker-comfyui /worker-comfyui
 
-# --- Workflows API ---
-RUN mkdir -p /workflows
-COPY workflows/medusa_i2v_v5_fast_api.json /workflows/
-COPY workflows/medusa_i2v_1pass_upscale_api.json /workflows/
-COPY workflows/medusa_i2v_v2_spatial_api.json /workflows/
-COPY workflows/medusa_i2v_v3_native_api.json /workflows/
+# --- Workflows API (single layer) ---
+COPY workflows/*.json /workflows/
 
 # --- Extra model paths template ---
 COPY src/extra_model_paths.yaml /extra_model_paths.yaml

@@ -221,28 +221,14 @@ EOF
     python main.py \
         --listen 127.0.0.1 \
         --port 8188 \
+        --disable-auto-launch \
+        --disable-metadata \
         --extra-model-paths-config "${COMFYUI_DIR}/extra_model_paths.yaml" &
     COMFYUI_PID=$!
     CHILD_PIDS+=($COMFYUI_PID)
 
-    echo "[medusa] Attente demarrage ComfyUI..."
-    MAX_RETRIES=60
-    RETRY=0
-    while [ $RETRY -lt $MAX_RETRIES ]; do
-        if curl -s http://127.0.0.1:8188/system_stats > /dev/null 2>&1; then
-            echo "[medusa] ComfyUI pret (apres ${RETRY}s)"
-            break
-        fi
-        RETRY=$((RETRY + 1))
-        sleep 1
-    done
-
-    if [ $RETRY -eq $MAX_RETRIES ]; then
-        echo "[medusa] ERREUR: ComfyUI n'a pas demarre apres ${MAX_RETRIES}s"
-        exit 1
-    fi
-
-    echo "[medusa] Demarrage du handler RunPod..."
+    # Le handler_wrapper.py gere l'attente de readiness (poll /object_info + verification noeuds)
+    echo "[medusa] Demarrage du handler RunPod (readiness geree par le wrapper)..."
     exec python /handler_wrapper.py
 
 else
