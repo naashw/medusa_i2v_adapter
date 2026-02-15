@@ -1,10 +1,10 @@
 # RunPod worker-comfyui with LTX-2 custom nodes (rebuilt 2026-02-15)
 FROM runpod/worker-comfyui:5.7.1-base
 
-# ComfyUI is already installed + configured in base image
-# Just install the custom nodes for LTX-2 support
+# Update ComfyUI to latest version to ensure LTX-2 core support
+RUN comfy install --upgrade
 
-# Install custom nodes (ComfyUI already has LTX-2 in core since v0.6.0)
+# Install custom nodes (ComfyUI now has LTX-2 in core)
 RUN comfy node install comfyui-videohelpersuite@1.7.9 && \
     comfy node install ComfyUI_essentials && \
     comfy node install https://github.com/Lightricks/ComfyUI-LTXVideo
