@@ -41,6 +41,8 @@ SKIP_FILES = {"_output_images_will_be_put_here"}
 OUTPUT_VOLUME_DIR = os.environ.get("OUTPUT_VOLUME_DIR", "/runpod-volume/output")
 CACHE_DIR = os.environ.get("CACHE_DIR", "/runpod-volume/cache")
 VOLUME_ROOT = os.environ.get("VOLUME_ROOT", "/runpod-volume")
+EMBEDDINGS_CACHE_DIR = "/ComfyUI/cache/embeddings"
+EMBEDDINGS_VOLUME_DIR = "/runpod-volume/cache/embeddings"
 
 # Cold start : noeuds requis et retry
 REQUIRED_NODES = {"LTXVImgToVideoInplace", "LTXVConditioning", "VHS_VideoCombine", "CachedCLIPTextEncode"}
@@ -352,6 +354,45 @@ def _submit_and_wait(workflow: dict, label: str, timeout: int) -> bool:
     return False
 
 
+def _has_cached_embeddings() -> bool:
+    """Verifie si le cache embeddings existe (volume ou local)."""
+    volume_has_cache = os.path.isdir(EMBEDDINGS_VOLUME_DIR) and any(
+        f.endswith(".pt") for f in os.listdir(EMBEDDINGS_VOLUME_DIR)
+    )
+    local_has_cache = os.path.isdir(EMBEDDINGS_CACHE_DIR) and any(
+        f.endswith(".pt") for f in os.listdir(EMBEDDINGS_CACHE_DIR)
+    )
+    return volume_has_cache or local_has_cache
+
+
+def _build_text_encoder_only_workflow(positive_prompt: str) -> dict:
+    """Workflow minimaliste : charge text encoder sur GPU et encode les prompts.
+    Utilise uniquement pour le premier cold start absolu."""
+    negative_prompt = (
+        "blurry, out of focus, low quality, distorted, watermark, "
+        "logo, text, subtitle, banner, signature, username, "
+        "compressed artifacts, jpeg artifacts, noise, grainy"
+    )
+    return {
+        "1": {
+            "inputs": {
+                "text_encoder": "gemma_3_12B_it_fp8_scaled.safetensors",
+                "ckpt_name": "ltx-2-19b-dev-fp8.safetensors",
+                "device": "cuda",
+            },
+            "class_type": "LTXAVTextEncoderLoader",
+        },
+        "2": {
+            "inputs": {"text": positive_prompt, "clip": ["1", 0]},
+            "class_type": "CachedCLIPTextEncode",
+        },
+        "3": {
+            "inputs": {"text": negative_prompt, "clip": ["1", 0]},
+            "class_type": "CachedCLIPTextEncode",
+        },
+    }
+
+
 def _build_warmup_workflow(positive_prompt: str) -> dict:
     """Construit le workflow de warmup avec le prompt positif donne."""
     negative_prompt = (
@@ -462,17 +503,74 @@ def _build_warmup_workflow(positive_prompt: str) -> dict:
     }
 
 
+def _free_vram() -> None:
+    """Libere la VRAM en dechargant tous les modeles."""
+    try:
+        requests.post(
+            f"{COMFYUI_URL}/free",
+            json={"unload_models": True, "free_memory": True},
+            timeout=10,
+        )
+        print("[wrapper] VRAM liberee")
+    except requests.RequestException as e:
+        print(f"[wrapper] Erreur liberation VRAM: {e}")
+
+
+def _persist_embeddings_cache() -> None:
+    """Copie les embeddings .pt depuis /ComfyUI/cache/embeddings vers le volume."""
+    if not os.path.isdir(EMBEDDINGS_CACHE_DIR):
+        return
+
+    pt_files = [f for f in os.listdir(EMBEDDINGS_CACHE_DIR) if f.endswith(".pt")]
+    if not pt_files:
+        return
+
+    os.makedirs(EMBEDDINGS_VOLUME_DIR, exist_ok=True)
+    copied = 0
+    for filename in pt_files:
+        src = os.path.join(EMBEDDINGS_CACHE_DIR, filename)
+        dst = os.path.join(EMBEDDINGS_VOLUME_DIR, filename)
+        try:
+            shutil.copy2(src, dst)
+            copied += 1
+        except OSError as e:
+            print(f"[wrapper] Erreur copie embedding {filename}: {e}")
+
+    if copied:
+        print(f"[wrapper] {copied} embedding(s) sauvegarde(s) sur volume pour futurs cold starts")
+
+
 def prewarm_models() -> None:
     """Pre-charge les modeles en VRAM et cache tous les embeddings camera.
 
-    1. Premier workflow : charge checkpoint + LoRAs + text encoder + sampling
-    2. Workflows suivants : cache les embeddings des autres prompts camera
-       (text encoder deja en memoire, ~44s par prompt sur CPU)
+    Strategie :
+    - Si pas de cache embeddings : genere avec text encoder sur GPU (rapide)
+      puis libere VRAM et charge checkpoint + LoRAs
+    - Si cache existe : charge directement checkpoint + LoRAs
     """
-    print("[wrapper] Pre-warming: chargement des modeles en VRAM...")
+    print("[wrapper] Pre-warming: verification cache embeddings...")
     start = time.time()
+    has_cache = _has_cached_embeddings()
 
-    # Image 1x1 blanche PNG (requise pour l'upload)
+    if not has_cache:
+        print("[wrapper] Pas de cache embeddings - generation rapide sur GPU...")
+        # Encoder tous les prompts avec text encoder sur GPU
+        for i, prompt_text in enumerate(CAMERA_PROMPTS, 1):
+            label = prompt_text[:40]
+            workflow = _build_text_encoder_only_workflow(prompt_text)
+            if not _submit_and_wait(workflow, f"GPU encode {i}/{len(CAMERA_PROMPTS)} ({label}...)", WARMUP_TIMEOUT):
+                print(f"[wrapper] WARNING: echec encoding prompt {i}")
+            cleanup_ephemeral(CLEANUP_DIRS)
+            clear_comfyui_history()
+
+        elapsed = time.time() - start
+        print(f"[wrapper] Embeddings generes sur GPU ({elapsed:.0f}s), liberation VRAM...")
+        _free_vram()
+        time.sleep(2)
+    else:
+        print("[wrapper] Cache embeddings detecte, skip generation")
+
+    # Image 1x1 blanche PNG (requise pour warmup sampling)
     tiny_png = base64.b64decode(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
         "AAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
@@ -489,7 +587,9 @@ def prewarm_models() -> None:
         print(f"[wrapper] Pre-warm echec upload ({e}), skip")
         return
 
-    # Premier prompt : charge tout en VRAM
+    # Warmup complet : charge checkpoint + LoRAs + sampling
+    # Les embeddings sont deja caches donc text encoder reste sur CPU
+    print("[wrapper] Chargement modeles en VRAM (checkpoint + LoRAs)...")
     first_prompt = CAMERA_PROMPTS[0]
     workflow = _build_warmup_workflow(first_prompt)
     if not _submit_and_wait(workflow, "Pre-warm (modeles)", WARMUP_TIMEOUT):
@@ -497,20 +597,13 @@ def prewarm_models() -> None:
 
     cleanup_ephemeral(CLEANUP_DIRS)
     clear_comfyui_history()
-    elapsed = time.time() - start
-    print(f"[wrapper] Modeles charges ({elapsed:.0f}s), cache embeddings restants...")
 
-    # Prompts suivants : text encoder deja en memoire, juste l'encodage CPU
-    for prompt_text in CAMERA_PROMPTS[1:]:
-        label = prompt_text[:40]
-        workflow = _build_warmup_workflow(prompt_text)
-        if not _submit_and_wait(workflow, f"Embedding ({label}...)", WARMUP_TIMEOUT):
-            continue
-        cleanup_ephemeral(CLEANUP_DIRS)
-        clear_comfyui_history()
+    # Persister les embeddings sur le volume
+    if not has_cache:
+        _persist_embeddings_cache()
 
     elapsed = time.time() - start
-    print(f"[wrapper] Pre-warming termine ({elapsed:.0f}s) - {len(CAMERA_PROMPTS)} prompts caches")
+    print(f"[wrapper] Pre-warming termine ({elapsed:.0f}s) - modeles en VRAM, {len(CAMERA_PROMPTS)} prompts caches")
 
 
 print("[wrapper] Verification noeuds custom ComfyUI...")

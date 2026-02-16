@@ -33,6 +33,7 @@ class CachedCLIPTextEncode:
         }
 
     RETURN_TYPES = ("CONDITIONING",)
+    OUTPUT_NODE = True
     FUNCTION = "encode"
     CATEGORY = "medusa"
 
