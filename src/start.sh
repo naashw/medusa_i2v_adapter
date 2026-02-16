@@ -229,6 +229,7 @@ EOF
         --disable-auto-launch \
         --disable-metadata \
         --disable-smart-memory \
+        --reserve-vram 0 \
         --extra-model-paths-config "${COMFYUI_DIR}/extra_model_paths.yaml" &
     COMFYUI_PID=$!
     CHILD_PIDS+=($COMFYUI_PID)

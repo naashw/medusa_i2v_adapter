@@ -23,6 +23,17 @@ sys.path.insert(0, "/worker-comfyui")
 from handler import handler as original_handler
 
 COMFYUI_URL = "http://127.0.0.1:8188"
+
+# Prompts standardises par type de camera (pre-warmes au cold start)
+CAMERA_PROMPTS = [
+    "A steady dolly-in camera movement, smooth forward motion, cinematic.",
+    "A steady dolly-out camera movement, smooth backward motion, cinematic.",
+    "A steady dolly-left camera movement, smooth lateral motion to the left, cinematic.",
+    "A steady dolly-right camera movement, smooth lateral motion to the right, cinematic.",
+    "A steady jib-down camera movement, smooth downward motion, cinematic.",
+    "A steady jib-up camera movement, smooth upward motion, cinematic.",
+    "A static camera, no movement, cinematic.",
+]
 COMFYUI_OUTPUT_DIR = "/ComfyUI/output"
 CLEANUP_DIRS = ["/ComfyUI/output", "/ComfyUI/input", "/ComfyUI/temp"]
 VIDEO_EXTENSIONS = {".mp4", ".webm", ".gif", ".webp"}
@@ -313,35 +324,42 @@ def wrapped_handler(job: dict) -> dict:
     return result
 
 
-def prewarm_models() -> None:
-    """Pre-charge les modeles lourds en VRAM via un workflow minimal.
-
-    Utilise les memes node IDs et inputs que le workflow de production
-    pour maximiser les cache hits ComfyUI sur le premier vrai job.
-    """
-    print("[wrapper] Pre-warming: chargement des modeles en VRAM...")
+def _submit_and_wait(workflow: dict, label: str, timeout: int) -> bool:
+    """Soumet un workflow ComfyUI et attend la fin. Retourne True si OK."""
     start = time.time()
-
-    # Image 1x1 blanche PNG
-    tiny_png = base64.b64decode(
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
-        "AAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
-    )
     try:
         resp = requests.post(
-            f"{COMFYUI_URL}/upload/image",
-            files={"image": ("warmup.png", tiny_png, "image/png")},
-            data={"overwrite": "true"},
+            f"{COMFYUI_URL}/prompt",
+            json={"prompt": workflow},
             timeout=10,
         )
         resp.raise_for_status()
+        prompt_id = resp.json()["prompt_id"]
     except requests.RequestException as e:
-        print(f"[wrapper] Pre-warm echec upload ({e}), skip")
-        return
+        print(f"[wrapper] {label} echec soumission ({e})")
+        return False
 
-    # Memes node IDs 1-6, 24 que le workflow de production
-    # + chaine de sampling minimale (IDs 90-97) pour forcer le chargement GPU
-    warmup_workflow = {
+    while time.time() - start < timeout:
+        time.sleep(5)
+        try:
+            resp = requests.get(f"{COMFYUI_URL}/history/{prompt_id}", timeout=10)
+            if resp.ok and prompt_id in resp.json():
+                return True
+        except requests.RequestException:
+            pass
+
+    print(f"[wrapper] {label} timeout ({timeout}s)")
+    return False
+
+
+def _build_warmup_workflow(positive_prompt: str) -> dict:
+    """Construit le workflow de warmup avec le prompt positif donne."""
+    negative_prompt = (
+        "blurry, out of focus, low quality, distorted, watermark, "
+        "logo, text, subtitle, banner, signature, username, "
+        "compressed artifacts, jpeg artifacts, noise, grainy"
+    )
+    return {
         "1": {
             "inputs": {"ckpt_name": "ltx-2-19b-dev-fp8.safetensors"},
             "class_type": "CheckpointLoaderSimple",
@@ -355,21 +373,11 @@ def prewarm_models() -> None:
             "class_type": "LTXAVTextEncoderLoader",
         },
         "3": {
-            "inputs": {
-                "text": "A steady dolly-in camera movement, smooth forward motion, cinematic.",
-                "clip": ["2", 0],
-            },
+            "inputs": {"text": positive_prompt, "clip": ["2", 0]},
             "class_type": "CachedCLIPTextEncode",
         },
         "4": {
-            "inputs": {
-                "text": (
-                    "blurry, out of focus, low quality, distorted, watermark, "
-                    "logo, text, subtitle, banner, signature, username, "
-                    "compressed artifacts, jpeg artifacts, noise, grainy"
-                ),
-                "clip": ["2", 0],
-            },
+            "inputs": {"text": negative_prompt, "clip": ["2", 0]},
             "class_type": "CachedCLIPTextEncode",
         },
         "5": {
@@ -396,7 +404,6 @@ def prewarm_models() -> None:
             },
             "class_type": "LTXVConditioning",
         },
-        # --- Chaine de sampling minimale (128x128, 1 step) ---
         "90": {
             "inputs": {"width": 128, "height": 128, "length": 9, "batch_size": 1},
             "class_type": "EmptyLTXVLatentVideo",
@@ -454,37 +461,56 @@ def prewarm_models() -> None:
         },
     }
 
+
+def prewarm_models() -> None:
+    """Pre-charge les modeles en VRAM et cache tous les embeddings camera.
+
+    1. Premier workflow : charge checkpoint + LoRAs + text encoder + sampling
+    2. Workflows suivants : cache les embeddings des autres prompts camera
+       (text encoder deja en memoire, ~44s par prompt sur CPU)
+    """
+    print("[wrapper] Pre-warming: chargement des modeles en VRAM...")
+    start = time.time()
+
+    # Image 1x1 blanche PNG (requise pour l'upload)
+    tiny_png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+        "AAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
+    )
     try:
         resp = requests.post(
-            f"{COMFYUI_URL}/prompt",
-            json={"prompt": warmup_workflow},
+            f"{COMFYUI_URL}/upload/image",
+            files={"image": ("warmup.png", tiny_png, "image/png")},
+            data={"overwrite": "true"},
             timeout=10,
         )
         resp.raise_for_status()
-        prompt_id = resp.json()["prompt_id"]
     except requests.RequestException as e:
-        print(f"[wrapper] Pre-warm echec soumission ({e}), skip")
+        print(f"[wrapper] Pre-warm echec upload ({e}), skip")
         return
 
-    # Polling jusqu'a la fin de l'execution
-    while time.time() - start < WARMUP_TIMEOUT:
-        time.sleep(5)
-        try:
-            resp = requests.get(f"{COMFYUI_URL}/history/{prompt_id}", timeout=10)
-            if resp.ok and prompt_id in resp.json():
-                break
-        except requests.RequestException:
-            pass
-    else:
-        print(f"[wrapper] Pre-warm timeout ({WARMUP_TIMEOUT}s)")
+    # Premier prompt : charge tout en VRAM
+    first_prompt = CAMERA_PROMPTS[0]
+    workflow = _build_warmup_workflow(first_prompt)
+    if not _submit_and_wait(workflow, "Pre-warm (modeles)", WARMUP_TIMEOUT):
         return
 
-    # Cleanup fichiers generes, garder le cache d'execution (modeles en memoire)
     cleanup_ephemeral(CLEANUP_DIRS)
     clear_comfyui_history()
+    elapsed = time.time() - start
+    print(f"[wrapper] Modeles charges ({elapsed:.0f}s), cache embeddings restants...")
+
+    # Prompts suivants : text encoder deja en memoire, juste l'encodage CPU
+    for prompt_text in CAMERA_PROMPTS[1:]:
+        label = prompt_text[:40]
+        workflow = _build_warmup_workflow(prompt_text)
+        if not _submit_and_wait(workflow, f"Embedding ({label}...)", WARMUP_TIMEOUT):
+            continue
+        cleanup_ephemeral(CLEANUP_DIRS)
+        clear_comfyui_history()
 
     elapsed = time.time() - start
-    print(f"[wrapper] Pre-warming termine ({elapsed:.0f}s) - modeles prets")
+    print(f"[wrapper] Pre-warming termine ({elapsed:.0f}s) - {len(CAMERA_PROMPTS)} prompts caches")
 
 
 print("[wrapper] Verification noeuds custom ComfyUI...")
