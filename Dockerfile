@@ -9,7 +9,7 @@
 # Serverless:  docker run --gpus all -e SERVERLESS=true -v /workspace:/workspace medusa-i2v
 
 # ============================================================
-# Stage 1 : builder (compile PyTorch, Q8-Kernels, extensions)
+# Stage 1 : builder (compile PyTorch, extensions)
 # ============================================================
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04 AS builder
 
@@ -44,17 +44,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install packaging setuptools wheel
 
-# --- LTX-Video Q8 Kernels (FP8 optimise, requiert CUDA 12.8+) ---
-# Le setup.py appelle torch.cuda.get_device_capability() au build,
-# ce qui echoue sans GPU. On patche pour utiliser un fallback env var.
-# TORCH_CUDA_ARCH_LIST cible: RTX 4090 / L40S (8.9)
-RUN --mount=type=cache,target=/root/.cache/pip \
-    git clone --filter=blob:none --quiet https://github.com/Lightricks/LTX-Video-Q8-Kernels.git /tmp/q8-kernels && \
-    cd /tmp/q8-kernels && git submodule update --init --recursive -q && \
-    python -c "t=open('setup.py').read(); open('setup.py','w').write(t.replace('major, minor = torch.cuda.get_device_capability(0)','try:\n        major, minor = torch.cuda.get_device_capability(0)\n    except RuntimeError:\n        import os; return os.environ.get(\"Q8_DEVICE_ARCH\", \"ada\")'))" && \
-    TORCH_CUDA_ARCH_LIST="8.9" Q8_DEVICE_ARCH=ada \
-    pip install --no-build-isolation . && \
-    rm -rf /tmp/q8-kernels
+# --- LTX-Video Q8 Kernels --- DESACTIVE ---
+# Incompatible avec LTX-2 19B AV model (dual-stream video+audio).
+# Le fused_forward crash car le modele passe un tuple au lieu d'un tensor.
+# A reactiver si Lightricks met a jour q8_kernels pour supporter AV.
+# RUN --mount=type=cache,target=/root/.cache/pip \
+#     git clone --filter=blob:none --quiet https://github.com/Lightricks/LTX-Video-Q8-Kernels.git /tmp/q8-kernels && \
+#     cd /tmp/q8-kernels && git submodule update --init --recursive -q && \
+#     TORCH_CUDA_ARCH_LIST="8.9" Q8_DEVICE_ARCH=ada \
+#     pip install --no-build-isolation . && \
+#     rm -rf /tmp/q8-kernels
 
 # --- ComfyUI + Python dependencies ---
 COPY requirements.txt /tmp/requirements.txt
