@@ -48,10 +48,11 @@ Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib
 ## Architecture Pipeline
 
 - **MedusaPipeline** : encapsule ltx-pipelines avec gestion lifecycle modeles
-  - Video encoder persistent en VRAM (~1GB)
+  - Video encoder persistent en VRAM (~1GB), charge apres warmup embeddings
   - Transformer cache par camera LoRA (reste en VRAM entre jobs)
-  - Text encoder sur CPU, embeddings pre-caches sur disque
+  - Text encoder Gemma sur CPU (~24GB RAM), embeddings pre-caches sur disque
   - Video decoder charge/decharge par job
+- **Ordre d'init** (evite OOM) : warmup embeddings → del Gemma → video encoder → transformer
 - **Audio skip** : `skip_step=99` sur audio guider → audio compute seulement au step 0/8
 - **CFG desactive** : `cfg_scale=1.0, stg_scale=0.0` → 1 seul forward par step
 - **Sigmas distilled** : 8 steps hardcodes (DISTILLED_SIGMA_VALUES)
@@ -68,7 +69,10 @@ Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib
 ## Points d'Attention
 
 - Le text encoder Gemma DOIT etre format HuggingFace (pas Comfy-Org single file)
-- Le text encoder DOIT rester sur CPU (VRAM insuffisante)
+- Le text encoder DOIT rester sur CPU (VRAM insuffisante, 24GB Gemma vs 24GB 4090)
 - Le VAE decode doit utiliser TilingConfig.default() pour eviter les OOM
 - num_frames doit etre k*8+1 (ex: 25, 49, 97)
 - height/width doivent etre multiples de 32
+- `transformers` DOIT etre pince `>=4.52,<5.0` (v5 supprime `rope_local_base_freq` de Gemma3TextConfig)
+- `huggingface-cli` n'est pas dans l'image Docker, utiliser `huggingface_hub.snapshot_download()` a la place
+- Pre-generer `embeddings_cache.pt` sur une machine avec >24GB RAM evite de charger Gemma au runtime
