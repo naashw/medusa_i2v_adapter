@@ -26,7 +26,6 @@ from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDO
 from ltx_core.model.video_vae import TilingConfig
 from ltx_core.model.video_vae import decode_video as vae_decode_video
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.quantization.fp8_cast import UPCAST_DURING_INFERENCE
 from ltx_core.text_encoders.gemma import encode_text
 from ltx_core.types import LatentState, VideoPixelShape
 from ltx_pipelines.utils import ModelLedger
@@ -42,6 +41,30 @@ from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.types import PipelineComponents
 
 log = logging.getLogger("medusa")
+
+# --- Monkey-patch : fallback CPU pour _fuse_delta_with_cast_fp8 ---
+# La version installee utilise calculate_weight_float8 (kernel Triton, CUDA-only).
+# Ce patch ajoute le path CPU present dans les versions recentes de ltx-core.
+import ltx_core.loader.fuse_loras as _fuse_loras_mod  # noqa: E402
+
+_orig_fuse_cast = _fuse_loras_mod._fuse_delta_with_cast_fp8
+
+
+def _cpu_safe_fuse_delta_with_cast_fp8(
+    deltas: torch.Tensor,
+    weight: torch.Tensor,
+    key: str,
+    target_dtype: torch.dtype,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    if str(device).startswith("cuda"):
+        return _orig_fuse_cast(deltas, weight, key, target_dtype, device)
+    # CPU path : dequant FP8→BF16, add delta, recast
+    deltas.add_(weight.to(dtype=deltas.dtype, device=device))
+    return {key: deltas.to(dtype=target_dtype)}
+
+
+_fuse_loras_mod._fuse_delta_with_cast_fp8 = _cpu_safe_fuse_delta_with_cast_fp8
 
 # LoRA strengths (matches current ComfyUI workflow)
 DISTILLED_LORA_STRENGTH = 0.7
@@ -184,8 +207,9 @@ class MedusaPipeline:
     def _get_transformer(self, camera_lora_path: str) -> torch.nn.Module:
         """Retourne le transformer avec le bon camera LoRA, cache en VRAM.
 
-        Build sur CPU (RAM) en BF16 pour eviter les ops FP8/Triton (CUDA-only),
-        puis re-quantize en FP8, applique les hooks upcast, et transfere en VRAM.
+        Build sur CPU (RAM) pour eviter OOM VRAM pendant le merge LoRA,
+        puis transfert du modele merge (~20GB FP8) vers GPU.
+        Le monkey-patch _cpu_safe_fuse_delta_with_cast_fp8 gere les ops FP8 sur CPU.
         """
         if camera_lora_path == self._current_camera_lora and self._transformer is not None:
             return self._transformer
@@ -198,13 +222,13 @@ class MedusaPipeline:
             LoraPathStrengthAndSDOps(camera_lora_path, CAMERA_LORA_STRENGTH, LTXV_LORA_COMFY_RENAMING_MAP),
         ]
 
-        # Build sur CPU SANS quantization FP8 — le merge LoRA se fait en BF16
-        # (QuantizationPolicy.fp8_cast() utilise un kernel Triton CUDA-only dans apply_loras)
+        # Build sur CPU avec fp8_cast (le monkey-patch ajoute le fallback CPU)
         cpu_ledger = ModelLedger(
             dtype=self.dtype,
             device=torch.device("cpu"),
             checkpoint_path=self._checkpoint_path,
             loras=all_loras,
+            quantization=QuantizationPolicy.fp8_cast(),
         )
 
         # Liberer l'ancien transformer
@@ -212,26 +236,15 @@ class MedusaPipeline:
             del self._transformer
             cleanup_memory()
 
-        log.info("Build transformer + merge LoRAs sur CPU (BF16)...")
+        log.info("Build transformer + merge LoRAs sur CPU...")
         transformer = cpu_ledger.transformer()
-        del cpu_ledger
-        cleanup_memory()
-
-        # Re-quantize les poids Linear en FP8 sur CPU (~38GB BF16 → ~20GB FP8)
-        log.info("Downcast FP8 + hooks upcast inference...")
-        for module in transformer.modules():
-            if isinstance(module, torch.nn.Linear):
-                module.weight.data = module.weight.data.to(torch.float8_e4m3fn)
-                if module.bias is not None:
-                    module.bias.data = module.bias.data.to(torch.float8_e4m3fn)
-
-        # Hooks upcast FP8→BF16 pendant le forward (equivalent de QuantizationPolicy.fp8_cast())
-        UPCAST_DURING_INFERENCE.mutator(transformer)
 
         log.info("Transfert vers GPU...")
         self._transformer = transformer.to(self.device)
         self._current_camera_lora = camera_lora_path
 
+        # Liberer le ledger CPU
+        del cpu_ledger
         cleanup_memory()
 
         log.info("Transformer pret en VRAM.")
