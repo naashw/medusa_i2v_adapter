@@ -101,9 +101,8 @@ class MedusaPipeline:
             quantization=QuantizationPolicy.fp8_cast(),
         )
 
-        # Video encoder persistent (~1GB VRAM)
-        log.info("Chargement video encoder (persistent)...")
-        self._video_encoder = self._base_ledger.video_encoder()
+        # Video encoder (charge apres warmup embeddings pour eviter OOM)
+        self._video_encoder: torch.nn.Module | None = None
 
         # Cache transformer (par camera LoRA)
         self._transformer: torch.nn.Module | None = None
@@ -165,6 +164,11 @@ class MedusaPipeline:
         del text_encoder
         del cpu_ledger
         cleanup_memory()
+
+    def load_video_encoder(self) -> None:
+        """Charge le video encoder en VRAM (~1GB). Appeler apres warmup_embeddings."""
+        log.info("Chargement video encoder (persistent)...")
+        self._video_encoder = self._base_ledger.video_encoder()
 
     def _load_embeddings_cache(self, cache_path: str) -> None:
         """Charge les embeddings depuis un fichier .pt."""

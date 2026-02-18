@@ -305,12 +305,15 @@ def init_pipeline() -> MedusaPipeline:
     log.info("Initialisation MedusaPipeline...")
     p = MedusaPipeline(models_dir=MODELS_DIR)
 
-    # Warmup embeddings
+    # 1. Warmup embeddings EN PREMIER (Gemma 24GB CPU seul, avant tout GPU)
     embeddings_cache_dir = os.path.join(CACHE_DIR, "embeddings")
     os.makedirs(embeddings_cache_dir, exist_ok=True)
     p.warmup_embeddings(embeddings_cache_dir)
 
-    # Pre-charge le premier transformer (dolly-in par defaut)
+    # 2. Video encoder persistent (~1GB VRAM, apres liberation Gemma)
+    p.load_video_encoder()
+
+    # 3. Pre-charge le premier transformer (dolly-in par defaut)
     default_lora = os.path.join(MODELS_DIR, "loras", CAMERAS["dolly-in"][0])
     log.info("Pre-chargement transformer (dolly-in)...")
     p._get_transformer(default_lora)
