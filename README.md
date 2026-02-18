@@ -1,6 +1,6 @@
-# Medusa I2V - ComfyUI + LTX-2 19B
+# Medusa I2V - ltx-pipelines + LTX-2 19B
 
-Pipeline Image-to-Video avec effets camera dolly, base sur ComfyUI et LTX-2 19B.
+Pipeline Image-to-Video avec effets camera dolly, inference directe via ltx-pipelines (sans ComfyUI).
 
 ## Structure
 
@@ -8,30 +8,15 @@ Pipeline Image-to-Video avec effets camera dolly, base sur ComfyUI et LTX-2 19B.
 medusa_i2v_adapter/
 ├── Dockerfile
 ├── docker-compose.yml
-├── .dockerignore
+├── requirements.txt
 ├── src/
-│   ├── start.sh                  # Script de demarrage
-│   └── extra_model_paths.yaml    # Template chemins modeles
-├── workflows/                    # 8 workflows actifs
-│   ├── medusa_i2v_1pass_fast.json
-│   ├── medusa_i2v_1pass_upscale.json
-│   ├── medusa_i2v_1pass_upscale_clean.json
-│   ├── medusa_i2v_1pass_upscale_api.json
-│   ├── medusa_i2v_2pass_adaptive.json
-│   ├── medusa_i2v_v2_spatial_api.json
-│   ├── medusa_i2v_v3_native_api.json
-│   └── medusa_i2v_v5_fast_api.json
-├── scripts/                      # Utilitaires
-│   ├── check-status.sh
-│   ├── send-workflow.sh
-│   ├── convert_ui_to_api.py
-│   ├── test-v2-spatial.sh
-│   └── run-test.sh
+│   ├── start.sh           # Telechargement modeles + lancement
+│   ├── pipeline.py        # MedusaPipeline (inference ltx-pipelines)
+│   └── handler.py         # Handler RunPod serverless
+├── workflows/             # Reference ComfyUI (plus utilises en prod)
+├── scripts/               # Utilitaires
 ├── docs/
-│   ├── WORKFLOWS.md
-│   └── example-request.json
 └── test-data/
-    └── images_test_immo/
 ```
 
 ## Docker
@@ -39,13 +24,13 @@ medusa_i2v_adapter/
 ### Build
 
 ```bash
-DOCKER_BUILDKIT=1 docker build -t medusa-i2v .
+DOCKER_BUILDKIT=1 docker build --platform linux/amd64 -t medusa-i2v .
 ```
 
 ### Run (GPU Pod)
 
 ```bash
-docker run --gpus all -p 8188:8188 -p 8888:8888 -v /workspace:/workspace medusa-i2v
+docker run --gpus all -p 8888:8888 -v /workspace:/workspace medusa-i2v
 ```
 
 ### Run (Serverless)
@@ -60,23 +45,71 @@ docker run --gpus all -e SERVERLESS=true -v /workspace:/workspace medusa-i2v
 docker compose up
 ```
 
-## Workflows
+## API
 
-| Workflow | Description |
-|----------|-------------|
-| `medusa_i2v_v5_fast_api.json` | API rapide (recommande) |
-| `medusa_i2v_1pass_fast.json` | 1 passe rapide (~1s) |
-| `medusa_i2v_1pass_upscale.json` | 1 passe + upscale |
-| `medusa_i2v_1pass_upscale_clean.json` | 1 passe + upscale (nettoye) |
-| `medusa_i2v_1pass_upscale_api.json` | 1 passe + upscale (API) |
-| `medusa_i2v_2pass_adaptive.json` | 2 passes resolution adaptative |
-| `medusa_i2v_v2_spatial_api.json` | v2 spatial upscaler (API) |
-| `medusa_i2v_v3_native_api.json` | v3 noeuds natifs (API) |
+### Input
+
+```json
+{
+  "input": {
+    "image": "https://example.com/photo.jpg",
+    "camera": "dolly-in",
+    "seed": 12345,
+    "num_frames": 25,
+    "frame_rate": 24,
+    "image_strength": 1.0
+  }
+}
+```
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `image` | string | **requis** | URL https ou base64 |
+| `camera` | string | `dolly-in` | dolly-in/out/left/right, jib-up/down, static |
+| `seed` | int | random | Seed generation |
+| `num_frames` | int | `25` | Nombre de frames (doit etre k*8+1) |
+| `frame_rate` | float | `24` | FPS |
+| `image_strength` | float | `1.0` | Force conditioning image |
+| `prompt` | string | auto | Override prompt (sinon genere depuis camera) |
+| `negative_prompt` | string | default | Override negative prompt |
+
+### Output
+
+```json
+{
+  "images": [
+    {
+      "filename": "medusa_i2v_job-123.mp4",
+      "content_type": "video",
+      "size_mb": 1.5,
+      "volume_path": "/runpod-volume/output/job-123/medusa_i2v_job-123.mp4",
+      "s3_key": "output/job-123/medusa_i2v_job-123.mp4"
+    }
+  ]
+}
+```
+
+### Exemple curl (RunPod)
+
+```bash
+curl -X POST "https://api.runpod.ai/v2/${ENDPOINT_ID}/runsync" \
+  -H "Authorization: Bearer ${RUNPOD_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": {
+      "image": "https://example.com/photo.jpg",
+      "camera": "dolly-in",
+      "seed": 42
+    }
+  }'
+```
 
 ## Modeles
 
-Les modeles sont telecharges automatiquement au runtime sur le network volume :
-- LTX-2 19B (FP8) — checkpoint principal
-- Gemma 3 12B (FP8) — text encoder
-- LoRA distilled + camera control
-- Spatial/temporal upscalers
+Telecharges automatiquement au runtime sur le network volume :
+
+- **LTX-2 19B** (FP8, ~10GB) — checkpoint principal
+- **Gemma 3 12B** (BF16, ~24GB) — text encoder (format HuggingFace, CPU)
+- **LoRA distilled** — acceleration inference (8 steps)
+- **I2V Adapter** — conditioning image
+- **Camera LoRAs** (x7) — controle camera (dolly, jib, static)

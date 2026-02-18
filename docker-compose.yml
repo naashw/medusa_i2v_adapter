@@ -11,20 +11,13 @@ services:
               count: 1
               capabilities: [gpu]
         limits:
-          memory: 32G
+          memory: 64G
     ports:
-      - "8188:8188"
       - "8888:8888"
     volumes:
       - ./data:/workspace
     environment:
       - WORKSPACE=/workspace
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8188/system_stats"]
-      interval: 30s
-      timeout: 10s
-      start_period: 300s
-      retries: 3
     logging:
       driver: json-file
       options:

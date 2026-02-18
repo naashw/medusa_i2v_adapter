@@ -116,7 +116,7 @@
       "12": {
         "inputs": {
           "resize_type": "scale to multiple",
-          "resize_type.multiple": 8,
+          "resize_type.multiple": 32,
           "scale_method": "area",
           "input": [
             "11",
@@ -125,7 +125,7 @@
         },
         "class_type": "ResizeImageMaskNode",
         "_meta": {
-          "title": "Align to 64px (keeps ratio)"
+          "title": "Align to 32px (keeps ratio)"
         }
       },
       "14": {

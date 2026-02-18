@@ -1,55 +1,74 @@
-# CLAUDE.md - Medusa I2V ComfyUI Project
+# CLAUDE.md - Medusa I2V (ltx-pipelines)
 
 ## Projet
 
-Pipeline ComfyUI Image-to-Video utilisant LTX-2 19B avec effet camera dolly.
+Pipeline Image-to-Video utilisant LTX-2 19B avec effet camera dolly.
+Inference directe via ltx-pipelines (sans ComfyUI).
 Objectif : generation rapide de videos dolly a partir d'images, qualite correcte.
 
 ## Contexte Technique
 
-- **Runtime** : ComfyUI 0.13.0 sur RunPod Serverless (RTX 4090, 24GB VRAM)
+- **Runtime** : ltx-pipelines (Python direct) sur RunPod Serverless (RTX 4090, 24GB VRAM)
 - **Modele principal** : LTX-2 19B AV model (FP8, ~20GB VRAM)
-- **Text encoder** : Gemma 3 12B (FP8, CPU — ~15GB RAM)
-- **Approche** : Pipeline 1 passe, 720p natif, 8 steps Euler distilled
+- **Text encoder** : Gemma 3 12B (BF16, CPU — ~24GB RAM, format HuggingFace)
+- **Approche** : Pipeline 1 passe, 720p natif, 8 steps Euler distilled, audio skip
 - **Output** : H264 MP4, 24fps, ~1 seconde (25 frames)
-- **PyTorch** : 2.10.0+cu128
+- **PyTorch** : ~2.7 (requis par ltx-core)
+- **Packages** : ltx-core + ltx-pipelines (depuis Lightricks/LTX-2)
 
 ## Structure
 
-- `Dockerfile` — image Docker multi-stage (devel builder -> runtime)
+- `Dockerfile` — image Docker multi-stage (devel builder -> runtime), sans ComfyUI
 - `docker-compose.yml` — lancement local avec GPU
-- `src/start.sh` — script de demarrage (telecharge modeles + lance ComfyUI)
-- `src/handler_wrapper.py` — wrapper RunPod (URL->base64, sauvegarde volume, dedup cache)
-- `src/extra_model_paths.yaml` — template des chemins modeles
-- `workflows/` — 2 workflows actifs + 1 archive
+- `src/start.sh` — script de demarrage (telecharge modeles + lance handler)
+- `src/pipeline.py` — classe MedusaPipeline (inference ltx-pipelines)
+- `src/handler.py` — handler RunPod serverless (API simplifiee)
+- `workflows/` — reference ComfyUI (plus utilises en production)
 - `scripts/` — scripts utilitaires (test, envoi, conversion)
 - `docs/` — documentation et exemples
 - `test-data/` — images de test
 
-## Workflows
+## API Input
 
-- `workflows/720p_native_1pass_api.json` — **production** : 720p natif, 1 passe, 8 steps
-- `workflows/2pass_spatial_upscale_api.json` — ancien : 2 passes half-res + spatial upscale 2x
-- `workflows/_unusable_720p_Q8_kernels_api.json` — archive : tentative Q8 (incompatible AV model)
+```json
+{
+  "input": {
+    "image": "https://example.com/photo.jpg",
+    "camera": "dolly-in",
+    "seed": 12345,
+    "num_frames": 25,
+    "frame_rate": 24,
+    "image_strength": 1.0
+  }
+}
+```
 
-## Etat Actuel
+Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib-up, static.
 
-- 1 passe 720p natif fonctionne (8 steps Euler, distilled + camera LoRA)
-- `--disable-smart-memory` actif (transformer reste en VRAM entre jobs)
-- I2V Adapter actif, resolution adaptative OK
-- Dedup cache par hash (meme input + meme workflow = skip)
-- Q8 Kernels incompatible avec LTX-2 19B (architecture AV dual-stream)
+## Architecture Pipeline
+
+- **MedusaPipeline** : encapsule ltx-pipelines avec gestion lifecycle modeles
+  - Video encoder persistent en VRAM (~1GB)
+  - Transformer cache par camera LoRA (reste en VRAM entre jobs)
+  - Text encoder sur CPU, embeddings pre-caches sur disque
+  - Video decoder charge/decharge par job
+- **Audio skip** : `skip_step=99` sur audio guider → audio compute seulement au step 0/8
+- **CFG desactive** : `cfg_scale=1.0, stg_scale=0.0` → 1 seul forward par step
+- **Sigmas distilled** : 8 steps hardcodes (DISTILLED_SIGMA_VALUES)
 
 ## Conventions
 
 - Prefixe output : `medusa_i2v`
-- Les workflows sont au format API RunPod (workflow neste dans `input.workflow`)
-- Le noeud camera LoRA est marque "SWAP ICI" pour changement rapide d'effet
+- Reponse API : `images[]` avec `s3_key` + `volume_path`
+- Input images : supporte URL https OU base64
+- Output videos : sauvegardees dans `/runpod-volume/output/{job_id}/`
+- Dedup cache par hash dans `/runpod-volume/cache/dedup/`
+- Embeddings cache dans `/runpod-volume/cache/embeddings/`
 
 ## Points d'Attention
 
-- Ne pas modifier la structure des liens sans verifier les IDs dans le JSON
-- Le text encoder DOIT rester sur CPU (VRAM insuffisante pour tout charger sur GPU)
-- Le VAE decode doit rester en mode tiled pour eviter les OOM
-- Q8 Kernels (`q8_kernels`) ne supporte pas le modele AV (tuple dual-stream video+audio)
-- ComfyUI-LTXVideo pinne au commit `82bd963c` (2026-02-11)
+- Le text encoder Gemma DOIT etre format HuggingFace (pas Comfy-Org single file)
+- Le text encoder DOIT rester sur CPU (VRAM insuffisante)
+- Le VAE decode doit utiliser TilingConfig.default() pour eviter les OOM
+- num_frames doit etre k*8+1 (ex: 25, 49, 97)
+- height/width doivent etre multiples de 32

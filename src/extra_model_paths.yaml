@@ -1,6 +1,0 @@
-medusa:
-    base_path: /workspace/models
-    checkpoints: checkpoints
-    loras: loras
-    text_encoders: text_encoders
-    latent_upscale_models: latent_upscale_models

@@ -18,7 +18,7 @@ cleanup() {
 trap cleanup SIGTERM SIGINT SIGQUIT
 
 echo "============================================"
-echo "  Medusa I2V - ComfyUI + LTX-2 19B"
+echo "  Medusa I2V - ltx-pipelines + LTX-2 19B"
 echo "============================================"
 
 # -----------------------------------------------
@@ -35,14 +35,11 @@ fi
 # -----------------------------------------------
 # 2. Workspace / Network volume
 # -----------------------------------------------
-# RunPod Serverless monte le network volume sur /runpod-volume
-# GPU Pods utilisent /workspace
 if [ -d "/runpod-volume" ]; then
     WORKSPACE="${WORKSPACE:-/runpod-volume}"
 else
     WORKSPACE="${WORKSPACE:-/workspace}"
 fi
-COMFYUI_DIR="/ComfyUI"
 MODELS_DIR="${WORKSPACE}/models"
 
 echo "[medusa] Workspace: $WORKSPACE"
@@ -51,28 +48,13 @@ echo "[medusa] Models dir: $MODELS_DIR"
 mkdir -p "${MODELS_DIR}/checkpoints"
 mkdir -p "${MODELS_DIR}/text_encoders"
 mkdir -p "${MODELS_DIR}/loras"
-mkdir -p "${MODELS_DIR}/latent_upscale_models"
+
+# Exporter pour handler.py
+export MODELS_DIR="$MODELS_DIR"
+export VOLUME_ROOT="$WORKSPACE"
 
 # -----------------------------------------------
-# 3. extra_model_paths.yaml (ComfyUI -> workspace)
-# -----------------------------------------------
-if [ -f /extra_model_paths.yaml ]; then
-    sed "s|/workspace/models|${MODELS_DIR}|g" /extra_model_paths.yaml > "${COMFYUI_DIR}/extra_model_paths.yaml"
-    echo "[medusa] extra_model_paths.yaml configure (depuis template)"
-else
-    cat > "${COMFYUI_DIR}/extra_model_paths.yaml" << EOF
-medusa:
-    base_path: ${MODELS_DIR}
-    checkpoints: checkpoints
-    loras: loras
-    text_encoders: text_encoders
-    latent_upscale_models: latent_upscale_models
-EOF
-    echo "[medusa] extra_model_paths.yaml configure (genere dynamiquement)"
-fi
-
-# -----------------------------------------------
-# 5. Fonction de telechargement
+# 3. Fonction de telechargement
 # -----------------------------------------------
 download_model() {
     local url="$1"
@@ -113,7 +95,7 @@ download_model() {
 }
 
 # -----------------------------------------------
-# 6. Telechargement des modeles (en parallele)
+# 4. Telechargement des modeles (en parallele)
 # -----------------------------------------------
 echo "[medusa] Demarrage des telechargements..."
 DOWNLOAD_PIDS=()
@@ -122,12 +104,6 @@ DOWNLOAD_PIDS=()
 download_model \
     "https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-dev-fp8.safetensors" \
     "${MODELS_DIR}/checkpoints" 10000000000 &
-DOWNLOAD_PIDS+=($!)
-
-# --- Text encoder (>6GB) ---
-download_model \
-    "https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors" \
-    "${MODELS_DIR}/text_encoders" 6000000000 &
 DOWNLOAD_PIDS+=($!)
 
 # --- Distilled LoRA (>100MB) ---
@@ -140,18 +116,6 @@ DOWNLOAD_PIDS+=($!)
 download_model \
     "https://huggingface.co/MachineDelusions/LTX-2_Image2Video_Adapter_LoRa/resolve/main/LTX-2-Image2Vid-Adapter.safetensors" \
     "${MODELS_DIR}/loras" 100000000 &
-DOWNLOAD_PIDS+=($!)
-
-# --- Spatial upscaler (>50MB) ---
-download_model \
-    "https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-spatial-upscaler-x2-1.0.safetensors" \
-    "${MODELS_DIR}/latent_upscale_models" 50000000 &
-DOWNLOAD_PIDS+=($!)
-
-# --- Temporal upscaler (>50MB) ---
-download_model \
-    "https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-temporal-upscaler-x2-1.0.safetensors" \
-    "${MODELS_DIR}/latent_upscale_models" 50000000 &
 DOWNLOAD_PIDS+=($!)
 
 # --- Camera LoRAs (>100MB each) ---
@@ -170,6 +134,18 @@ for lora_url in "${CAMERA_LORAS[@]}"; do
     DOWNLOAD_PIDS+=($!)
 done
 
+# --- Gemma 3 12B (format HuggingFace, ~24GB BF16) ---
+GEMMA_DIR="${MODELS_DIR}/text_encoders/gemma-3-12b-it"
+if [ -d "$GEMMA_DIR" ] && [ -f "$GEMMA_DIR/config.json" ]; then
+    echo "[medusa] Deja present: gemma-3-12b-it/"
+else
+    echo "[medusa] Telechargement: gemma-3-12b-it (HuggingFace format, ~24GB)..."
+    huggingface-cli download google/gemma-3-12b-it \
+        --local-dir "$GEMMA_DIR" \
+        --exclude "*.gguf" "*.bin" &
+    DOWNLOAD_PIDS+=($!)
+fi
+
 # Attendre tous les telechargements et verifier les codes retour
 echo "[medusa] Attente fin des telechargements..."
 DOWNLOAD_FAILED=0
@@ -186,7 +162,7 @@ fi
 echo "[medusa] Tous les modeles sont prets."
 
 # -----------------------------------------------
-# 7. Demarrage (GPU Pod ou Serverless)
+# 5. Demarrage
 # -----------------------------------------------
 if [ "${SERVERLESS:-}" = "true" ] || [ -n "${RUNPOD_ENDPOINT_ID:-}" ]; then
     # ===== MODE SERVERLESS =====
@@ -201,67 +177,34 @@ if [ "${SERVERLESS:-}" = "true" ] || [ -n "${RUNPOD_ENDPOINT_ID:-}" ]; then
     echo "[medusa] Output dir: $OUTPUT_DIR"
     echo "[medusa] Cache dir: $CACHE_DIR"
 
-    # Sync embedding cache depuis le volume (persistant entre cold starts)
-    EMBEDDING_CACHE_VOL="${WORKSPACE}/cache/embeddings"
-    EMBEDDING_CACHE_LOCAL="/ComfyUI/cache/embeddings"
-    if [ -d "$EMBEDDING_CACHE_VOL" ]; then
-        PT_COUNT=$(find "$EMBEDDING_CACHE_VOL" -name "*.pt" 2>/dev/null | wc -l)
-        if [ "$PT_COUNT" -gt 0 ]; then
-            mkdir -p "$EMBEDDING_CACHE_LOCAL"
-            cp "$EMBEDDING_CACHE_VOL"/*.pt "$EMBEDDING_CACHE_LOCAL/" 2>/dev/null
-            echo "[medusa] Embeddings cache: $PT_COUNT fichier(s) copies depuis volume"
-        fi
-    fi
-
-    # Desactiver ComfyUI-Manager network checks (economise ~2min au cold start)
-    MANAGER_DIR="${COMFYUI_DIR}/user/__manager"
-    mkdir -p "$MANAGER_DIR"
-    cat > "${MANAGER_DIR}/config.ini" << EOF
-[default]
-network_mode = offline
-EOF
-    echo "[medusa] ComfyUI-Manager: mode offline (serverless)"
-
-    cd "${COMFYUI_DIR}"
-    python main.py \
-        --listen 127.0.0.1 \
-        --port 8188 \
-        --disable-auto-launch \
-        --disable-metadata \
-        --disable-smart-memory \
-        --reserve-vram 0 \
-        --extra-model-paths-config "${COMFYUI_DIR}/extra_model_paths.yaml" &
-    COMFYUI_PID=$!
-    CHILD_PIDS+=($COMFYUI_PID)
-
-    echo "[medusa] Demarrage du handler RunPod..."
-    exec python /handler_wrapper.py
+    exec python /app/handler.py
 
 else
     # ===== MODE GPU POD =====
     echo "[medusa] Mode: GPU POD (interactif)"
 
     # JupyterLab avec token securise
-    if [ -z "${JUPYTER_TOKEN:-}" ]; then
-        JUPYTER_TOKEN=$(python -c "import secrets; print(secrets.token_hex(32))")
-        echo "[medusa] JupyterLab token genere: ${JUPYTER_TOKEN}"
+    if command -v jupyter &>/dev/null; then
+        if [ -z "${JUPYTER_TOKEN:-}" ]; then
+            JUPYTER_TOKEN=$(python -c "import secrets; print(secrets.token_hex(32))")
+            echo "[medusa] JupyterLab token genere: ${JUPYTER_TOKEN}"
+        fi
+
+        jupyter lab \
+            --ip=0.0.0.0 \
+            --port=8888 \
+            --no-browser \
+            --allow-root \
+            --ServerApp.token="${JUPYTER_TOKEN}" \
+            --ServerApp.allow_origin='*' \
+            --notebook-dir="${WORKSPACE}" &
+        CHILD_PIDS+=($!)
+        echo "[medusa] JupyterLab demarre sur port 8888"
     fi
 
-    jupyter lab \
-        --ip=0.0.0.0 \
-        --port=8888 \
-        --no-browser \
-        --allow-root \
-        --ServerApp.token="${JUPYTER_TOKEN}" \
-        --ServerApp.allow_origin='*' \
-        --notebook-dir="${WORKSPACE}" &
-    CHILD_PIDS+=($!)
-    echo "[medusa] JupyterLab demarre sur port 8888"
+    echo "[medusa] GPU Pod pret. Pipeline disponible via Python."
+    echo "[medusa] Pour lancer le handler manuellement : python /app/handler.py"
 
-    echo "[medusa] Demarrage ComfyUI sur port 8188..."
-    cd "${COMFYUI_DIR}"
-    exec python main.py \
-        --listen 0.0.0.0 \
-        --port 8188 \
-        --extra-model-paths-config "${COMFYUI_DIR}/extra_model_paths.yaml"
+    # Garder le container en vie
+    wait
 fi
