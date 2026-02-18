@@ -182,6 +182,11 @@ if [ "${SERVERLESS:-}" = "true" ] || [ -n "${RUNPOD_ENDPOINT_ID:-}" ]; then
     echo "[medusa] Output dir: $OUTPUT_DIR"
     echo "[medusa] Cache dir: $CACHE_DIR"
 
+    # Warmup embeddings dans un process isole (l'OS recupere 100% RAM a la fin)
+    echo "[medusa] Warmup embeddings (process isole)..."
+    CUDA_VISIBLE_DEVICES="" python /app/warmup_embeddings.py
+    echo "[medusa] Warmup termine, lancement handler..."
+
     exec python /app/handler.py
 
 else
