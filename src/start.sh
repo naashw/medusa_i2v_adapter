@@ -140,9 +140,14 @@ if [ -d "$GEMMA_DIR" ] && [ -f "$GEMMA_DIR/config.json" ]; then
     echo "[medusa] Deja present: gemma-3-12b-it/"
 else
     echo "[medusa] Telechargement: gemma-3-12b-it (HuggingFace format, ~24GB)..."
-    huggingface-cli download google/gemma-3-12b-it \
-        --local-dir "$GEMMA_DIR" \
-        --exclude "*.gguf" "*.bin" &
+    python -c "
+from huggingface_hub import snapshot_download
+snapshot_download(
+    'google/gemma-3-12b-it',
+    local_dir='$GEMMA_DIR',
+    ignore_patterns=['*.gguf', '*.bin'],
+)
+" &
     DOWNLOAD_PIDS+=($!)
 fi
 
