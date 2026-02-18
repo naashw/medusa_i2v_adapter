@@ -10,9 +10,10 @@ medusa_i2v_adapter/
 ├── docker-compose.yml
 ├── requirements.txt
 ├── src/
-│   ├── start.sh           # Telechargement modeles + lancement
-│   ├── pipeline.py        # MedusaPipeline (inference ltx-pipelines)
-│   └── handler.py         # Handler RunPod serverless
+│   ├── start.sh                # Telechargement modeles + lancement
+│   ├── warmup_embeddings.py    # Warmup embeddings low-RAM (process isole)
+│   ├── pipeline.py             # MedusaPipeline (inference ltx-pipelines)
+│   └── handler.py              # Handler RunPod serverless
 ├── workflows/             # Reference ComfyUI (plus utilises en prod)
 ├── scripts/               # Utilitaires
 ├── docs/
