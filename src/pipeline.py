@@ -88,16 +88,17 @@ class MedusaPipeline:
         # Pipeline components (patchifiers + scale factors)
         self._components = PipelineComponents(dtype=self.dtype, device=self.device)
 
-        # Base ModelLedger (checkpoint + distilled + i2v adapter, sans camera LoRA)
+        # Base LoRAs (distilled + i2v adapter, utilisees pour chaque transformer build)
         self._base_loras = [
             LoraPathStrengthAndSDOps(self._distilled_lora, DISTILLED_LORA_STRENGTH, LTXV_LORA_COMFY_RENAMING_MAP),
             LoraPathStrengthAndSDOps(self._i2v_adapter, I2V_ADAPTER_STRENGTH, LTXV_LORA_COMFY_RENAMING_MAP),
         ]
+
+        # Base ModelLedger SANS LoRAs — uniquement pour video_encoder et video_decoder (VAE)
         self._base_ledger = ModelLedger(
             dtype=self.dtype,
             device=self.device,
             checkpoint_path=self._checkpoint_path,
-            loras=self._base_loras,
             quantization=QuantizationPolicy.fp8_cast(),
         )
 
@@ -107,7 +108,6 @@ class MedusaPipeline:
         # Cache transformer (par camera LoRA)
         self._transformer: torch.nn.Module | None = None
         self._current_camera_lora: str | None = None
-        self._current_ledger: ModelLedger | None = None
 
         # Embeddings cache (prompt -> (video_ctx, audio_ctx))
         self._embeddings_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -181,7 +181,11 @@ class MedusaPipeline:
         log.info("Embeddings charges: %d prompts", len(self._embeddings_cache))
 
     def _get_transformer(self, camera_lora_path: str) -> torch.nn.Module:
-        """Retourne le transformer avec le bon camera LoRA, cache en VRAM."""
+        """Retourne le transformer avec le bon camera LoRA, cache en VRAM.
+
+        Build sur CPU (RAM) pour eviter OOM VRAM pendant le merge LoRA,
+        puis transfert du modele merge (~20GB) vers GPU.
+        """
         if camera_lora_path == self._current_camera_lora and self._transformer is not None:
             return self._transformer
 
@@ -193,17 +197,32 @@ class MedusaPipeline:
             LoraPathStrengthAndSDOps(camera_lora_path, CAMERA_LORA_STRENGTH, LTXV_LORA_COMFY_RENAMING_MAP),
         ]
 
-        # Nouveau ledger partageant le registry (base weights caches)
-        job_ledger = self._base_ledger.with_loras(all_loras)
+        # Build sur CPU pour eviter OOM VRAM pendant le merge LoRA
+        cpu_ledger = ModelLedger(
+            dtype=self.dtype,
+            device=torch.device("cpu"),
+            checkpoint_path=self._checkpoint_path,
+            loras=all_loras,
+            quantization=QuantizationPolicy.fp8_cast(),
+        )
 
         # Liberer l'ancien transformer
         if self._transformer is not None:
             del self._transformer
             cleanup_memory()
 
-        self._transformer = job_ledger.transformer()
+        log.info("Build transformer + merge LoRAs sur CPU...")
+        transformer = cpu_ledger.transformer()
+
+        log.info("Transfert vers GPU...")
+        self._transformer = transformer.to(self.device)
         self._current_camera_lora = camera_lora_path
-        self._current_ledger = job_ledger
+
+        # Liberer le ledger CPU
+        del cpu_ledger
+        cleanup_memory()
+
+        log.info("Transformer pret en VRAM.")
         return self._transformer
 
     @torch.inference_mode()
@@ -333,7 +352,7 @@ class MedusaPipeline:
 
         # 7. VAE decode (tiled pour eviter OOM 720p)
         log.info("VAE decode tiled...")
-        video_decoder = self._current_ledger.video_decoder() if self._current_ledger else self._base_ledger.video_decoder()
+        video_decoder = self._base_ledger.video_decoder()
         decoded_video: Iterator[torch.Tensor] = vae_decode_video(
             video_state.latent,
             video_decoder,
