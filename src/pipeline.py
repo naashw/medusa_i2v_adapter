@@ -90,6 +90,12 @@ def _apply_loras_strip_scales(
 
 _fuse_loras_mod.apply_loras = _apply_loras_strip_scales
 
+# Patch aussi le binding local dans single_gpu_model_builder
+# (from ... import apply_loras cree une reference locale non affectee par le patch module)
+import ltx_core.loader.single_gpu_model_builder as _builder_mod  # noqa: E402
+
+_builder_mod.apply_loras = _apply_loras_strip_scales
+
 # LoRA strengths (matches current ComfyUI workflow)
 DISTILLED_LORA_STRENGTH = 0.7
 I2V_ADAPTER_STRENGTH = 0.8
