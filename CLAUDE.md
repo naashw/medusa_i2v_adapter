@@ -51,6 +51,7 @@ Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib
 - **MedusaPipeline** : encapsule ltx-pipelines avec gestion lifecycle modeles
   - Video encoder persistent en VRAM (~1GB), charge apres warmup embeddings
   - Transformer cache par camera LoRA (reste en VRAM entre jobs)
+  - Merge LoRAs directement en VRAM (DummyRegistry + destination_sd in-place, pas de transfert CPU→GPU)
   - Embeddings pre-caches sur disque (generes par warmup_embeddings.py)
   - Video decoder charge/decharge par job
 - **Ordre d'init** (evite OOM) : warmup embeddings (process isole, LD_PRELOAD="") → video encoder → transformer

@@ -214,9 +214,8 @@ class MedusaPipeline:
     def _get_transformer(self, camera_lora_path: str) -> torch.nn.Module:
         """Retourne le transformer avec le bon camera LoRA, cache en VRAM.
 
-        Build sur CPU (RAM) pour eviter OOM VRAM pendant le merge LoRA,
-        puis transfert du modele merge (~20GB FP8) vers GPU.
-        Le monkey-patch _cpu_safe_fuse_delta_with_cast_fp8 gere les ops FP8 sur CPU.
+        Build + merge LoRAs directement en VRAM via destination_sd (in-place).
+        DummyRegistry (defaut) permet le merge sans doubler la memoire.
         """
         if camera_lora_path == self._current_camera_lora and self._transformer is not None:
             return self._transformer
@@ -229,10 +228,10 @@ class MedusaPipeline:
             LoraPathStrengthAndSDOps(camera_lora_path, CAMERA_LORA_STRENGTH, LTXV_LORA_COMFY_RENAMING_MAP),
         ]
 
-        # Build sur CPU avec fp8_cast (le monkey-patch ajoute le fallback CPU)
-        cpu_ledger = ModelLedger(
+        # Build sur GPU avec fp8_cast — DummyRegistry assure le merge in-place
+        gpu_ledger = ModelLedger(
             dtype=self.dtype,
-            device=torch.device("cpu"),
+            device=self.device,
             checkpoint_path=self._checkpoint_path,
             loras=all_loras,
             quantization=QuantizationPolicy.fp8_cast(),
@@ -243,15 +242,11 @@ class MedusaPipeline:
             del self._transformer
             cleanup_memory()
 
-        log.info("Build transformer + merge LoRAs sur CPU...")
-        transformer = cpu_ledger.transformer()
-
-        log.info("Transfert vers GPU...")
-        self._transformer = transformer.to(self.device)
+        log.info("Build transformer + merge LoRAs sur GPU...")
+        self._transformer = gpu_ledger.transformer()
         self._current_camera_lora = camera_lora_path
 
-        # Liberer le ledger CPU
-        del cpu_ledger
+        del gpu_ledger
         cleanup_memory()
 
         log.info("Transformer pret en VRAM.")

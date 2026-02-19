@@ -187,7 +187,7 @@ if [ "${SERVERLESS:-}" = "true" ] || [ -n "${RUNPOD_ENDPOINT_ID:-}" ]; then
     CUDA_VISIBLE_DEVICES="" LD_PRELOAD="" python /app/warmup_embeddings.py
     echo "[medusa] Warmup termine, lancement handler..."
 
-    exec env PYTORCH_ALLOC_CONF=expandable_segments:True python /app/handler.py
+    exec env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python /app/handler.py
 
 else
     # ===== MODE GPU POD =====
