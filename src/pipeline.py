@@ -259,6 +259,7 @@ class MedusaPipeline:
         """Charge le video encoder en VRAM (~1GB). Appeler apres warmup_embeddings."""
         log.info("Chargement video encoder (persistent)...")
         self._video_encoder = self._base_ledger.video_encoder()
+        self._log_vram("apres video encoder")
 
     def _load_embeddings_cache(self, cache_path: str) -> None:
         """Charge les embeddings depuis un fichier .pt."""
@@ -303,6 +304,7 @@ class MedusaPipeline:
         del gpu_ledger
         cleanup_memory()
         log.info("Transformer de base pret en VRAM.")
+        self._log_vram("apres transformer")
 
     def _preload_camera_loras(self, camera_loras_paths: dict[str, str]) -> None:
         """Charge toutes les camera LoRAs en RAM CPU.
@@ -316,6 +318,14 @@ class MedusaPipeline:
             sd = loader.load([path], sd_ops=LTXV_LORA_COMFY_RENAMING_MAP, device=torch.device("cpu"))
             self._camera_loras_ram[path] = sd
         log.info("Camera LoRAs preloadees en RAM: %d", len(self._camera_loras_ram))
+
+    @staticmethod
+    def _log_vram(label: str) -> None:
+        """Log l'utilisation VRAM courante (alloue + reserve)."""
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / 2**30
+            rsvd = torch.cuda.memory_reserved() / 2**30
+            log.info("VRAM [%s]: %.2fGB alloc, %.2fGB reserved", label, alloc, rsvd)
 
     def _lazy_load_camera_lora(self, path: str) -> None:
         """Charge une camera LoRA en RAM CPU a la demande (lazy).
@@ -466,6 +476,7 @@ class MedusaPipeline:
             raise ValueError("Negative prompt non trouve dans le cache embeddings")
 
         # 2. Transformer avec bon camera LoRA
+        self._log_vram("debut generate")
         transformer = self._get_transformer(camera_lora_path)
 
         # 3. Setup denoising
