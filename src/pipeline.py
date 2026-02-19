@@ -14,7 +14,6 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Iterator
-from pathlib import Path
 
 import torch
 
@@ -42,35 +41,13 @@ from ltx_pipelines.utils.types import PipelineComponents
 
 log = logging.getLogger("medusa")
 
-# --- Monkey-patch : fallback CPU pour _fuse_delta_with_cast_fp8 ---
-# La version installee utilise calculate_weight_float8 (kernel Triton, CUDA-only).
-# Ce patch ajoute le path CPU present dans les versions recentes de ltx-core.
-import ltx_core.loader.fuse_loras as _fuse_loras_mod  # noqa: E402
-
-_orig_fuse_cast = _fuse_loras_mod._fuse_delta_with_cast_fp8
-
-
-def _cpu_safe_fuse_delta_with_cast_fp8(
-    deltas: torch.Tensor,
-    weight: torch.Tensor,
-    key: str,
-    target_dtype: torch.dtype,
-    device: torch.device,
-) -> dict[str, torch.Tensor]:
-    if str(device).startswith("cuda"):
-        return _orig_fuse_cast(deltas, weight, key, target_dtype, device)
-    # CPU path : dequant FP8→BF16, add delta, recast
-    deltas.add_(weight.to(dtype=deltas.dtype, device=device))
-    return {key: deltas.to(dtype=target_dtype)}
-
-
-_fuse_loras_mod._fuse_delta_with_cast_fp8 = _cpu_safe_fuse_delta_with_cast_fp8
-
 # --- Monkey-patch : strip .weight_scale keys pour forcer le path cast FP8 ---
 # Avec fp8_cast(), les poids sont charges en format cast (non transposes),
 # mais les cles .weight_scale du checkpoint ne sont pas supprimees.
 # Leur presence fait croire a apply_loras que les poids sont en format scaled
 # (transposes), ce qui provoque un shape mismatch lors du merge LoRA.
+import ltx_core.loader.fuse_loras as _fuse_loras_mod  # noqa: E402
+
 _orig_apply_loras = _fuse_loras_mod.apply_loras
 
 

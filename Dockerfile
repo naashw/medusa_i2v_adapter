@@ -45,7 +45,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install packaging setuptools wheel
 
 # --- ltx-core + ltx-pipelines depuis le repo Lightricks/LTX-2 ---
-RUN git clone --filter=blob:none --quiet https://github.com/Lightricks/LTX-2.git /tmp/LTX-2
+# Pin au commit 28c3c73 (2026-02-09) — inclut CPU fallback natif pour fuse_loras FP8
+RUN git clone --filter=blob:none --quiet https://github.com/Lightricks/LTX-2.git /tmp/LTX-2 && \
+    cd /tmp/LTX-2 && git checkout 28c3c73fe557666c3de176e1e50a5220152ccfca
 
 # Installer ltx-core d'abord (dependance de ltx-pipelines)
 RUN --mount=type=cache,target=/root/.cache/pip \
