@@ -12,6 +12,7 @@ Reprend les fonctionnalites cles de handler_wrapper.py :
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -318,8 +319,17 @@ def init_pipeline() -> MedusaPipeline:
     log.info("Build transformer de base...")
     p._build_base_transformer()
 
-    # 3. Video encoder persistent (~1GB VRAM, apres que le transformer est stable)
-    p.load_video_encoder()
+    # 3. Charger video encoder (VRAM) + pre-warm dolly-in (RAM CPU) en parallele
+    # Thread-safety : load_video_encoder -> _video_encoder (VRAM) ;
+    # _lazy_load_camera_lora -> _camera_loras_ram (RAM CPU). Attributs disjoints, pas de conflit.
+    log.info("Chargement parallele: video encoder + pre-warm dolly-in...")
+    dolly_in_path = os.path.join(MODELS_DIR, "loras", CAMERAS["dolly-in"][0])
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        ve_future = executor.submit(p.load_video_encoder)
+        lora_future = executor.submit(p._lazy_load_camera_lora, dolly_in_path)
+        for future in concurrent.futures.as_completed([ve_future, lora_future]):
+            future.result()  # propage les exceptions
 
     log.info("Pipeline pret (camera LoRAs en lazy-load).")
     return p
