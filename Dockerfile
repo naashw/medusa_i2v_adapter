@@ -101,6 +101,7 @@ RUN chmod +x /start.sh
 COPY src/pipeline.py /app/pipeline.py
 COPY src/handler.py /app/handler.py
 COPY src/warmup_embeddings.py /app/warmup_embeddings.py
+COPY src/bake_base_checkpoint.py /app/bake_base_checkpoint.py
 
 WORKDIR /app
 

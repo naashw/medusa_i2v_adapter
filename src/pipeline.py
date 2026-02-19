@@ -12,6 +12,7 @@ Gestion du lifecycle des modeles entre jobs :
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections.abc import Iterator
@@ -149,6 +150,8 @@ class MedusaPipeline:
 
         # Paths modeles
         self._checkpoint_path = os.path.join(models_dir, "checkpoints", "ltx-2-19b-dev-fp8.safetensors")
+        self._baked_checkpoint_path = os.path.join(models_dir, "checkpoints", "ltx-2-19b-dev-fp8-baked.safetensors")
+        self._baked_metadata_path = self._baked_checkpoint_path + ".json"
         self._gemma_root = os.path.join(models_dir, "text_encoders", "gemma-3-12b-it")
         self._distilled_lora = os.path.join(models_dir, "loras", "ltx-2-19b-distilled-lora-384.safetensors")
         self._i2v_adapter = os.path.join(models_dir, "loras", "LTX-2-Image2Vid-Adapter.safetensors")
@@ -188,6 +191,21 @@ class MedusaPipeline:
         self._sigmas = torch.tensor(
             DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=self.device
         )
+
+    def _is_baked_valid(self) -> bool:
+        """Verifie si le baked checkpoint existe et correspond aux strengths actuels."""
+        if not (os.path.isfile(self._baked_checkpoint_path) and os.path.isfile(self._baked_metadata_path)):
+            return False
+        try:
+            with open(self._baked_metadata_path) as f:
+                meta = json.load(f)
+            return (
+                meta.get("distilled_strength") == str(DISTILLED_LORA_STRENGTH)
+                and meta.get("i2v_strength") == str(I2V_ADAPTER_STRENGTH)
+                and meta.get("bake_version") == "1"
+            )
+        except Exception:
+            return False
 
     def warmup_embeddings(self, cache_dir: str) -> None:
         """Encode tous les prompts camera + negative, sauvegarde sur disque.
@@ -253,16 +271,29 @@ class MedusaPipeline:
         log.info("Embeddings charges: %d prompts", len(self._embeddings_cache))
 
     def _build_base_transformer(self) -> None:
-        """Build transformer avec distilled + I2V fusionnes (sans camera LoRA). Une seule fois."""
-        log.info("Build transformer de base (distilled + I2V, sans camera)...")
+        """Build transformer avec distilled + I2V fusionnes (sans camera LoRA). Une seule fois.
 
-        gpu_ledger = ModelLedger(
-            dtype=self.dtype,
-            device=self.device,
-            checkpoint_path=self._checkpoint_path,
-            loras=self._base_loras,
-            quantization=QuantizationPolicy.fp8_cast(),
-        )
+        Si le baked checkpoint (distilled + I2V pre-fusionnes) est disponible, le charge
+        directement (plus rapide). Sinon, build runtime avec apply_loras.
+        """
+        if self._is_baked_valid():
+            log.info("Chargement transformer depuis baked checkpoint (distilled + I2V pre-fusionnes)...")
+            gpu_ledger = ModelLedger(
+                dtype=self.dtype,
+                device=self.device,
+                checkpoint_path=self._baked_checkpoint_path,
+                loras=[],  # deja fusionnes dans le baked checkpoint
+                quantization=QuantizationPolicy.fp8_cast(),
+            )
+        else:
+            log.info("Build transformer de base (distilled + I2V, apply_loras runtime)...")
+            gpu_ledger = ModelLedger(
+                dtype=self.dtype,
+                device=self.device,
+                checkpoint_path=self._checkpoint_path,
+                loras=self._base_loras,
+                quantization=QuantizationPolicy.fp8_cast(),
+            )
 
         if self._base_transformer is not None:
             del self._base_transformer

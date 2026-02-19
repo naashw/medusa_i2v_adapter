@@ -167,6 +167,12 @@ fi
 echo "[medusa] Tous les modeles sont prets."
 
 # -----------------------------------------------
+# 4b. Bake base checkpoint si necessaire
+# -----------------------------------------------
+echo "[medusa] Bake base checkpoint si necessaire..."
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python /app/bake_base_checkpoint.py
+
+# -----------------------------------------------
 # 5. Demarrage
 # -----------------------------------------------
 if [ "${SERVERLESS:-}" = "true" ] || [ -n "${RUNPOD_ENDPOINT_ID:-}" ]; then
