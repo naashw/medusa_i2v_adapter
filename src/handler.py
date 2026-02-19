@@ -310,12 +310,19 @@ def init_pipeline() -> MedusaPipeline:
     os.makedirs(embeddings_cache_dir, exist_ok=True)
     p.warmup_embeddings(embeddings_cache_dir)
 
-    # 2. Pre-charge le transformer (AVANT video encoder — VRAM quasi-vide = max headroom pour LoRAs)
-    default_lora = os.path.join(MODELS_DIR, "loras", CAMERAS["dolly-in"][0])
-    log.info("Pre-chargement transformer (dolly-in)...")
-    p._get_transformer(default_lora)
+    # 2. Build transformer de base (distilled + I2V, sans camera — VRAM quasi-vide)
+    log.info("Build transformer de base...")
+    p._build_base_transformer()
 
-    # 3. Video encoder persistent (~1GB VRAM, apres que le transformer est stable)
+    # 3. Preload camera LoRAs en RAM CPU (~7.5GB RAM total)
+    camera_loras_paths = {
+        camera: os.path.join(MODELS_DIR, "loras", lora_filename)
+        for camera, (lora_filename, _) in CAMERAS.items()
+    }
+    log.info("Preload camera LoRAs en RAM...")
+    p._preload_camera_loras(camera_loras_paths)
+
+    # 4. Video encoder persistent (~1GB VRAM, apres que le transformer est stable)
     p.load_video_encoder()
 
     log.info("Pipeline pret.")

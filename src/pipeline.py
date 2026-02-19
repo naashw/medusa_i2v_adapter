@@ -3,10 +3,11 @@ MedusaPipeline — ltx-pipelines direct inference for LTX-2 19B I2V.
 
 Remplace ComfyUI par un appel Python direct a ltx-core / ltx-pipelines.
 Gestion du lifecycle des modeles entre jobs :
-  - Video encoder : persistent en VRAM (~1GB)
-  - Transformer   : cache par camera LoRA, reste en VRAM entre jobs
-  - Text encoder  : charge sur CPU au warmup, embeddings caches sur disque
-  - Video decoder : charge/decharge par job (libere VRAM)
+  - Video encoder  : persistent en VRAM (~1GB)
+  - Transformer    : base (distilled + I2V) persistent en VRAM, camera = delta applique en place
+  - Camera LoRAs   : preloadees en RAM CPU (~7.5GB), delta applique/annule en ~2-5s
+  - Text encoder   : charge sur CPU au warmup, embeddings caches sur disque
+  - Video decoder  : charge/decharge par job (libere VRAM)
 """
 
 from __future__ import annotations
@@ -38,6 +39,11 @@ from ltx_pipelines.utils.helpers import (
 )
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.types import PipelineComponents
+
+# Imports pour le mecanisme de delta camera (Phase 2)
+from ltx_core.loader.fuse_loras import _prepare_deltas, _fuse_delta_with_cast_fp8
+from ltx_core.loader.primitives import LoraStateDictWithStrength, StateDict
+from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
 
 log = logging.getLogger("medusa")
 
@@ -166,9 +172,13 @@ class MedusaPipeline:
         # Video encoder (charge apres warmup embeddings pour eviter OOM)
         self._video_encoder: torch.nn.Module | None = None
 
-        # Cache transformer (par camera LoRA)
-        self._transformer: torch.nn.Module | None = None
+        # Transformer de base en VRAM (distilled + I2V fusionnes, sans camera LoRA)
+        # Build une seule fois au cold start, camera delta applique/annule en place.
+        self._base_transformer: torch.nn.Module | None = None
         self._current_camera_lora: str | None = None
+
+        # Camera LoRAs preloadees en RAM CPU (key = lora_path absolu)
+        self._camera_loras_ram: dict[str, StateDict] = {}
 
         # Embeddings cache (prompt -> (video_ctx, audio_ctx))
         self._embeddings_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -241,24 +251,109 @@ class MedusaPipeline:
             )
         log.info("Embeddings charges: %d prompts", len(self._embeddings_cache))
 
-    def _get_transformer(self, camera_lora_path: str) -> torch.nn.Module:
-        """Retourne le transformer avec le bon camera LoRA, cache en VRAM.
+    def _build_base_transformer(self) -> None:
+        """Build transformer avec distilled + I2V fusionnes (sans camera LoRA). Une seule fois."""
+        log.info("Build transformer de base (distilled + I2V, sans camera)...")
 
+        gpu_ledger = ModelLedger(
+            dtype=self.dtype,
+            device=self.device,
+            checkpoint_path=self._checkpoint_path,
+            loras=self._base_loras,
+            quantization=QuantizationPolicy.fp8_cast(),
+        )
+
+        if self._base_transformer is not None:
+            del self._base_transformer
+            cleanup_memory()
+
+        self._base_transformer = gpu_ledger.transformer()
+        del gpu_ledger
+        cleanup_memory()
+        log.info("Transformer de base pret en VRAM.")
+
+    def _preload_camera_loras(self, camera_loras_paths: dict[str, str]) -> None:
+        """Charge toutes les camera LoRAs en RAM CPU.
+
+        Args:
+            camera_loras_paths: dict mapping camera_key -> lora_file_path absolu.
+        """
+        loader = SafetensorsModelStateDictLoader()
+        for camera_key, path in camera_loras_paths.items():
+            log.info("Preload camera LoRA en RAM: %s", os.path.basename(path))
+            sd = loader.load([path], sd_ops=LTXV_LORA_COMFY_RENAMING_MAP, device=torch.device("cpu"))
+            self._camera_loras_ram[path] = sd
+        log.info("Camera LoRAs preloadees en RAM: %d", len(self._camera_loras_ram))
+
+    def _apply_camera_delta(self, camera_path: str, sign: int = 1) -> None:
+        """Applique ou annule un camera LoRA delta sur le transformer de base.
+
+        Args:
+            camera_path: Chemin absolu du fichier camera LoRA.
+            sign: +1 pour appliquer, -1 pour annuler.
+        """
+        lora_sd = self._camera_loras_ram[camera_path]
+        strength = CAMERA_LORA_STRENGTH * sign
+        lora_item = [LoraStateDictWithStrength(lora_sd, strength)]
+        model = self._base_transformer
+
+        for name, param in model.named_parameters():
+            if not name.endswith(".weight"):
+                continue
+            delta = _prepare_deltas(lora_item, name, torch.bfloat16, param.device)
+            if delta is None:
+                continue
+            if param.data.dtype == torch.float8_e4m3fn:
+                result = _fuse_delta_with_cast_fp8(
+                    delta, param.data, name, torch.float8_e4m3fn, param.device
+                )
+                param.data = result[name]
+            else:
+                param.data = (param.data.to(torch.bfloat16) + delta).to(param.data.dtype)
+
+    def _get_transformer(self, camera_lora_path: str) -> torch.nn.Module:
+        """Retourne le transformer avec le bon camera delta applique.
+
+        Si la camera LoRA est preloadee en RAM, le switch se fait en ~2-5s
+        (undo delta precedent + apply nouveau delta).
+        Sinon, fallback sur rebuild complet via _get_transformer_rebuild.
+        """
+        if camera_lora_path == self._current_camera_lora and self._base_transformer is not None:
+            return self._base_transformer
+
+        # Fallback si camera LoRA pas preloadee en RAM
+        if camera_lora_path not in self._camera_loras_ram:
+            log.warning(
+                "Camera LoRA pas preloadee, rebuild complet: %s",
+                os.path.basename(camera_lora_path),
+            )
+            return self._get_transformer_rebuild(camera_lora_path)
+
+        # Undo camera precedente
+        if self._current_camera_lora is not None and self._current_camera_lora in self._camera_loras_ram:
+            log.info("Undo camera delta: %s", os.path.basename(self._current_camera_lora))
+            self._apply_camera_delta(self._current_camera_lora, sign=-1)
+
+        # Apply nouvelle camera
+        log.info("Apply camera delta: %s", os.path.basename(camera_lora_path))
+        self._apply_camera_delta(camera_lora_path, sign=+1)
+        self._current_camera_lora = camera_lora_path
+        return self._base_transformer
+
+    def _get_transformer_rebuild(self, camera_lora_path: str) -> torch.nn.Module:
+        """Fallback : rebuild complet du transformer avec la camera LoRA donnee.
+
+        Utilise uniquement si la camera LoRA n'est pas preloadee en RAM.
         Build + merge LoRAs directement en VRAM via destination_sd (in-place).
         DummyRegistry (defaut) permet le merge sans doubler la memoire.
         """
-        if camera_lora_path == self._current_camera_lora and self._transformer is not None:
-            return self._transformer
+        log.info("Rebuild transformer avec LoRA: %s", os.path.basename(camera_lora_path))
 
-        log.info("Chargement transformer avec LoRA: %s", os.path.basename(camera_lora_path))
-
-        # Toutes les LoRAs : distilled + i2v + camera
         all_loras = [
             *self._base_loras,
             LoraPathStrengthAndSDOps(camera_lora_path, CAMERA_LORA_STRENGTH, LTXV_LORA_COMFY_RENAMING_MAP),
         ]
 
-        # Build sur GPU avec fp8_cast — DummyRegistry assure le merge in-place
         gpu_ledger = ModelLedger(
             dtype=self.dtype,
             device=self.device,
@@ -267,20 +362,19 @@ class MedusaPipeline:
             quantization=QuantizationPolicy.fp8_cast(),
         )
 
-        # Liberer l'ancien transformer
-        if self._transformer is not None:
-            del self._transformer
+        if self._base_transformer is not None:
+            del self._base_transformer
             cleanup_memory()
 
         log.info("Build transformer + merge LoRAs sur GPU...")
-        self._transformer = gpu_ledger.transformer()
+        self._base_transformer = gpu_ledger.transformer()
         self._current_camera_lora = camera_lora_path
 
         del gpu_ledger
         cleanup_memory()
 
         log.info("Transformer pret en VRAM.")
-        return self._transformer
+        return self._base_transformer
 
     @torch.inference_mode()
     def generate(
