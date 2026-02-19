@@ -203,13 +203,16 @@ pipeline: MedusaPipeline | None = None
 def handler(job: dict) -> dict:
     """Handler RunPod pour generation I2V."""
     global pipeline
-    if pipeline is None:
-        raise RuntimeError("Pipeline non initialisee")
 
     job_id = job.get("id", f"unknown-{int(time.time())}")
     job_input = job.get("input", {})
-    disk_before = get_disk_usage_mb()
-    log.info("Job %s - Disque avant: %.0f MB", job_id, disk_before)
+
+    # --- Dedup cache EN PREMIER (filesystem only, pas besoin du pipeline) ---
+    input_hash = compute_input_hash(job_input)
+    cached = lookup_cache(input_hash)
+    if cached:
+        log.info("Cache hit (%s) - %d fichier(s), skip execution", input_hash, len(cached))
+        return {"images": cached, "cached": True}
 
     # --- Parse input ---
     image_data = job_input.get("image")
@@ -227,12 +230,13 @@ def handler(job: dict) -> dict:
     prompt_override = job_input.get("prompt")
     negative_override = job_input.get("negative_prompt")
 
-    # --- Dedup cache ---
-    input_hash = compute_input_hash(job_input)
-    cached = lookup_cache(input_hash)
-    if cached:
-        log.info("Cache hit (%s) - %d fichier(s), skip execution", input_hash, len(cached))
-        return {"images": cached, "cached": True}
+    # --- Lazy init pipeline (seulement si cache miss) ---
+    if pipeline is None:
+        log.info("Pipeline non init — cold start...")
+        pipeline = init_pipeline()
+
+    disk_before = get_disk_usage_mb()
+    log.info("Job %s - Disque avant: %.0f MB", job_id, disk_before)
 
     # --- Resolve image ---
     tmp_image = None
@@ -330,5 +334,5 @@ def init_pipeline() -> MedusaPipeline:
 
 
 if __name__ == "__main__":
-    pipeline = init_pipeline()
+    # Pas d'init ici — lazy init dans le handler au premier cache miss
     runpod.serverless.start({"handler": handler})
