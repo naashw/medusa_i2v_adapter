@@ -66,6 +66,30 @@ def _cpu_safe_fuse_delta_with_cast_fp8(
 
 _fuse_loras_mod._fuse_delta_with_cast_fp8 = _cpu_safe_fuse_delta_with_cast_fp8
 
+# --- Monkey-patch : strip .weight_scale keys pour forcer le path cast FP8 ---
+# Avec fp8_cast(), les poids sont charges en format cast (non transposes),
+# mais les cles .weight_scale du checkpoint ne sont pas supprimees.
+# Leur presence fait croire a apply_loras que les poids sont en format scaled
+# (transposes), ce qui provoque un shape mismatch lors du merge LoRA.
+_orig_apply_loras = _fuse_loras_mod.apply_loras
+
+
+def _apply_loras_strip_scales(
+    model_sd: "StateDict",
+    lora_sd_and_strengths: list,
+    dtype: torch.dtype | None = None,
+    destination_sd: "StateDict | None" = None,
+) -> "StateDict":
+    scale_keys = [k for k in model_sd.sd if k.endswith(".weight_scale")]
+    if scale_keys:
+        log.info("Stripping %d .weight_scale keys (force cast FP8 path)", len(scale_keys))
+        for k in scale_keys:
+            del model_sd.sd[k]
+    return _orig_apply_loras(model_sd, lora_sd_and_strengths, dtype, destination_sd)
+
+
+_fuse_loras_mod.apply_loras = _apply_loras_strip_scales
+
 # LoRA strengths (matches current ComfyUI workflow)
 DISTILLED_LORA_STRENGTH = 0.7
 I2V_ADAPTER_STRENGTH = 0.8
