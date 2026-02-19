@@ -5,7 +5,7 @@ Remplace ComfyUI par un appel Python direct a ltx-core / ltx-pipelines.
 Gestion du lifecycle des modeles entre jobs :
   - Video encoder  : persistent en VRAM (~1GB)
   - Transformer    : base (distilled + I2V) persistent en VRAM, camera = delta applique en place
-  - Camera LoRAs   : preloadees en RAM CPU (~7.5GB), delta applique/annule en ~2-5s
+  - Camera LoRAs   : lazy-load en RAM CPU a la demande, delta applique/annule en ~2-5s
   - Text encoder   : charge sur CPU au warmup, embeddings caches sur disque
   - Video decoder  : charge/decharge par job (libere VRAM)
 """
@@ -286,6 +286,18 @@ class MedusaPipeline:
             self._camera_loras_ram[path] = sd
         log.info("Camera LoRAs preloadees en RAM: %d", len(self._camera_loras_ram))
 
+    def _lazy_load_camera_lora(self, path: str) -> None:
+        """Charge une camera LoRA en RAM CPU a la demande (lazy).
+
+        SafetensorsStateDictLoader utilise safe_open avec copy=False → mmap natif.
+        """
+        if path in self._camera_loras_ram:
+            return
+        log.info("Lazy-load camera LoRA: %s", os.path.basename(path))
+        loader = SafetensorsModelStateDictLoader()
+        sd = loader.load([path], sd_ops=LTXV_LORA_COMFY_RENAMING_MAP, device=torch.device("cpu"))
+        self._camera_loras_ram[path] = sd
+
     def _apply_camera_delta(self, camera_path: str, sign: int = 1) -> None:
         """Applique ou annule un camera LoRA delta sur le transformer de base.
 
@@ -322,13 +334,8 @@ class MedusaPipeline:
         if camera_lora_path == self._current_camera_lora and self._base_transformer is not None:
             return self._base_transformer
 
-        # Fallback si camera LoRA pas preloadee en RAM
-        if camera_lora_path not in self._camera_loras_ram:
-            log.warning(
-                "Camera LoRA pas preloadee, rebuild complet: %s",
-                os.path.basename(camera_lora_path),
-            )
-            return self._get_transformer_rebuild(camera_lora_path)
+        # Lazy-load si pas encore en RAM
+        self._lazy_load_camera_lora(camera_lora_path)
 
         # Undo camera precedente
         if self._current_camera_lora is not None and self._current_camera_lora in self._camera_loras_ram:
