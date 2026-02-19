@@ -82,7 +82,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     add-apt-repository ppa:deadsnakes/ppa && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-        python3.11 \
+        python3.11 python3.11-dev \
         curl ffmpeg aria2 \
         libgl1 libglib2.0-0 \
         google-perftools tini \
