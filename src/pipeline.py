@@ -73,6 +73,36 @@ import ltx_core.loader.single_gpu_model_builder as _builder_mod  # noqa: E402
 
 _builder_mod.apply_loras = _apply_loras_strip_scales
 
+# --- Monkey-patch : charger les LoRAs sur CPU pour eviter l'OOM VRAM ---
+# Modele FP8 ~23GB + LoRAs BF16 ~12.1GB > 24GB VRAM.
+# _prepare_deltas (fuse_loras.py) fait .to(device) cle-par-cle → streaming GPU automatique.
+_orig_sgmb_build = _builder_mod.SingleGPUModelBuilder.build
+
+
+def _patched_sgmb_build(self, device=None, dtype=None):
+    """Charge les LoRAs sur CPU plutot que GPU pour eviter l'OOM pendant le build."""
+    if not self.loras:
+        return _orig_sgmb_build(self, device=device, dtype=dtype)
+
+    device_arg = torch.device("cuda") if device is None else device
+    lora_paths = {lora.path for lora in self.loras}
+    orig_load_sd = self.load_sd
+
+    def _cpu_load_sd(paths, **kwargs):
+        if len(paths) == 1 and paths[0] in lora_paths:
+            kwargs["device"] = torch.device("cpu")
+            log.info("LoRA charge sur CPU (streaming): %s", os.path.basename(paths[0]))
+        return orig_load_sd(paths, **kwargs)
+
+    self.load_sd = _cpu_load_sd
+    try:
+        return _orig_sgmb_build(self, device=device_arg, dtype=dtype)
+    finally:
+        del self.load_sd
+
+
+_builder_mod.SingleGPUModelBuilder.build = _patched_sgmb_build
+
 # LoRA strengths (matches current ComfyUI workflow)
 DISTILLED_LORA_STRENGTH = 0.7
 I2V_ADAPTER_STRENGTH = 0.8
