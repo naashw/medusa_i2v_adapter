@@ -100,11 +100,12 @@ def _patched_sgmb_build(self, device=None, dtype=None):
             log.info("LoRA charge sur CPU (streaming): %s", os.path.basename(paths[0]))
         return orig_load_sd(paths, **kwargs)
 
-    self.load_sd = _cpu_load_sd
+    # SingleGPUModelBuilder est un @dataclass(frozen=True) — utiliser object.__setattr__
+    object.__setattr__(self, "load_sd", _cpu_load_sd)
     try:
         return _orig_sgmb_build(self, device=device_arg, dtype=dtype)
     finally:
-        del self.load_sd
+        object.__setattr__(self, "load_sd", orig_load_sd)
 
 
 _builder_mod.SingleGPUModelBuilder.build = _patched_sgmb_build
