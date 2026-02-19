@@ -85,7 +85,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         python3.11 \
         curl ffmpeg aria2 \
         libgl1 libglib2.0-0 \
-        google-perftools tini && \
+        google-perftools tini \
+        gcc libc6-dev && \
     ln -sf /usr/bin/python3.11 /usr/bin/python && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
