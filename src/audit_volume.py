@@ -4,7 +4,7 @@ audit_volume.py — Identifie les fichiers inutilises sur le network volume RunP
 Scan /runpod-volume et compare avec la liste des fichiers requis par MedusaPipeline.
 
 Usage:
-    python scripts/audit_volume.py [--volume /runpod-volume] [--delete]
+    python scripts/audit_volume.py [--volume /runpod-volume] [--json]
 """
 from __future__ import annotations
 
@@ -34,11 +34,11 @@ def dir_size(path: str) -> int:
     return total
 
 
-def audit_volume(volume_root: str) -> tuple[list[dict], list[dict], list[dict]]:
+def audit_volume(volume_root: str) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
     """Scan le volume et classifie chaque element.
 
     Returns:
-        (used, unused, dynamic) — listes de dicts {path, size, reason}
+        (used, unused, dynamic, missing) — listes de dicts {path, size, reason}
     """
     models_dir = os.path.join(volume_root, "models")
 
@@ -47,11 +47,11 @@ def audit_volume(volume_root: str) -> tuple[list[dict], list[dict], list[dict]]:
         # Checkpoint principal
         os.path.join(models_dir, "checkpoints", "ltx-2-19b-dev-fp8.safetensors"):
             "Checkpoint LTX-2 19B FP8 (pipeline.py, bake_base_checkpoint.py)",
-        # Baked checkpoint (genere par bake_base_checkpoint.py)
+        # Baked checkpoint (optionnel, genere par bake_base_checkpoint.py, fallback apply_loras runtime)
         os.path.join(models_dir, "checkpoints", "ltx-2-19b-dev-fp8-baked.safetensors"):
-            "Baked checkpoint pre-fusionne (pipeline.py _build_base_transformer)",
+            "Baked checkpoint pre-fusionne — optionnel, optimise cold start (pipeline.py _build_base_transformer)",
         os.path.join(models_dir, "checkpoints", "ltx-2-19b-dev-fp8-baked.safetensors.json"):
-            "Metadata baked checkpoint (pipeline.py _is_baked_valid)",
+            "Metadata baked checkpoint — optionnel (pipeline.py _is_baked_valid)",
         # LoRAs de base
         os.path.join(models_dir, "loras", "ltx-2-19b-distilled-lora-384.safetensors"):
             "Distilled LoRA (pipeline.py _base_loras)",
@@ -78,12 +78,13 @@ def audit_volume(volume_root: str) -> tuple[list[dict], list[dict], list[dict]]:
     required_dirs: dict[str, str] = {
         os.path.join(models_dir, "text_encoders", "gemma-3-12b-it"):
             "Text encoder Gemma 3 12B HF (warmup_embeddings.py)",
+        # Cache persistant — sans ce dossier, le warmup doit recharger Gemma 12B (~24GB RAM)
+        os.path.join(volume_root, "cache", "embeddings"):
+            "Cache embeddings persistant — NE PAS SUPPRIMER (warmup_embeddings.py, pipeline.py)",
     }
 
-    # --- Dossiers DYNAMIQUES (generes au runtime, contenu variable) ---
+    # --- Dossiers DYNAMIQUES (generes au runtime, supprimables) ---
     dynamic_dirs: dict[str, str] = {
-        os.path.join(volume_root, "cache", "embeddings"):
-            "Cache embeddings (embeddings_cache.pt)",
         os.path.join(volume_root, "cache", "dedup"):
             "Cache dedup par hash input",
         os.path.join(volume_root, "output"):
@@ -144,6 +145,14 @@ def audit_volume(volume_root: str) -> tuple[list[dict], list[dict], list[dict]]:
             count = sum(1 for _, _, files in os.walk(ddir) for _ in files)
             dynamic.append({"path": ddir, "size": size, "reason": f"{reason} ({count} fichiers)"})
 
+    # Scanner les dossiers requis hors models/ (ex: cache/embeddings)
+    found_dirs = {item["path"] for item in used}
+    for dpath, reason in required_dirs_norm.items():
+        if dpath not in found_dirs:
+            if os.path.isdir(dpath):
+                size = dir_size(dpath)
+                used.append({"path": dpath, "size": size, "reason": reason})
+
     # Scanner tout le reste a la racine du volume (hors models/, cache/, output/)
     known_top_dirs = {"models", "cache", "output"}
     if os.path.isdir(volume_root):
@@ -158,7 +167,35 @@ def audit_volume(volume_root: str) -> tuple[list[dict], list[dict], list[dict]]:
                 size = os.path.getsize(full)
                 unused.append({"path": full, "size": size, "reason": "Fichier inconnu a la racine du volume"})
 
-    return used, unused, dynamic
+    # Scanner sous-dossiers inconnus dans cache/
+    cache_dir = os.path.normpath(os.path.join(volume_root, "cache"))
+    if os.path.isdir(cache_dir):
+        known_cache_subdirs: set[str] = set()
+        for d in list(dynamic_dirs_norm.keys()) + list(required_dirs_norm.keys()):
+            if d.startswith(cache_dir + os.sep):
+                known_cache_subdirs.add(os.path.relpath(d, cache_dir).split(os.sep)[0])
+        for entry in sorted(os.listdir(cache_dir)):
+            if entry in known_cache_subdirs:
+                continue
+            full = os.path.join(cache_dir, entry)
+            if os.path.isdir(full):
+                size = dir_size(full)
+                unused.append({"path": full + "/", "size": size, "reason": "Dossier inconnu dans cache/"})
+            elif os.path.isfile(full):
+                size = os.path.getsize(full)
+                unused.append({"path": full, "size": size, "reason": "Fichier inconnu dans cache/"})
+
+    # Detection des fichiers/dossiers MANQUANTS
+    missing: list[dict] = []
+    found_paths = {item["path"] for item in used}
+    for fpath, reason in required_files_norm.items():
+        if fpath not in found_paths:
+            missing.append({"path": fpath, "reason": reason})
+    for dpath, reason in required_dirs_norm.items():
+        if dpath not in found_paths:
+            missing.append({"path": dpath, "reason": reason})
+
+    return used, unused, dynamic, missing
 
 
 def main() -> None:
@@ -173,7 +210,7 @@ def main() -> None:
         return
 
     # 1. Audit des fichiers
-    used, unused, dynamic = audit_volume(volume)
+    used, unused, dynamic, missing = audit_volume(volume)
     total_used = sum(item["size"] for item in used)
     total_unused = sum(item["size"] for item in unused)
 
@@ -192,6 +229,7 @@ def main() -> None:
             "used": sorted(used, key=lambda x: x["path"]),
             "unused": sorted(unused, key=lambda x: -x["size"]),
             "dynamic": sorted(dynamic, key=lambda x: x["path"]),
+            "missing": sorted(missing, key=lambda x: x["path"]),
         }))
         return
 
@@ -205,7 +243,16 @@ def main() -> None:
     print(f"  Disque libre    : {human_size(disk.free)}")
     print(f"  Utilise pipeline: {human_size(total_used)}")
     print(f"  Recuperable     : {human_size(total_unused)}")
+    print(f"  Manquants       : {len(missing)}")
     print()
+
+    # --- Fichiers MANQUANTS ---
+    if missing:
+        print(f"--- MANQUANTS — CRITIQUES ({len(missing)} elements) ---\n")
+        for item in sorted(missing, key=lambda x: x["path"]):
+            print(f"  [!!] MANQUANT  {item['path']}")
+            print(f"       → {item['reason']}")
+        print()
 
     # --- Fichiers UTILISES ---
     print(f"--- UTILISES PAR LE PIPELINE ({len(used)} elements) ---\n")
