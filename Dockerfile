@@ -18,18 +18,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     CMAKE_BUILD_PARALLEL_LEVEL=8
 
-# --- Build dependencies + Python 3.11 ---
+# --- Build dependencies + Python 3.12 (natif Ubuntu 24.04) ---
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && \
-    apt-get install -y --no-install-recommends software-properties-common && \
-    add-apt-repository ppa:deadsnakes/ppa && \
-    apt-get update && \
     apt-get install -y --no-install-recommends \
-        python3.11 python3.11-venv python3.11-dev python3-pip \
+        python3 python3-venv python3-dev python3-pip \
         build-essential gcc ninja-build git && \
-    ln -sf /usr/bin/python3.11 /usr/bin/python && \
-    ln -sf /usr/bin/pip3 /usr/bin/pip && \
-    python3.11 -m venv /opt/venv && \
+    ln -sf /usr/bin/python3 /usr/bin/python && \
+    python3 -m venv /opt/venv && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 ENV PATH="/opt/venv/bin:$PATH"
@@ -75,19 +71,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH="/opt/venv/bin:$PATH" \
     RUNPOD_INIT_TIMEOUT=600
 
-# --- Runtime dependencies only ---
+# --- Runtime dependencies only (Python 3.12 natif Ubuntu 24.04) ---
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && \
-    apt-get install -y --no-install-recommends software-properties-common && \
-    add-apt-repository ppa:deadsnakes/ppa && \
-    apt-get update && \
     apt-get install -y --no-install-recommends \
-        python3.11 python3.11-dev \
+        python3 python3-dev \
         curl ffmpeg aria2 \
         libgl1 libglib2.0-0 \
         google-perftools tini \
         gcc libc6-dev && \
-    ln -sf /usr/bin/python3.11 /usr/bin/python && \
+    ln -sf /usr/bin/python3 /usr/bin/python && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # --- Copy venv depuis builder ---
