@@ -102,6 +102,7 @@ COPY src/pipeline.py /app/pipeline.py
 COPY src/handler.py /app/handler.py
 COPY src/warmup_embeddings.py /app/warmup_embeddings.py
 COPY src/bake_base_checkpoint.py /app/bake_base_checkpoint.py
+COPY scripts/audit_volume.py /app/audit_volume.py
 
 WORKDIR /app
 
