@@ -1,4 +1,5 @@
 # CLAUDE.md - Medusa I2V (ltx-pipelines)
+<!-- last-mirror-test: 2026-02-21 -->
 
 ## Projet
 
