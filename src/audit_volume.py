@@ -9,7 +9,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import shutil
 
 
 def human_size(size_bytes: int) -> str:
@@ -162,6 +164,7 @@ def audit_volume(volume_root: str) -> tuple[list[dict], list[dict], list[dict]]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Audit des fichiers sur le network volume")
     parser.add_argument("--volume", default="/runpod-volume", help="Chemin du volume (default: /runpod-volume)")
+    parser.add_argument("--json", action="store_true", help="Sortie JSON pour exploitation programmatique")
     args = parser.parse_args()
 
     volume = args.volume
@@ -169,17 +172,44 @@ def main() -> None:
         print(f"ERREUR: Volume non trouve: {volume}")
         return
 
+    # 1. Audit des fichiers
+    used, unused, dynamic = audit_volume(volume)
+    total_used = sum(item["size"] for item in used)
+    total_unused = sum(item["size"] for item in unused)
+
+    # 2. Espace disque
+    disk = shutil.disk_usage(volume)
+
+    # 3. Mode JSON
+    if args.json:
+        print(json.dumps({
+            "volume": volume,
+            "disk_total_bytes": disk.total,
+            "disk_used_bytes": disk.used,
+            "disk_free_bytes": disk.free,
+            "pipeline_used_bytes": total_used,
+            "recoverable_bytes": total_unused,
+            "used": sorted(used, key=lambda x: x["path"]),
+            "unused": sorted(unused, key=lambda x: -x["size"]),
+            "dynamic": sorted(dynamic, key=lambda x: x["path"]),
+        }))
+        return
+
+    # 4. Header texte avec infos disque
     print(f"\n{'='*70}")
     print(f"  AUDIT VOLUME: {volume}")
-    print(f"{'='*70}\n")
-
-    used, unused, dynamic = audit_volume(volume)
+    print(f"{'='*70}")
+    print(f"  Volume          : {volume}")
+    print(f"  Disque total    : {human_size(disk.total)}")
+    print(f"  Disque utilise  : {human_size(disk.used)}")
+    print(f"  Disque libre    : {human_size(disk.free)}")
+    print(f"  Utilise pipeline: {human_size(total_used)}")
+    print(f"  Recuperable     : {human_size(total_unused)}")
+    print()
 
     # --- Fichiers UTILISES ---
     print(f"--- UTILISES PAR LE PIPELINE ({len(used)} elements) ---\n")
-    total_used = 0
     for item in sorted(used, key=lambda x: x["path"]):
-        total_used += item["size"]
         print(f"  [OK] {human_size(item['size']):>10}  {item['path']}")
         print(f"       → {item['reason']}")
     print(f"\n  Total utilise: {human_size(total_used)}\n")
@@ -196,9 +226,7 @@ def main() -> None:
     # --- Fichiers NON UTILISES ---
     if unused:
         print(f"--- NON UTILISES — SUPPRIMABLES ({len(unused)} elements) ---\n")
-        total_unused = 0
         for item in sorted(unused, key=lambda x: -x["size"]):
-            total_unused += item["size"]
             print(f"  [!!] {human_size(item['size']):>10}  {item['path']}")
             print(f"       → {item['reason']}")
         print(f"\n  Total non utilise: {human_size(total_unused)}")
@@ -213,10 +241,10 @@ def main() -> None:
         print("  Le volume est propre.")
 
     print(f"\n{'='*70}")
-    total_all = total_used + sum(d["size"] for d in dynamic) + sum(u["size"] for u in unused)
+    total_all = total_used + sum(d["size"] for d in dynamic) + total_unused
     print(f"  Resume: {human_size(total_used)} utilise"
           f" + {human_size(sum(d['size'] for d in dynamic))} cache/output"
-          f" + {human_size(sum(u['size'] for u in unused))} inutilise"
+          f" + {human_size(total_unused)} inutilise"
           f" = {human_size(total_all)} total")
     print(f"{'='*70}\n")
 
