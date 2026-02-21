@@ -31,9 +31,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 ENV PATH="/opt/venv/bin:$PATH"
 
 # --- PyTorch stable (CUDA 12.8) ---
-# ltx-core requiert torch~=2.7
+# Pin >=2.7.1,<3 : support CUDA 12.8, compatible ltx-core ~=2.7
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install torch torchvision torchaudio \
+    pip install "torch>=2.7.1,<3" torchvision torchaudio \
         --index-url https://download.pytorch.org/whl/cu128
 
 # --- Core Python tooling ---
