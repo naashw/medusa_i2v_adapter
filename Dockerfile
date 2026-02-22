@@ -39,7 +39,8 @@ ENV PATH="/opt/venv/bin:$PATH" \
 # Pin >=2.7.1,<3 : support CUDA 12.8, compatible ltx-core ~=2.7
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install "torch>=2.7.1,<3" torchvision torchaudio \
-        --index-url https://download.pytorch.org/whl/cu128
+        --index-url https://download.pytorch.org/whl/cu128 \
+        --extra-index-url https://pypi.org/simple/
 
 # --- ltx-core + ltx-pipelines depuis le repo Lightricks/LTX-2 ---
 # Pin au commit 28c3c73 (2026-02-09) — inclut CPU fallback natif pour fuse_loras FP8
