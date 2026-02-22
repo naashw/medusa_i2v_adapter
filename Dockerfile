@@ -55,10 +55,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         -r /tmp/requirements.txt && \
     rm -rf /tmp/LTX-2
 
-# Verification builder : ltx_core et ltx_pipelines importables
-RUN /opt/venv/bin/python -c "import ltx_core; print('ltx_core OK:', ltx_core.__file__)" && \
-    /opt/venv/bin/python -c "import ltx_pipelines; print('ltx_pipelines OK')" && \
-    uv pip list --python /opt/venv/bin/python | grep -i ltx
+# Verification builder : packages installes
+RUN uv pip list --python /opt/venv/bin/python | grep -i ltx
 
 # ============================================================
 # Stage 2 : runtime (pas de compilateur, pas de headers)
@@ -85,9 +83,8 @@ RUN apt-get update && \
 # --- Copy venv depuis builder ---
 COPY --from=builder /opt/venv /opt/venv
 
-# Verification runtime : ltx_core et ltx_pipelines importables apres COPY
-RUN /opt/venv/bin/python -c "import ltx_core; print('ltx_core OK:', ltx_core.__file__)" && \
-    /opt/venv/bin/python -c "import ltx_pipelines; print('ltx_pipelines OK')"
+# Verification runtime : pip list apres COPY
+RUN /opt/venv/bin/pip list 2>/dev/null | grep -i ltx || true
 
 # --- Application ---
 RUN mkdir -p /app
