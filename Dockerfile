@@ -37,7 +37,8 @@ ENV PATH="/opt/venv/bin:$PATH" \
 # --- PyTorch stable (CUDA 12.8) ---
 # Pin >=2.7.1,<3 : support CUDA 12.8, compatible ltx-core ~=2.7
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install "torch>=2.7.1,<3" torchvision torchaudio \
+    uv pip install --python /opt/venv/bin/python \
+        "torch>=2.7.1,<3" torchvision torchaudio \
         --index-url https://download.pytorch.org/whl/cu128 \
         --extra-index-url https://pypi.org/simple/
 
@@ -48,7 +49,7 @@ COPY requirements.txt /tmp/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/uv \
     git clone --filter=blob:none --quiet https://github.com/Lightricks/LTX-2.git /tmp/LTX-2 && \
     cd /tmp/LTX-2 && git checkout 28c3c73fe557666c3de176e1e50a5220152ccfca && \
-    uv pip install \
+    uv pip install --python /opt/venv/bin/python \
         /tmp/LTX-2/packages/ltx-core \
         /tmp/LTX-2/packages/ltx-pipelines \
         -r /tmp/requirements.txt && \
@@ -57,7 +58,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Verification builder : ltx_core et ltx_pipelines importables
 RUN /opt/venv/bin/python -c "import ltx_core; print('ltx_core OK:', ltx_core.__file__)" && \
     /opt/venv/bin/python -c "import ltx_pipelines; print('ltx_pipelines OK')" && \
-    uv pip list | grep -i ltx
+    uv pip list --python /opt/venv/bin/python | grep -i ltx
 
 # ============================================================
 # Stage 2 : runtime (pas de compilateur, pas de headers)
