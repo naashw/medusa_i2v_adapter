@@ -92,22 +92,32 @@ download_model() {
         fi
     fi
 
-    echo "[medusa] Telechargement: $filename"
+    # Log espace disque avant telechargement
+    local disk_used disk_avail
+    disk_used=$(df -h "$dest_dir" | awk 'NR==2{print $3}')
+    disk_avail=$(df -h "$dest_dir" | awk 'NR==2{print $4}')
+    echo "[medusa] Telechargement: $filename (disque: ${disk_used} utilise, ${disk_avail} libre)"
+
     aria2c -x 16 -s 16 -k 1M \
         -d "$dest_dir" -o "$filename" \
         "$url" \
-        --console-log-level=error \
+        --console-log-level=warn \
         --summary-interval=0 \
         --check-certificate=true \
         --file-allocation=none \
         --max-tries=3 \
         --retry-wait=5 \
         --timeout=600
+    local dl_exit=$?
 
     local final_size
     final_size=$(stat -c%s "$filepath" 2>/dev/null || echo 0)
-    if [ "$final_size" -lt "$min_size" ]; then
-        echo "[medusa] ERREUR: $filename trop petit (${final_size}B < min ${min_size}B)"
+    local disk_avail_after
+    disk_avail_after=$(df -h "$dest_dir" | awk 'NR==2{print $4}')
+
+    if [ "$dl_exit" -ne 0 ] || [ "$final_size" -lt "$min_size" ]; then
+        echo "[medusa] ERREUR: $filename echoue (exit=$dl_exit, taille=${final_size}B, disque libre: ${disk_avail_after})"
+        rm -f "${filepath}" "${filepath}.aria2" "${filepath}.aria2__temp"
         return 1
     fi
 }
