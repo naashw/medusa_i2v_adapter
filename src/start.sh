@@ -59,32 +59,13 @@ export VOLUME_ROOT="$WORKSPACE"
 download_model() {
     local url="$1"
     local dest_dir="$2"
-    local min_size="${3:-1000000}"
     local filename
     filename=$(basename "$url")
     local filepath="${dest_dir}/${filename}"
 
     if [ -f "$filepath" ] && [ ! -f "${filepath}.aria2" ]; then
-        local size
-        size=$(stat -c%s "$filepath" 2>/dev/null || echo 0)
-        if [ "$size" -gt "$min_size" ]; then
-            # Validation safetensors : header check (instantane, pas de chargement)
-            if [[ "$filename" == *.safetensors ]]; then
-                if ! python -c "from safetensors import safe_open; safe_open('$filepath', framework='pt')" 2>/dev/null; then
-                    echo "[medusa] Corrompu (header safetensors invalide), re-telechargement: $filename"
-                    rm -f "${filepath}"
-                else
-                    echo "[medusa] Deja present: $filename ($(numfmt --to=iec "$size"))"
-                    return 0
-                fi
-            else
-                echo "[medusa] Deja present: $filename ($(numfmt --to=iec "$size"))"
-                return 0
-            fi
-        else
-            echo "[medusa] Corrompu (${size}B < min ${min_size}B), re-telechargement: $filename"
-            rm -f "${filepath}"
-        fi
+        echo "[medusa] Deja present: $filename"
+        return 0
     elif [ -f "${filepath}.aria2" ]; then
         echo "[medusa] Reprise telechargement interrompu: $filename"
     fi
@@ -106,16 +87,8 @@ download_model() {
         --max-tries=3 \
         --retry-wait=5 \
         --timeout=600
-    local dl_exit=$?
-
-    local final_size
-    final_size=$(stat -c%s "$filepath" 2>/dev/null || echo 0)
-    local disk_avail_after
-    disk_avail_after=$(df -h "$dest_dir" | awk 'NR==2{print $4}')
-
-    if [ "$dl_exit" -ne 0 ] || [ "$final_size" -lt "$min_size" ]; then
-        echo "[medusa] ERREUR: $filename echoue (exit=$dl_exit, taille=${final_size}B, disque libre: ${disk_avail_after})"
-        rm -f "${filepath}" "${filepath}.aria2" "${filepath}.aria2__temp"
+    if [ $? -ne 0 ]; then
+        echo "[medusa] ERREUR: $filename echoue"
         return 1
     fi
 }
@@ -128,17 +101,17 @@ echo "[medusa] Demarrage des telechargements (sequentiel)..."
 # --- Checkpoint (>10GB) ---
 download_model \
     "https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-dev-fp8.safetensors" \
-    "${MODELS_DIR}/checkpoints" 10000000000
+    "${MODELS_DIR}/checkpoints"
 
 # --- Distilled LoRA (>100MB) ---
 download_model \
     "https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-distilled-lora-384.safetensors" \
-    "${MODELS_DIR}/loras" 100000000
+    "${MODELS_DIR}/loras"
 
 # --- I2V Adapter (>100MB) ---
 download_model \
     "https://huggingface.co/MachineDelusions/LTX-2_Image2Video_Adapter_LoRa/resolve/main/LTX-2-Image2Vid-Adapter.safetensors" \
-    "${MODELS_DIR}/loras" 100000000
+    "${MODELS_DIR}/loras"
 
 # --- Camera LoRAs (>100MB each) ---
 CAMERA_LORAS=(
@@ -152,7 +125,7 @@ CAMERA_LORAS=(
 )
 
 for lora_url in "${CAMERA_LORAS[@]}"; do
-    download_model "$lora_url" "${MODELS_DIR}/loras" 100000000
+    download_model "$lora_url" "${MODELS_DIR}/loras"
 done
 
 # --- Gemma 3 12B (format HuggingFace, ~24GB BF16) ---
