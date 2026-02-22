@@ -22,8 +22,10 @@ import shutil
 import tempfile
 import time
 
+import boto3
 import requests
 import runpod
+from botocore.config import Config
 from PIL import Image
 
 from pipeline import MedusaPipeline
@@ -70,6 +72,59 @@ CAMERAS: dict[str, tuple[str, str]] = {
         "A static camera, no movement, cinematic.",
     ),
 }
+
+# --- S3 ---
+
+S3_BUCKET = os.environ.get("S3_BUCKET")
+S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL", "https://s3.sbg.io.cloud.ovh.net")
+S3_REGION = os.environ.get("S3_REGION", "sbg")
+log.info("S3 config: bucket=%s, endpoint=%s", S3_BUCKET or "(disabled)", S3_ENDPOINT_URL)
+
+_s3_client = None
+
+S3_CONTENT_TYPES = {
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".gif": "image/gif",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
+
+
+def get_s3_client():
+    """Client S3 singleton (lazy init)."""
+    global _s3_client
+    if _s3_client is None:
+        access_key = os.environ.get("AWS_ACCESS_KEY_ID") or os.environ.get("aws_access_key_id")
+        secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY") or os.environ.get("aws_secret_access_key")
+        _s3_client = boto3.client(
+            "s3",
+            endpoint_url=S3_ENDPOINT_URL,
+            region_name=S3_REGION,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            config=Config(retries={"max_attempts": 3, "mode": "standard"}),
+        )
+    return _s3_client
+
+
+def upload_to_s3(filepath: str, s3_key: str) -> str | None:
+    """Upload fichier vers S3. Retourne l'URL publique ou None si desactive/erreur."""
+    if not S3_BUCKET:
+        return None
+    try:
+        ext = os.path.splitext(filepath)[1].lower()
+        content_type = S3_CONTENT_TYPES.get(ext, "application/octet-stream")
+        client = get_s3_client()
+        client.upload_file(filepath, S3_BUCKET, s3_key, ExtraArgs={"ContentType": content_type})
+        s3_url = f"{S3_ENDPOINT_URL}/{S3_BUCKET}/{s3_key}"
+        log.info("S3 upload OK: %s (%.1f MB)", s3_key, os.path.getsize(filepath) / (1024 * 1024))
+        return s3_url
+    except Exception as e:
+        log.warning("S3 upload echoue: %s", e)
+        return None
+
 
 DEFAULT_NEGATIVE_PROMPT = (
     "blurry, out of focus, low quality, distorted, watermark, "
@@ -152,14 +207,18 @@ def lookup_cache(input_hash: str) -> list[dict] | None:
         ext = os.path.splitext(filename)[1].lower()
         file_type = "video" if ext in VIDEO_EXTENSIONS else "image"
         size_mb = os.path.getsize(filepath) / (1024 * 1024)
-        s3_key = os.path.relpath(filepath, VOLUME_ROOT)
-        outputs.append({
+        s3_key = f"generated/videos/{filename}"
+        s3_url = upload_to_s3(filepath, s3_key)
+        entry = {
             "filename": filename,
             "content_type": file_type,
             "size_mb": round(size_mb, 2),
             "volume_path": filepath,
             "s3_key": s3_key,
-        })
+        }
+        if s3_url:
+            entry["s3_url"] = s3_url
+        outputs.append(entry)
     return outputs
 
 
@@ -183,16 +242,21 @@ def collect_output(source_file: str, job_id: str) -> dict:
     ext = os.path.splitext(filename)[1].lower()
     file_type = "video" if ext in VIDEO_EXTENSIONS else "image"
     size_mb = os.path.getsize(dest_path) / (1024 * 1024)
-    s3_key = os.path.relpath(dest_path, VOLUME_ROOT)
+    s3_key = f"generated/videos/{filename}"
 
     log.info("%s: %.1f MB (%s) -> %s/", filename, size_mb, file_type, dest_dir)
-    return {
+
+    s3_url = upload_to_s3(dest_path, s3_key)
+    result = {
         "filename": filename,
         "content_type": file_type,
         "size_mb": round(size_mb, 2),
         "volume_path": dest_path,
         "s3_key": s3_key,
     }
+    if s3_url:
+        result["s3_url"] = s3_url
+    return result
 
 
 # --- Handler ---

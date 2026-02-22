@@ -1,5 +1,5 @@
 # CLAUDE.md - Medusa I2V (ltx-pipelines)
-<!-- last-mirror-test: 2026-02-21 -->
+<!-- last-mirror-test: 2026-02-23 -->
 
 ## Projet
 
@@ -16,12 +16,13 @@ Objectif : generation rapide de videos dolly a partir d'images, qualite correcte
 - **Output** : H264 MP4, 24fps, ~1 seconde (25 frames)
 - **PyTorch** : ~2.7 (requis par ltx-core)
 - **Packages** : ltx-core + ltx-pipelines (depuis Lightricks/LTX-2)
+- **S3** : Upload OVH S3 optionnel (boto3, active via `S3_BUCKET` env var)
 
 ## Structure
 
 - `Dockerfile` — image Docker multi-stage (devel builder -> runtime), sans ComfyUI
 - `docker-compose.yml` — lancement local avec GPU
-- `src/start.sh` — script de demarrage (telecharge modeles via hf_xet + lance handler)
+- `src/start.sh` — script de demarrage (telecharge modeles via hf_xet + valide safetensors + lance handler)
 - `src/warmup_embeddings.py` — warmup embeddings low-RAM (safe_open direct, sans ModelLedger)
 - `src/pipeline.py` — classe MedusaPipeline (inference ltx-pipelines)
 - `src/handler.py` — handler RunPod serverless (API simplifiee)
@@ -64,9 +65,10 @@ Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib
 ## Conventions
 
 - Prefixe output : `medusa_i2v`
-- Reponse API : `images[]` avec `s3_key` + `volume_path`
+- Reponse API : `images[]` avec `s3_key` + `volume_path` + `s3_url` (si S3 active)
 - Input images : supporte URL https OU base64
 - Output videos : sauvegardees dans `/runpod-volume/output/{job_id}/`
+- S3 upload : `generated/videos/{filename}` (OVH S3, optionnel via `S3_BUCKET`)
 - Dedup cache par hash dans `/runpod-volume/cache/dedup/`
 - Embeddings cache dans `/runpod-volume/cache/embeddings/`
 
@@ -78,3 +80,5 @@ Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib
 - `transformers` DOIT etre pince `>=4.52,<5.0` (v5 supprime `rope_local_base_freq` de Gemma3TextConfig)
 - `huggingface-cli` n'est pas dans l'image Docker, utiliser `huggingface_hub.snapshot_download()` a la place
 - `start.sh` lance le warmup avec `LD_PRELOAD=""` pour desactiver tcmalloc (inutile sur process ephemere)
+- `start.sh` valide les fichiers `.safetensors` existants via `safe_open()` avant de skip le telechargement (detecte les fichiers corrompus/partiels)
+- S3 env vars : `S3_BUCKET`, `S3_ENDPOINT_URL` (defaut OVH SBG), `S3_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
