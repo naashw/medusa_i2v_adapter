@@ -41,20 +41,23 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --index-url https://download.pytorch.org/whl/cu128 \
         --extra-index-url https://pypi.org/simple/
 
-# --- ltx-core + ltx-pipelines depuis le repo Lightricks/LTX-2 ---
+# --- ltx-core + ltx-pipelines + runtime deps en une seule resolution ---
 # Pin au commit 28c3c73 (2026-02-09) — inclut CPU fallback natif pour fuse_loras FP8
+# Resolution atomique : evite que requirements.txt ecrase ltx-core
+COPY requirements.txt /tmp/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/uv \
     git clone --filter=blob:none --quiet https://github.com/Lightricks/LTX-2.git /tmp/LTX-2 && \
     cd /tmp/LTX-2 && git checkout 28c3c73fe557666c3de176e1e50a5220152ccfca && \
-    cd /tmp/LTX-2/packages/ltx-core && uv pip install . && \
-    cd /tmp/LTX-2/packages/ltx-pipelines && uv pip install . && \
+    uv pip install \
+        /tmp/LTX-2/packages/ltx-core \
+        /tmp/LTX-2/packages/ltx-pipelines \
+        -r /tmp/requirements.txt && \
     rm -rf /tmp/LTX-2
 
-# --- Runtime Python dependencies (runpod, requests, etc.) ---
-# Installe EN DERNIER pour que nos pins (transformers<5.0) aient le dernier mot
-COPY requirements.txt /tmp/requirements.txt
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install -r /tmp/requirements.txt
+# Verification builder : ltx_core et ltx_pipelines importables
+RUN python -c "import ltx_core; print('ltx_core OK:', ltx_core.__file__)" && \
+    python -c "import ltx_pipelines; print('ltx_pipelines OK')" && \
+    uv pip list | grep -i ltx
 
 # ============================================================
 # Stage 2 : runtime (pas de compilateur, pas de headers)
@@ -80,6 +83,10 @@ RUN apt-get update && \
 
 # --- Copy venv depuis builder ---
 COPY --from=builder /opt/venv /opt/venv
+
+# Verification runtime : ltx_core et ltx_pipelines importables apres COPY
+RUN python -c "import ltx_core; print('ltx_core OK:', ltx_core.__file__)" && \
+    python -c "import ltx_pipelines; print('ltx_pipelines OK')"
 
 # --- Application ---
 RUN mkdir -p /app
