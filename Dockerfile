@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Medusa I2V - ltx-pipelines + LTX-2 19B
 # Image legere : les modeles sont telecharges au runtime sur le network volume
 # Supporte 2 modes : GPU Pod (interactif) et RunPod Serverless (API)
@@ -14,46 +15,46 @@
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    PIP_PREFER_BINARY=1 \
     PYTHONUNBUFFERED=1 \
-    CMAKE_BUILD_PARALLEL_LEVEL=8
+    CMAKE_BUILD_PARALLEL_LEVEL=8 \
+    UV_SYSTEM_PYTHON=1 \
+    UV_COMPILE_BYTECODE=1
 
-# --- Build dependencies + Python 3.12 (natif Ubuntu 24.04) ---
+# --- Build dependencies + Python 3.12 (natif Ubuntu 24.04) + uv ---
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        python3 python3-venv python3-dev python3-pip \
+        python3 python3-venv python3-dev \
         build-essential gcc ninja-build git && \
     ln -sf /usr/bin/python3 /usr/bin/python && \
     python3 -m venv /opt/venv && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-ENV PATH="/opt/venv/bin:$PATH"
+# Installer uv (package manager ultra-rapide)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+ENV PATH="/opt/venv/bin:$PATH" \
+    VIRTUAL_ENV="/opt/venv"
 
 # --- PyTorch stable (CUDA 12.8) ---
 # Pin >=2.7.1,<3 : support CUDA 12.8, compatible ltx-core ~=2.7
-RUN pip install --no-cache-dir "torch>=2.7.1,<3" torchvision torchaudio \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install "torch>=2.7.1,<3" torchvision torchaudio \
         --index-url https://download.pytorch.org/whl/cu128
-
-# --- Core Python tooling ---
-RUN pip install --no-cache-dir packaging setuptools wheel
 
 # --- ltx-core + ltx-pipelines depuis le repo Lightricks/LTX-2 ---
 # Pin au commit 28c3c73 (2026-02-09) — inclut CPU fallback natif pour fuse_loras FP8
-RUN git clone --filter=blob:none --quiet https://github.com/Lightricks/LTX-2.git /tmp/LTX-2 && \
-    cd /tmp/LTX-2 && git checkout 28c3c73fe557666c3de176e1e50a5220152ccfca
-
-# Installer ltx-core d'abord (dependance de ltx-pipelines)
-RUN cd /tmp/LTX-2/packages/ltx-core && pip install --no-cache-dir .
-
-# Installer ltx-pipelines
-RUN cd /tmp/LTX-2/packages/ltx-pipelines && pip install --no-cache-dir .
-
-# Cleanup repo clone
-RUN rm -rf /tmp/LTX-2
+RUN --mount=type=cache,target=/root/.cache/uv \
+    git clone --filter=blob:none --quiet https://github.com/Lightricks/LTX-2.git /tmp/LTX-2 && \
+    cd /tmp/LTX-2 && git checkout 28c3c73fe557666c3de176e1e50a5220152ccfca && \
+    cd /tmp/LTX-2/packages/ltx-core && uv pip install . && \
+    cd /tmp/LTX-2/packages/ltx-pipelines && uv pip install . && \
+    rm -rf /tmp/LTX-2
 
 # --- Runtime Python dependencies (runpod, requests, etc.) ---
+# Installe EN DERNIER pour que nos pins (transformers<5.0) aient le dernier mot
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install -r /tmp/requirements.txt
 
 # ============================================================
 # Stage 2 : runtime (pas de compilateur, pas de headers)
