@@ -28,8 +28,8 @@ RUN apt-get update && \
     python3 -m venv /opt/venv && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Installer uv (package manager ultra-rapide)
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+# Installer uv — pin 0.9.30 : ltx-core requiert uv_build<0.10.0
+COPY --from=ghcr.io/astral-sh/uv:0.9.30 /uv /usr/local/bin/uv
 
 ENV PATH="/opt/venv/bin:$PATH" \
     VIRTUAL_ENV="/opt/venv"
