@@ -134,7 +134,7 @@ def main() -> int:
     log.info("Generation du cache embeddings: %s", cache_path)
 
     checkpoint_path = os.path.join(
-        models_dir, "checkpoints", "ltx-2-19b-dev-fp8.safetensors"
+        models_dir, "checkpoints", "ltx-2-19b-dev.safetensors"
     )
     gemma_root = os.path.join(models_dir, "text_encoders", "gemma-3-12b-it")
 

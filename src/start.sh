@@ -114,7 +114,7 @@ echo "[medusa] Demarrage des telechargements (sequentiel)..."
 
 # --- Checkpoint (>10GB) ---
 download_model \
-    "https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-dev-fp8.safetensors" \
+    "https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-dev.safetensors" \
     "${MODELS_DIR}/checkpoints"
 
 # --- Distilled LoRA (>100MB) ---

@@ -10,7 +10,7 @@ Objectif : generation rapide de videos dolly a partir d'images, qualite correcte
 ## Contexte Technique
 
 - **Runtime** : ltx-pipelines (Python direct) sur RunPod Serverless (H100 80GB, HBM3)
-- **Modele principal** : LTX-2 19B AV model (FP8, ~22GB VRAM avec 3 LoRAs fusionnees)
+- **Modele principal** : LTX-2 19B AV model (BF16, ~38GB VRAM avec 3 LoRAs fusionnees)
 - **Text encoder** : Gemma 3 12B (BF16, CPU — ~24GB RAM, format HuggingFace)
 - **Approche** : Pipeline 1 passe, 720p natif, 8 steps Euler distilled, audio skip
 - **Output** : H264 MP4, 24fps, ~1 seconde (25 frames)

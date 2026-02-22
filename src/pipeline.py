@@ -23,7 +23,7 @@ from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
 from ltx_core.model.video_vae import decode_video as vae_decode_video
-from ltx_core.quantization import QuantizationPolicy
+
 from ltx_core.text_encoders.gemma import encode_text
 from ltx_core.types import LatentState, VideoPixelShape
 from ltx_pipelines.utils import ModelLedger
@@ -78,7 +78,7 @@ class MedusaPipeline:
         self.models_dir = models_dir
 
         # Paths modeles
-        self._checkpoint_path = os.path.join(models_dir, "checkpoints", "ltx-2-19b-dev-fp8.safetensors")
+        self._checkpoint_path = os.path.join(models_dir, "checkpoints", "ltx-2-19b-dev.safetensors")
         self._gemma_root = os.path.join(models_dir, "text_encoders", "gemma-3-12b-it")
         self._distilled_lora = os.path.join(models_dir, "loras", "ltx-2-19b-distilled-lora-384.safetensors")
         self._i2v_adapter = os.path.join(models_dir, "loras", "LTX-2-Image2Vid-Adapter.safetensors")
@@ -97,7 +97,6 @@ class MedusaPipeline:
             dtype=self.dtype,
             device=self.device,
             checkpoint_path=self._checkpoint_path,
-            quantization=QuantizationPolicy.fp8_cast(),
         )
 
         # Video encoder (persistent en VRAM)
@@ -220,7 +219,6 @@ class MedusaPipeline:
             device=self.device,
             checkpoint_path=self._checkpoint_path,
             loras=all_loras,
-            quantization=QuantizationPolicy.fp8_cast(),
         )
         self._base_transformer = ledger.transformer()
         self._current_camera_lora = camera_lora_path
