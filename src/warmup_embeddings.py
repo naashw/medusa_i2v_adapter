@@ -27,7 +27,7 @@ import torch
 from safetensors import safe_open
 
 sys.path.insert(0, os.path.dirname(__file__) if "__file__" in dir() else "/app")
-from pipeline import CAMERA_PROMPTS, DEFAULT_NEGATIVE_PROMPT  # noqa: E402
+from prompts import CAMERA_PROMPTS, DEFAULT_NEGATIVE_PROMPT  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
