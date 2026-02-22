@@ -167,13 +167,7 @@ fi
 echo "[medusa] Tous les modeles sont prets."
 
 # -----------------------------------------------
-# 4b. Bake base checkpoint si necessaire
-# -----------------------------------------------
-echo "[medusa] Bake base checkpoint si necessaire..."
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python /app/bake_base_checkpoint.py
-
-# -----------------------------------------------
-# 4c. Audit volume (dry-run, log fichiers inutilises)
+# 4b. Audit volume (dry-run, log fichiers inutilises)
 # -----------------------------------------------
 echo "[medusa] Audit volume (dry-run)..."
 python /app/audit_volume.py --volume "$WORKSPACE" || echo "[medusa] Audit volume echoue (non bloquant)"

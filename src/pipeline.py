@@ -4,15 +4,13 @@ MedusaPipeline — ltx-pipelines direct inference for LTX-2 19B I2V.
 Remplace ComfyUI par un appel Python direct a ltx-core / ltx-pipelines.
 Gestion du lifecycle des modeles entre jobs :
   - Video encoder  : persistent en VRAM (~1GB)
-  - Transformer    : base (distilled + I2V) persistent en VRAM, camera = delta applique en place
-  - Camera LoRAs   : lazy-load en RAM CPU a la demande, delta applique/annule en ~2-5s
+  - Video decoder  : persistent en VRAM (~2GB)
+  - Transformer    : cache par camera LoRA, rebuild via ModelLedger si camera change
   - Text encoder   : charge sur CPU au warmup, embeddings caches sur disque
-  - Video decoder  : charge/decharge par job (libere VRAM)
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from collections.abc import Iterator
@@ -24,7 +22,6 @@ from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
-from ltx_core.model.video_vae import TilingConfig
 from ltx_core.model.video_vae import decode_video as vae_decode_video
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.text_encoders.gemma import encode_text
@@ -41,75 +38,7 @@ from ltx_pipelines.utils.helpers import (
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.types import PipelineComponents
 
-# Imports pour le mecanisme de delta camera (Phase 2)
-from ltx_core.loader.fuse_loras import _prepare_deltas, _fuse_delta_with_cast_fp8
-from ltx_core.loader.primitives import LoraStateDictWithStrength, StateDict
-from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
-
 log = logging.getLogger("medusa")
-
-# --- Monkey-patch : strip .weight_scale keys pour forcer le path cast FP8 ---
-# Avec fp8_cast(), les poids sont charges en format cast (non transposes),
-# mais les cles .weight_scale du checkpoint ne sont pas supprimees.
-# Leur presence fait croire a apply_loras que les poids sont en format scaled
-# (transposes), ce qui provoque un shape mismatch lors du merge LoRA.
-import ltx_core.loader.fuse_loras as _fuse_loras_mod  # noqa: E402
-
-_orig_apply_loras = _fuse_loras_mod.apply_loras
-
-
-def _apply_loras_strip_scales(
-    model_sd: "StateDict",
-    lora_sd_and_strengths: list,
-    dtype: torch.dtype | None = None,
-    destination_sd: "StateDict | None" = None,
-) -> "StateDict":
-    scale_keys = [k for k in model_sd.sd if k.endswith(".weight_scale")]
-    if scale_keys:
-        log.info("Stripping %d .weight_scale keys (force cast FP8 path)", len(scale_keys))
-        for k in scale_keys:
-            del model_sd.sd[k]
-    return _orig_apply_loras(model_sd, lora_sd_and_strengths, dtype, destination_sd)
-
-
-_fuse_loras_mod.apply_loras = _apply_loras_strip_scales
-
-# Patch aussi le binding local dans single_gpu_model_builder
-# (from ... import apply_loras cree une reference locale non affectee par le patch module)
-import ltx_core.loader.single_gpu_model_builder as _builder_mod  # noqa: E402
-
-_builder_mod.apply_loras = _apply_loras_strip_scales
-
-# --- Monkey-patch : charger les LoRAs sur CPU pour eviter l'OOM VRAM ---
-# Modele FP8 ~23GB + LoRAs BF16 ~12.1GB > 24GB VRAM.
-# _prepare_deltas (fuse_loras.py) fait .to(device) cle-par-cle → streaming GPU automatique.
-_orig_sgmb_build = _builder_mod.SingleGPUModelBuilder.build
-
-
-def _patched_sgmb_build(self, device=None, dtype=None):
-    """Charge les LoRAs sur CPU plutot que GPU pour eviter l'OOM pendant le build."""
-    if not self.loras:
-        return _orig_sgmb_build(self, device=device, dtype=dtype)
-
-    device_arg = torch.device("cuda") if device is None else device
-    lora_paths = {lora.path for lora in self.loras}
-    orig_load_sd = self.load_sd
-
-    def _cpu_load_sd(paths, **kwargs):
-        if len(paths) == 1 and paths[0] in lora_paths:
-            kwargs["device"] = torch.device("cpu")
-            log.info("LoRA charge sur CPU (streaming): %s", os.path.basename(paths[0]))
-        return orig_load_sd(paths, **kwargs)
-
-    # SingleGPUModelBuilder est un @dataclass(frozen=True) — utiliser object.__setattr__
-    object.__setattr__(self, "load_sd", _cpu_load_sd)
-    try:
-        return _orig_sgmb_build(self, device=device_arg, dtype=dtype)
-    finally:
-        object.__setattr__(self, "load_sd", orig_load_sd)
-
-
-_builder_mod.SingleGPUModelBuilder.build = _patched_sgmb_build
 
 # LoRA strengths (matches current ComfyUI workflow)
 DISTILLED_LORA_STRENGTH = 0.7
@@ -150,8 +79,6 @@ class MedusaPipeline:
 
         # Paths modeles
         self._checkpoint_path = os.path.join(models_dir, "checkpoints", "ltx-2-19b-dev-fp8.safetensors")
-        self._baked_checkpoint_path = os.path.join(models_dir, "checkpoints", "ltx-2-19b-dev-fp8-baked.safetensors")
-        self._baked_metadata_path = self._baked_checkpoint_path + ".json"
         self._gemma_root = os.path.join(models_dir, "text_encoders", "gemma-3-12b-it")
         self._distilled_lora = os.path.join(models_dir, "loras", "ltx-2-19b-distilled-lora-384.safetensors")
         self._i2v_adapter = os.path.join(models_dir, "loras", "LTX-2-Image2Vid-Adapter.safetensors")
@@ -173,16 +100,15 @@ class MedusaPipeline:
             quantization=QuantizationPolicy.fp8_cast(),
         )
 
-        # Video encoder (charge apres warmup embeddings pour eviter OOM)
+        # Video encoder (persistent en VRAM)
         self._video_encoder: torch.nn.Module | None = None
 
-        # Transformer de base en VRAM (distilled + I2V fusionnes, sans camera LoRA)
-        # Build une seule fois au cold start, camera delta applique/annule en place.
+        # Video decoder (persistent en VRAM)
+        self._video_decoder: torch.nn.Module | None = None
+
+        # Transformer cache en VRAM (toutes LoRAs fusionnees)
         self._base_transformer: torch.nn.Module | None = None
         self._current_camera_lora: str | None = None
-
-        # Camera LoRAs preloadees en RAM CPU (key = lora_path absolu)
-        self._camera_loras_ram: dict[str, StateDict] = {}
 
         # Embeddings cache (prompt -> (video_ctx, audio_ctx))
         self._embeddings_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -191,21 +117,6 @@ class MedusaPipeline:
         self._sigmas = torch.tensor(
             DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=self.device
         )
-
-    def _is_baked_valid(self) -> bool:
-        """Verifie si le baked checkpoint existe et correspond aux strengths actuels."""
-        if not (os.path.isfile(self._baked_checkpoint_path) and os.path.isfile(self._baked_metadata_path)):
-            return False
-        try:
-            with open(self._baked_metadata_path) as f:
-                meta = json.load(f)
-            return (
-                meta.get("distilled_strength") == str(DISTILLED_LORA_STRENGTH)
-                and meta.get("i2v_strength") == str(I2V_ADAPTER_STRENGTH)
-                and meta.get("bake_version") == "1"
-            )
-        except Exception:
-            return False
 
     def warmup_embeddings(self, cache_dir: str) -> None:
         """Encode tous les prompts camera + negative, sauvegarde sur disque.
@@ -261,6 +172,12 @@ class MedusaPipeline:
         self._video_encoder = self._base_ledger.video_encoder()
         self._log_vram("apres video encoder")
 
+    def load_video_decoder(self) -> None:
+        """Charge le video decoder en VRAM (~2GB). Persistent entre jobs."""
+        log.info("Chargement video decoder (persistent)...")
+        self._video_decoder = self._base_ledger.video_decoder()
+        self._log_vram("apres video decoder")
+
     def _load_embeddings_cache(self, cache_path: str) -> None:
         """Charge les embeddings depuis un fichier .pt."""
         cache_data = torch.load(cache_path, map_location="cpu", weights_only=True)
@@ -271,54 +188,6 @@ class MedusaPipeline:
             )
         log.info("Embeddings charges: %d prompts", len(self._embeddings_cache))
 
-    def _build_base_transformer(self) -> None:
-        """Build transformer avec distilled + I2V fusionnes (sans camera LoRA). Une seule fois.
-
-        Si le baked checkpoint (distilled + I2V pre-fusionnes) est disponible, le charge
-        directement (plus rapide). Sinon, build runtime avec apply_loras.
-        """
-        if self._is_baked_valid():
-            log.info("Chargement transformer depuis baked checkpoint (distilled + I2V pre-fusionnes)...")
-            gpu_ledger = ModelLedger(
-                dtype=self.dtype,
-                device=self.device,
-                checkpoint_path=self._baked_checkpoint_path,
-                loras=[],  # deja fusionnes dans le baked checkpoint
-                quantization=QuantizationPolicy.fp8_cast(),
-            )
-        else:
-            log.info("Build transformer de base (distilled + I2V, apply_loras runtime)...")
-            gpu_ledger = ModelLedger(
-                dtype=self.dtype,
-                device=self.device,
-                checkpoint_path=self._checkpoint_path,
-                loras=self._base_loras,
-                quantization=QuantizationPolicy.fp8_cast(),
-            )
-
-        if self._base_transformer is not None:
-            del self._base_transformer
-            cleanup_memory()
-
-        self._base_transformer = gpu_ledger.transformer()
-        del gpu_ledger
-        cleanup_memory()
-        log.info("Transformer de base pret en VRAM.")
-        self._log_vram("apres transformer")
-
-    def _preload_camera_loras(self, camera_loras_paths: dict[str, str]) -> None:
-        """Charge toutes les camera LoRAs en RAM CPU.
-
-        Args:
-            camera_loras_paths: dict mapping camera_key -> lora_file_path absolu.
-        """
-        loader = SafetensorsModelStateDictLoader()
-        for camera_key, path in camera_loras_paths.items():
-            log.info("Preload camera LoRA en RAM: %s", os.path.basename(path))
-            sd = loader.load([path], sd_ops=LTXV_LORA_COMFY_RENAMING_MAP, device=torch.device("cpu"))
-            self._camera_loras_ram[path] = sd
-        log.info("Camera LoRAs preloadees en RAM: %d", len(self._camera_loras_ram))
-
     @staticmethod
     def _log_vram(label: str) -> None:
         """Log l'utilisation VRAM courante (alloue + reserve)."""
@@ -327,102 +196,38 @@ class MedusaPipeline:
             rsvd = torch.cuda.memory_reserved() / 2**30
             log.info("VRAM [%s]: %.2fGB alloc, %.2fGB reserved", label, alloc, rsvd)
 
-    def _lazy_load_camera_lora(self, path: str) -> None:
-        """Charge une camera LoRA en RAM CPU a la demande (lazy).
+    def get_transformer(self, camera_lora_path: str) -> torch.nn.Module:
+        """Retourne le transformer avec toutes les LoRAs fusionnees (distilled + I2V + camera).
 
-        SafetensorsStateDictLoader utilise safe_open avec copy=False → mmap natif.
-        """
-        if path in self._camera_loras_ram:
-            return
-        log.info("Lazy-load camera LoRA: %s", os.path.basename(path))
-        loader = SafetensorsModelStateDictLoader()
-        sd = loader.load([path], sd_ops=LTXV_LORA_COMFY_RENAMING_MAP, device=torch.device("cpu"))
-        self._camera_loras_ram[path] = sd
-
-    def _apply_camera_delta(self, camera_path: str, sign: int = 1) -> None:
-        """Applique ou annule un camera LoRA delta sur le transformer de base.
-
-        Args:
-            camera_path: Chemin absolu du fichier camera LoRA.
-            sign: +1 pour appliquer, -1 pour annuler.
-        """
-        lora_sd = self._camera_loras_ram[camera_path]
-        strength = CAMERA_LORA_STRENGTH * sign
-        lora_item = [LoraStateDictWithStrength(lora_sd, strength)]
-        model = self._base_transformer
-
-        for name, param in model.named_parameters():
-            if not name.endswith(".weight"):
-                continue
-            delta = _prepare_deltas(lora_item, name, torch.bfloat16, param.device)
-            if delta is None:
-                continue
-            if param.data.dtype == torch.float8_e4m3fn:
-                result = _fuse_delta_with_cast_fp8(
-                    delta, param.data, name, torch.float8_e4m3fn, param.device
-                )
-                param.data = result[name]
-            else:
-                param.data = (param.data.to(torch.bfloat16) + delta).to(param.data.dtype)
-
-    def _get_transformer(self, camera_lora_path: str) -> torch.nn.Module:
-        """Retourne le transformer avec le bon camera delta applique.
-
-        Si la camera LoRA est preloadee en RAM, le switch se fait en ~2-5s
-        (undo delta precedent + apply nouveau delta).
-        Sinon, fallback sur rebuild complet via _get_transformer_rebuild.
+        Le transformer est cache tant que la meme camera est utilisee.
+        Un changement de camera = rebuild complet via ModelLedger (~5-8s sur H100).
         """
         if camera_lora_path == self._current_camera_lora and self._base_transformer is not None:
             return self._base_transformer
 
-        # Lazy-load si pas encore en RAM
-        self._lazy_load_camera_lora(camera_lora_path)
+        if self._base_transformer is not None:
+            del self._base_transformer
+            cleanup_memory()
 
-        # Undo camera precedente
-        if self._current_camera_lora is not None and self._current_camera_lora in self._camera_loras_ram:
-            log.info("Undo camera delta: %s", os.path.basename(self._current_camera_lora))
-            self._apply_camera_delta(self._current_camera_lora, sign=-1)
-
-        # Apply nouvelle camera
-        log.info("Apply camera delta: %s", os.path.basename(camera_lora_path))
-        self._apply_camera_delta(camera_lora_path, sign=+1)
-        self._current_camera_lora = camera_lora_path
-        return self._base_transformer
-
-    def _get_transformer_rebuild(self, camera_lora_path: str) -> torch.nn.Module:
-        """Fallback : rebuild complet du transformer avec la camera LoRA donnee.
-
-        Utilise uniquement si la camera LoRA n'est pas preloadee en RAM.
-        Build + merge LoRAs directement en VRAM via destination_sd (in-place).
-        DummyRegistry (defaut) permet le merge sans doubler la memoire.
-        """
-        log.info("Rebuild transformer avec LoRA: %s", os.path.basename(camera_lora_path))
+        log.info("Build transformer avec LoRA: %s", os.path.basename(camera_lora_path))
 
         all_loras = [
             *self._base_loras,
             LoraPathStrengthAndSDOps(camera_lora_path, CAMERA_LORA_STRENGTH, LTXV_LORA_COMFY_RENAMING_MAP),
         ]
-
-        gpu_ledger = ModelLedger(
+        ledger = ModelLedger(
             dtype=self.dtype,
             device=self.device,
             checkpoint_path=self._checkpoint_path,
             loras=all_loras,
             quantization=QuantizationPolicy.fp8_cast(),
         )
-
-        if self._base_transformer is not None:
-            del self._base_transformer
-            cleanup_memory()
-
-        log.info("Build transformer + merge LoRAs sur GPU...")
-        self._base_transformer = gpu_ledger.transformer()
+        self._base_transformer = ledger.transformer()
         self._current_camera_lora = camera_lora_path
-
-        del gpu_ledger
+        del ledger
         cleanup_memory()
 
-        log.info("Transformer pret en VRAM.")
+        self._log_vram("apres transformer")
         return self._base_transformer
 
     @torch.inference_mode()
@@ -477,7 +282,7 @@ class MedusaPipeline:
 
         # 2. Transformer avec bon camera LoRA
         self._log_vram("debut generate")
-        transformer = self._get_transformer(camera_lora_path)
+        transformer = self.get_transformer(camera_lora_path)
 
         # 3. Setup denoising
         noiser = GaussianNoiser(generator=generator)
@@ -551,13 +356,12 @@ class MedusaPipeline:
             device=self.device,
         )
 
-        # 7. VAE decode (tiled pour eviter OOM 720p)
-        log.info("VAE decode tiled...")
-        video_decoder = self._base_ledger.video_decoder()
+        # 7. VAE decode (sans tiling — H100 80GB)
+        log.info("VAE decode...")
         decoded_video: Iterator[torch.Tensor] = vae_decode_video(
             video_state.latent,
-            video_decoder,
-            TilingConfig.default(),
+            self._video_decoder,
+            None,
             generator,
         )
 
@@ -572,10 +376,6 @@ class MedusaPipeline:
             video_chunks_number=1,
         )
         log.info("Video sauvegardee: %s", output_path)
-
-        # Liberer le video decoder
-        del video_decoder
-        cleanup_memory()
 
     def _encode_prompt(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode un prompt custom via le text encoder (cold path, rarement utilise)."""

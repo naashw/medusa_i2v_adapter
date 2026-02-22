@@ -11,7 +11,7 @@ services:
               count: 1
               capabilities: [gpu]
         limits:
-          memory: 64G
+          memory: 140G
     ports:
       - "8888:8888"
     volumes:

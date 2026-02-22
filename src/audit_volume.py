@@ -46,12 +46,7 @@ def audit_volume(volume_root: str) -> tuple[list[dict], list[dict], list[dict], 
     required_files: dict[str, str] = {
         # Checkpoint principal
         os.path.join(models_dir, "checkpoints", "ltx-2-19b-dev-fp8.safetensors"):
-            "Checkpoint LTX-2 19B FP8 (pipeline.py, bake_base_checkpoint.py)",
-        # Baked checkpoint (optionnel, genere par bake_base_checkpoint.py, fallback apply_loras runtime)
-        os.path.join(models_dir, "checkpoints", "ltx-2-19b-dev-fp8-baked.safetensors"):
-            "Baked checkpoint pre-fusionne — optionnel, optimise cold start (pipeline.py _build_base_transformer)",
-        os.path.join(models_dir, "checkpoints", "ltx-2-19b-dev-fp8-baked.safetensors.json"):
-            "Metadata baked checkpoint — optionnel (pipeline.py _is_baked_valid)",
+            "Checkpoint LTX-2 19B FP8 (pipeline.py)",
         # LoRAs de base
         os.path.join(models_dir, "loras", "ltx-2-19b-distilled-lora-384.safetensors"):
             "Distilled LoRA (pipeline.py _base_loras)",

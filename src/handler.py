@@ -12,7 +12,6 @@ Reprend les fonctionnalites cles de handler_wrapper.py :
 from __future__ import annotations
 
 import base64
-import concurrent.futures
 import hashlib
 import json
 import logging
@@ -305,33 +304,23 @@ def handler(job: dict) -> dict:
 
 def init_pipeline() -> MedusaPipeline:
     """Initialise le pipeline au demarrage du worker."""
-    import torch
-
     log.info("Initialisation MedusaPipeline...")
     p = MedusaPipeline(models_dir=MODELS_DIR)
 
-    # 1. Warmup embeddings EN PREMIER (Gemma 24GB CPU seul, avant tout GPU)
+    # 1. Warmup embeddings (depuis cache disque)
     embeddings_cache_dir = os.path.join(CACHE_DIR, "embeddings")
     os.makedirs(embeddings_cache_dir, exist_ok=True)
     p.warmup_embeddings(embeddings_cache_dir)
 
-    # 2. Build transformer de base (distilled + I2V, sans camera — VRAM quasi-vide)
-    log.info("Build transformer de base...")
-    p._build_base_transformer()
-
-    # 3. Charger video encoder (VRAM) + pre-warm dolly-in (RAM CPU) en parallele
-    # Thread-safety : load_video_encoder -> _video_encoder (VRAM) ;
-    # _lazy_load_camera_lora -> _camera_loras_ram (RAM CPU). Attributs disjoints, pas de conflit.
-    log.info("Chargement parallele: video encoder + pre-warm dolly-in...")
+    # 2. Build transformer avec camera par defaut (dolly-in)
     dolly_in_path = os.path.join(MODELS_DIR, "loras", CAMERAS["dolly-in"][0])
+    p.get_transformer(dolly_in_path)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        ve_future = executor.submit(p.load_video_encoder)
-        lora_future = executor.submit(p._lazy_load_camera_lora, dolly_in_path)
-        for future in concurrent.futures.as_completed([ve_future, lora_future]):
-            future.result()  # propage les exceptions
+    # 3. Charger video encoder + video decoder (persistent)
+    p.load_video_encoder()
+    p.load_video_decoder()
 
-    log.info("Pipeline pret (camera LoRAs en lazy-load).")
+    log.info("Pipeline pret.")
     return p
 
 

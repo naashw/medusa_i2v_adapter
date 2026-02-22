@@ -9,8 +9,8 @@ Objectif : generation rapide de videos dolly a partir d'images, qualite correcte
 
 ## Contexte Technique
 
-- **Runtime** : ltx-pipelines (Python direct) sur RunPod Serverless (RTX 4090, 24GB VRAM)
-- **Modele principal** : LTX-2 19B AV model (FP8, ~20GB VRAM)
+- **Runtime** : ltx-pipelines (Python direct) sur RunPod Serverless (H100 80GB, HBM3)
+- **Modele principal** : LTX-2 19B AV model (FP8, ~22GB VRAM avec 3 LoRAs fusionnees)
 - **Text encoder** : Gemma 3 12B (BF16, CPU — ~24GB RAM, format HuggingFace)
 - **Approche** : Pipeline 1 passe, 720p natif, 8 steps Euler distilled, audio skip
 - **Output** : H264 MP4, 24fps, ~1 seconde (25 frames)
@@ -50,13 +50,13 @@ Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib
 ## Architecture Pipeline
 
 - **MedusaPipeline** : encapsule ltx-pipelines avec gestion lifecycle modeles
-  - Video encoder persistent en VRAM (~1GB), charge apres warmup embeddings
-  - Transformer cache par camera LoRA (reste en VRAM entre jobs)
-  - Merge LoRAs directement en VRAM (DummyRegistry + destination_sd in-place, pas de transfert CPU→GPU)
+  - Video encoder persistent en VRAM (~1GB)
+  - Video decoder persistent en VRAM (~2GB)
+  - Transformer cache par camera LoRA, rebuild standard via ModelLedger si camera change (~5-8s)
+  - 3 LoRAs fusionnees a chaque build : distilled + I2V + camera
   - Embeddings pre-caches sur disque (generes par warmup_embeddings.py)
-  - Video decoder charge/decharge par job
-- **Ordre d'init** (evite OOM) : warmup embeddings (process isole, LD_PRELOAD="") → video encoder → transformer
-- **warmup_embeddings.py** : charge uniquement les 59 cles TE via safe_open (2.7GB) + Gemma `low_cpu_mem_usage=True`. Peak ~35GB (vs ~106GB avec ModelLedger). Tourne dans 57GB RAM RunPod 4090.
+- **Ordre d'init** : warmup embeddings (process isole) → transformer (dolly-in) → video encoder → video decoder
+- **warmup_embeddings.py** : charge uniquement les 59 cles TE via safe_open (2.7GB) + Gemma `low_cpu_mem_usage=True`. Peak ~35GB.
 - **Audio skip** : `skip_step=99` sur audio guider → audio compute seulement au step 0/8
 - **CFG desactive** : `cfg_scale=1.0, stg_scale=0.0` → 1 seul forward par step
 - **Sigmas distilled** : 8 steps hardcodes (DISTILLED_SIGMA_VALUES)
@@ -73,12 +73,8 @@ Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib
 ## Points d'Attention
 
 - Le text encoder Gemma DOIT etre format HuggingFace (pas Comfy-Org single file)
-- Le text encoder DOIT rester sur CPU (VRAM insuffisante, 24GB Gemma vs 24GB 4090)
-- Le VAE decode doit utiliser TilingConfig.default() pour eviter les OOM
 - num_frames doit etre k*8+1 (ex: 25, 49, 97)
 - height/width doivent etre multiples de 32
 - `transformers` DOIT etre pince `>=4.52,<5.0` (v5 supprime `rope_local_base_freq` de Gemma3TextConfig)
 - `huggingface-cli` n'est pas dans l'image Docker, utiliser `huggingface_hub.snapshot_download()` a la place
-- Le warmup via `warmup_embeddings.py` tourne dans 57GB RAM (peak ~35GB) — pas besoin de pre-generer offline
-- NE PAS utiliser ModelLedger pour le warmup : charge le checkpoint 19B entier (~38GB FP8→BF16) → OOM
 - `start.sh` lance le warmup avec `LD_PRELOAD=""` pour desactiver tcmalloc (inutile sur process ephemere)
