@@ -109,7 +109,7 @@ curl -X POST "https://api.runpod.ai/v2/${ENDPOINT_ID}/runsync" \
 
 Telecharges automatiquement au runtime sur le network volume :
 
-- **LTX-2 19B** (FP8, ~10GB) — checkpoint principal
+- **LTX-2 19B** (BF16, ~38GB) — checkpoint principal
 - **Gemma 3 12B** (BF16, ~24GB) — text encoder (format HuggingFace, CPU)
 - **LoRA distilled** — acceleration inference (8 steps)
 - **I2V Adapter** — conditioning image

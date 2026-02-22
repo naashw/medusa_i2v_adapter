@@ -18,7 +18,6 @@
 ### comfy_kitchen backends (cuda/triton)
 - Les logs montrent cuda et triton backends disponibles mais desactives
 - Chercher comment activer (env var, CLI flag, pip install)
-- Fournit des kernels optimises pour FP8
 - Modifier `src/start.sh` si applicable
 
 ### S3 externe pour les outputs
