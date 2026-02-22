@@ -64,32 +64,29 @@ download_model() {
     filename=$(basename "$url")
     local filepath="${dest_dir}/${filename}"
 
-    if [ -f "$filepath" ]; then
-        # Fichier .aria2 = telechargement interrompu, fichier incomplet
-        if [ -f "${filepath}.aria2" ]; then
-            echo "[medusa] Incomplet (aria2 interrompu), re-telechargement: $filename"
-            rm -f "${filepath}" "${filepath}.aria2" "${filepath}.aria2__temp"
-        else
-            local size
-            size=$(stat -c%s "$filepath" 2>/dev/null || echo 0)
-            if [ "$size" -gt "$min_size" ]; then
-                # Validation safetensors : header check (instantane, pas de chargement)
-                if [[ "$filename" == *.safetensors ]]; then
-                    if ! python -c "from safetensors import safe_open; safe_open('$filepath', framework='pt')" 2>/dev/null; then
-                        echo "[medusa] Corrompu (header safetensors invalide), re-telechargement: $filename"
-                        rm -f "${filepath}" "${filepath}.aria2" "${filepath}.aria2__temp"
-                    else
-                        echo "[medusa] Deja present: $filename ($(numfmt --to=iec "$size"))"
-                        return 0
-                    fi
+    if [ -f "$filepath" ] && [ ! -f "${filepath}.aria2" ]; then
+        local size
+        size=$(stat -c%s "$filepath" 2>/dev/null || echo 0)
+        if [ "$size" -gt "$min_size" ]; then
+            # Validation safetensors : header check (instantane, pas de chargement)
+            if [[ "$filename" == *.safetensors ]]; then
+                if ! python -c "from safetensors import safe_open; safe_open('$filepath', framework='pt')" 2>/dev/null; then
+                    echo "[medusa] Corrompu (header safetensors invalide), re-telechargement: $filename"
+                    rm -f "${filepath}"
                 else
                     echo "[medusa] Deja present: $filename ($(numfmt --to=iec "$size"))"
                     return 0
                 fi
             else
-                echo "[medusa] Corrompu (${size}B < min ${min_size}B), re-telechargement: $filename"
+                echo "[medusa] Deja present: $filename ($(numfmt --to=iec "$size"))"
+                return 0
             fi
+        else
+            echo "[medusa] Corrompu (${size}B < min ${min_size}B), re-telechargement: $filename"
+            rm -f "${filepath}"
         fi
+    elif [ -f "${filepath}.aria2" ]; then
+        echo "[medusa] Reprise telechargement interrompu: $filename"
     fi
 
     # Log espace disque avant telechargement
@@ -101,6 +98,7 @@ download_model() {
     aria2c -x 16 -s 16 -k 1M \
         -d "$dest_dir" -o "$filename" \
         "$url" \
+        --continue=true \
         --console-log-level=warn \
         --summary-interval=0 \
         --check-certificate=true \
@@ -126,14 +124,6 @@ download_model() {
 # 4. Telechargement des modeles (sequentiel)
 # -----------------------------------------------
 echo "[medusa] Demarrage des telechargements (sequentiel)..."
-
-# Nettoyer les telechargements interrompus (fichiers .aria2 orphelins)
-STALE_COUNT=$(find "${MODELS_DIR}" -name "*.aria2" -o -name "*.aria2__temp" 2>/dev/null | wc -l)
-if [ "$STALE_COUNT" -gt 0 ]; then
-    echo "[medusa] Nettoyage de ${STALE_COUNT} fichier(s) aria2 orphelin(s)..."
-    find "${MODELS_DIR}" -name "*.aria2" -delete
-    find "${MODELS_DIR}" -name "*.aria2__temp" -delete
-fi
 
 # --- Checkpoint (>10GB) ---
 download_model \
