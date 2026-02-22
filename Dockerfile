@@ -16,28 +16,24 @@ FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    CMAKE_BUILD_PARALLEL_LEVEL=8 \
-    UV_COMPILE_BYTECODE=1
+    CMAKE_BUILD_PARALLEL_LEVEL=8
 
-# --- Build dependencies + Python 3.12 (natif Ubuntu 24.04) + uv ---
+# --- Build dependencies + Python 3.12 (natif Ubuntu 24.04) ---
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        python3 python3-venv python3-dev \
+        python3 python3-venv python3-dev python3-pip \
         build-essential gcc ninja-build git && \
     ln -sf /usr/bin/python3 /usr/bin/python && \
     python3 -m venv /opt/venv && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
-
-# Installer uv — pin 0.9.30 : ltx-core requiert uv_build<0.10.0
-COPY --from=ghcr.io/astral-sh/uv:0.9.30 /uv /usr/local/bin/uv
 
 ENV PATH="/opt/venv/bin:$PATH" \
     VIRTUAL_ENV="/opt/venv"
 
 # --- PyTorch stable (CUDA 12.8) ---
 # Pin >=2.7.1,<3 : support CUDA 12.8, compatible ltx-core ~=2.7
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --python /opt/venv/bin/python \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir \
         "torch>=2.7.1,<3" torchvision torchaudio \
         --index-url https://download.pytorch.org/whl/cu128 \
         --extra-index-url https://pypi.org/simple/
@@ -46,17 +42,19 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Pin au commit 28c3c73 (2026-02-09) — inclut CPU fallback natif pour fuse_loras FP8
 # Resolution atomique : evite que requirements.txt ecrase ltx-core
 COPY requirements.txt /tmp/requirements.txt
-RUN --mount=type=cache,target=/root/.cache/uv \
+RUN --mount=type=cache,target=/root/.cache/pip \
     git clone --filter=blob:none --quiet https://github.com/Lightricks/LTX-2.git /tmp/LTX-2 && \
     cd /tmp/LTX-2 && git checkout 28c3c73fe557666c3de176e1e50a5220152ccfca && \
-    uv pip install --python /opt/venv/bin/python \
+    pip install --no-cache-dir \
         /tmp/LTX-2/packages/ltx-core \
         /tmp/LTX-2/packages/ltx-pipelines \
         -r /tmp/requirements.txt && \
     rm -rf /tmp/LTX-2
 
-# Verification builder : packages installes
-RUN uv pip list --python /opt/venv/bin/python | grep -i ltx
+# Verification builder : ltx_core et ltx_pipelines importables
+RUN python -c "import ltx_core; print('ltx_core OK:', ltx_core.__file__)" && \
+    python -c "import ltx_pipelines; print('ltx_pipelines OK')" && \
+    pip list | grep -i ltx
 
 # ============================================================
 # Stage 2 : runtime (pas de compilateur, pas de headers)
@@ -83,8 +81,9 @@ RUN apt-get update && \
 # --- Copy venv depuis builder ---
 COPY --from=builder /opt/venv /opt/venv
 
-# Verification runtime : pip list apres COPY
-RUN /opt/venv/bin/pip list 2>/dev/null | grep -i ltx || true
+# Verification runtime : ltx_core et ltx_pipelines importables apres COPY
+RUN python -c "import ltx_core; print('ltx_core OK:', ltx_core.__file__)" && \
+    python -c "import ltx_pipelines; print('ltx_pipelines OK')"
 
 # --- Application ---
 RUN mkdir -p /app
