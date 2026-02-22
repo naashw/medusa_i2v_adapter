@@ -38,18 +38,23 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         --index-url https://download.pytorch.org/whl/cu128 \
         --extra-index-url https://pypi.org/simple/
 
-# --- ltx-core + ltx-pipelines + runtime deps en une seule resolution ---
+# --- ltx-core + ltx-pipelines depuis le repo Lightricks/LTX-2 ---
 # Pin au commit 28c3c73 (2026-02-09) — inclut CPU fallback natif pour fuse_loras FP8
-# Resolution atomique : evite que requirements.txt ecrase ltx-core
+RUN git clone --filter=blob:none --quiet https://github.com/Lightricks/LTX-2.git /tmp/LTX-2 && \
+    cd /tmp/LTX-2 && git checkout 28c3c73fe557666c3de176e1e50a5220152ccfca
+
+# Installer ltx-core d'abord (dependance de ltx-pipelines)
+RUN cd /tmp/LTX-2/packages/ltx-core && pip install --no-cache-dir .
+
+# Installer ltx-pipelines
+RUN cd /tmp/LTX-2/packages/ltx-pipelines && pip install --no-cache-dir .
+
+# Cleanup repo clone
+RUN rm -rf /tmp/LTX-2
+
+# --- Runtime Python dependencies (runpod, requests, etc.) ---
 COPY requirements.txt /tmp/requirements.txt
-RUN --mount=type=cache,target=/root/.cache/pip \
-    git clone --filter=blob:none --quiet https://github.com/Lightricks/LTX-2.git /tmp/LTX-2 && \
-    cd /tmp/LTX-2 && git checkout 28c3c73fe557666c3de176e1e50a5220152ccfca && \
-    pip install --no-cache-dir \
-        /tmp/LTX-2/packages/ltx-core \
-        /tmp/LTX-2/packages/ltx-pipelines \
-        -r /tmp/requirements.txt && \
-    rm -rf /tmp/LTX-2
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 # Verification builder : ltx_core et ltx_pipelines importables
 RUN python -c "import ltx_core; print('ltx_core OK:', ltx_core.__file__)" && \
