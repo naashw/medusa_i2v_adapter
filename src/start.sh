@@ -65,13 +65,31 @@ download_model() {
     local filepath="${dest_dir}/${filename}"
 
     if [ -f "$filepath" ]; then
-        local size
-        size=$(stat -c%s "$filepath" 2>/dev/null || echo 0)
-        if [ "$size" -gt "$min_size" ]; then
-            echo "[medusa] Deja present: $filename ($(numfmt --to=iec "$size"))"
-            return 0
+        # Fichier .aria2 = telechargement interrompu, fichier incomplet
+        if [ -f "${filepath}.aria2" ]; then
+            echo "[medusa] Incomplet (aria2 interrompu), re-telechargement: $filename"
+            rm -f "${filepath}" "${filepath}.aria2" "${filepath}.aria2__temp"
+        else
+            local size
+            size=$(stat -c%s "$filepath" 2>/dev/null || echo 0)
+            if [ "$size" -gt "$min_size" ]; then
+                # Validation safetensors : header check (instantane, pas de chargement)
+                if [[ "$filename" == *.safetensors ]]; then
+                    if ! python -c "from safetensors import safe_open; safe_open('$filepath', framework='pt')" 2>/dev/null; then
+                        echo "[medusa] Corrompu (header safetensors invalide), re-telechargement: $filename"
+                        rm -f "${filepath}" "${filepath}.aria2" "${filepath}.aria2__temp"
+                    else
+                        echo "[medusa] Deja present: $filename ($(numfmt --to=iec "$size"))"
+                        return 0
+                    fi
+                else
+                    echo "[medusa] Deja present: $filename ($(numfmt --to=iec "$size"))"
+                    return 0
+                fi
+            else
+                echo "[medusa] Corrompu (${size}B < min ${min_size}B), re-telechargement: $filename"
+            fi
         fi
-        echo "[medusa] Corrompu (${size}B < min ${min_size}B), re-telechargement: $filename"
     fi
 
     echo "[medusa] Telechargement: $filename"
