@@ -17,7 +17,6 @@ FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04 AS builder
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     CMAKE_BUILD_PARALLEL_LEVEL=8 \
-    UV_SYSTEM_PYTHON=1 \
     UV_COMPILE_BYTECODE=1
 
 # --- Build dependencies + Python 3.12 (natif Ubuntu 24.04) + uv ---
