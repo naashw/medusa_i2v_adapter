@@ -69,8 +69,21 @@ download_model() {
     local filepath="${dest_dir}/${filename}"
 
     if [ -f "$filepath" ]; then
-        echo "[medusa] Deja present: $filename"
-        return 0
+        # Valider les fichiers safetensors (detecte les telechargements partiels)
+        if [[ "$filename" == *.safetensors ]]; then
+            if ! python -c "from safetensors import safe_open; f = safe_open('${filepath}', framework='pt'); del f" 2>/dev/null; then
+                local file_size
+                file_size=$(stat -c%s "$filepath" 2>/dev/null || echo "?")
+                echo "[medusa] CORROMPU: $filename (${file_size} bytes) — suppression et re-telechargement"
+                rm -f "$filepath"
+            else
+                echo "[medusa] Deja present (valide): $filename"
+                return 0
+            fi
+        else
+            echo "[medusa] Deja present: $filename"
+            return 0
+        fi
     fi
 
     local disk_avail mem_avail
