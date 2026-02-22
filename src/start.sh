@@ -123,28 +123,24 @@ download_model() {
 }
 
 # -----------------------------------------------
-# 4. Telechargement des modeles (en parallele)
+# 4. Telechargement des modeles (sequentiel)
 # -----------------------------------------------
-echo "[medusa] Demarrage des telechargements..."
-DOWNLOAD_PIDS=()
+echo "[medusa] Demarrage des telechargements (sequentiel)..."
 
 # --- Checkpoint (>10GB) ---
 download_model \
     "https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-dev-fp8.safetensors" \
-    "${MODELS_DIR}/checkpoints" 10000000000 &
-DOWNLOAD_PIDS+=($!)
+    "${MODELS_DIR}/checkpoints" 10000000000
 
 # --- Distilled LoRA (>100MB) ---
 download_model \
     "https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-distilled-lora-384.safetensors" \
-    "${MODELS_DIR}/loras" 100000000 &
-DOWNLOAD_PIDS+=($!)
+    "${MODELS_DIR}/loras" 100000000
 
 # --- I2V Adapter (>100MB) ---
 download_model \
     "https://huggingface.co/MachineDelusions/LTX-2_Image2Video_Adapter_LoRa/resolve/main/LTX-2-Image2Vid-Adapter.safetensors" \
-    "${MODELS_DIR}/loras" 100000000 &
-DOWNLOAD_PIDS+=($!)
+    "${MODELS_DIR}/loras" 100000000
 
 # --- Camera LoRAs (>100MB each) ---
 CAMERA_LORAS=(
@@ -158,8 +154,7 @@ CAMERA_LORAS=(
 )
 
 for lora_url in "${CAMERA_LORAS[@]}"; do
-    download_model "$lora_url" "${MODELS_DIR}/loras" 100000000 &
-    DOWNLOAD_PIDS+=($!)
+    download_model "$lora_url" "${MODELS_DIR}/loras" 100000000
 done
 
 # --- Gemma 3 12B (format HuggingFace, ~24GB BF16) ---
@@ -175,23 +170,9 @@ snapshot_download(
     local_dir='$GEMMA_DIR',
     ignore_patterns=['*.gguf', '*.bin'],
 )
-" &
-    DOWNLOAD_PIDS+=($!)
+"
 fi
 
-# Attendre tous les telechargements et verifier les codes retour
-echo "[medusa] Attente fin des telechargements..."
-DOWNLOAD_FAILED=0
-for pid in "${DOWNLOAD_PIDS[@]}"; do
-    if ! wait "$pid"; then
-        DOWNLOAD_FAILED=1
-    fi
-done
-
-if [ "$DOWNLOAD_FAILED" -eq 1 ]; then
-    echo "[medusa] ERREUR: Un ou plusieurs telechargements ont echoue"
-    exit 1
-fi
 echo "[medusa] Tous les modeles sont prets."
 
 # -----------------------------------------------
