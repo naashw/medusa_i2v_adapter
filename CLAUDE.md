@@ -21,7 +21,7 @@ Objectif : generation rapide de videos dolly a partir d'images, qualite correcte
 
 - `Dockerfile` — image Docker multi-stage (devel builder -> runtime), sans ComfyUI
 - `docker-compose.yml` — lancement local avec GPU
-- `src/start.sh` — script de demarrage (telecharge modeles + lance handler)
+- `src/start.sh` — script de demarrage (telecharge modeles via hf_xet + lance handler)
 - `src/warmup_embeddings.py` — warmup embeddings low-RAM (safe_open direct, sans ModelLedger)
 - `src/pipeline.py` — classe MedusaPipeline (inference ltx-pipelines)
 - `src/handler.py` — handler RunPod serverless (API simplifiee)

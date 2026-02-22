@@ -63,38 +63,30 @@ export VOLUME_ROOT="$WORKSPACE"
 # 3. Fonction de telechargement
 # -----------------------------------------------
 download_model() {
-    local url="$1"
-    local dest_dir="$2"
-    local filename
-    filename=$(basename "$url")
+    local repo_id="$1"
+    local filename="$2"
+    local dest_dir="$3"
     local filepath="${dest_dir}/${filename}"
 
-    if [ -f "$filepath" ] && [ ! -f "${filepath}.aria2" ]; then
+    if [ -f "$filepath" ]; then
         echo "[medusa] Deja present: $filename"
         return 0
-    elif [ -f "${filepath}.aria2" ]; then
-        echo "[medusa] Reprise telechargement interrompu: $filename"
     fi
 
-    # Log etat systeme avant telechargement
     local disk_avail mem_avail
     disk_avail=$(df -h "$dest_dir" | awk 'NR==2{print $4}')
     mem_avail=$(awk '/MemAvailable/{printf "%.0fM", $2/1024}' /proc/meminfo 2>/dev/null || echo "?")
     echo "[medusa] Telechargement: $filename (disque libre: ${disk_avail}, RAM libre: ${mem_avail})"
 
-    local dl_exit
-    aria2c -x 16 -s 16 -k 1M \
-        -d "$dest_dir" -o "$filename" \
-        "$url" \
-        --continue=true \
-        --console-log-level=warn \
-        --summary-interval=0 \
-        --check-certificate=true \
-        --file-allocation=none \
-        --max-tries=3 \
-        --retry-wait=5 \
-        --timeout=600
-    dl_exit=$?
+    python -c "
+from huggingface_hub import hf_hub_download
+hf_hub_download(
+    repo_id='${repo_id}',
+    filename='${filename}',
+    local_dir='${dest_dir}',
+)
+"
+    local dl_exit=$?
 
     if [ "$dl_exit" -ne 0 ]; then
         local disk_after mem_after
@@ -110,36 +102,32 @@ download_model() {
 # -----------------------------------------------
 # 4. Telechargement des modeles (sequentiel)
 # -----------------------------------------------
-echo "[medusa] Demarrage des telechargements (sequentiel)..."
+echo "[medusa] Demarrage des telechargements (sequentiel, hf_xet)..."
 
-# --- Checkpoint (>10GB) ---
-download_model \
-    "https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-dev.safetensors" \
-    "${MODELS_DIR}/checkpoints"
+# --- Checkpoint (~38GB) ---
+download_model "Lightricks/LTX-2" "ltx-2-19b-dev.safetensors" "${MODELS_DIR}/checkpoints"
 
-# --- Distilled LoRA (>100MB) ---
-download_model \
-    "https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-distilled-lora-384.safetensors" \
-    "${MODELS_DIR}/loras"
+# --- Distilled LoRA ---
+download_model "Lightricks/LTX-2" "ltx-2-19b-distilled-lora-384.safetensors" "${MODELS_DIR}/loras"
 
-# --- I2V Adapter (>100MB) ---
-download_model \
-    "https://huggingface.co/MachineDelusions/LTX-2_Image2Video_Adapter_LoRa/resolve/main/LTX-2-Image2Vid-Adapter.safetensors" \
-    "${MODELS_DIR}/loras"
+# --- I2V Adapter ---
+download_model "MachineDelusions/LTX-2_Image2Video_Adapter_LoRa" "LTX-2-Image2Vid-Adapter.safetensors" "${MODELS_DIR}/loras"
 
-# --- Camera LoRAs (>100MB each) ---
+# --- Camera LoRAs ---
 CAMERA_LORAS=(
-    "https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-In/resolve/main/ltx-2-19b-lora-camera-control-dolly-in.safetensors"
-    "https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-Out/resolve/main/ltx-2-19b-lora-camera-control-dolly-out.safetensors"
-    "https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-Left/resolve/main/ltx-2-19b-lora-camera-control-dolly-left.safetensors"
-    "https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-Right/resolve/main/ltx-2-19b-lora-camera-control-dolly-right.safetensors"
-    "https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Jib-Down/resolve/main/ltx-2-19b-lora-camera-control-jib-down.safetensors"
-    "https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Jib-Up/resolve/main/ltx-2-19b-lora-camera-control-jib-up.safetensors"
-    "https://huggingface.co/Lightricks/LTX-2-19b-LoRA-Camera-Control-Static/resolve/main/ltx-2-19b-lora-camera-control-static.safetensors"
+    "Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-In|ltx-2-19b-lora-camera-control-dolly-in.safetensors"
+    "Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-Out|ltx-2-19b-lora-camera-control-dolly-out.safetensors"
+    "Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-Left|ltx-2-19b-lora-camera-control-dolly-left.safetensors"
+    "Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-Right|ltx-2-19b-lora-camera-control-dolly-right.safetensors"
+    "Lightricks/LTX-2-19b-LoRA-Camera-Control-Jib-Down|ltx-2-19b-lora-camera-control-jib-down.safetensors"
+    "Lightricks/LTX-2-19b-LoRA-Camera-Control-Jib-Up|ltx-2-19b-lora-camera-control-jib-up.safetensors"
+    "Lightricks/LTX-2-19b-LoRA-Camera-Control-Static|ltx-2-19b-lora-camera-control-static.safetensors"
 )
 
-for lora_url in "${CAMERA_LORAS[@]}"; do
-    download_model "$lora_url" "${MODELS_DIR}/loras"
+for entry in "${CAMERA_LORAS[@]}"; do
+    repo_id="${entry%%|*}"
+    filename="${entry##*|}"
+    download_model "$repo_id" "$filename" "${MODELS_DIR}/loras"
 done
 
 # --- Gemma 3 12B (format HuggingFace, ~24GB BF16) ---

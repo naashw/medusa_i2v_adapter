@@ -64,13 +64,14 @@ FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:$PATH" \
-    RUNPOD_INIT_TIMEOUT=600
+    RUNPOD_INIT_TIMEOUT=600 \
+    HF_XET_HIGH_PERFORMANCE=1
 
 # --- Runtime dependencies only (Python 3.12 natif Ubuntu 24.04) ---
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         python3 python3-dev \
-        curl ffmpeg aria2 \
+        curl ffmpeg \
         libgl1 libglib2.0-0 \
         google-perftools tini \
         gcc libc6-dev && \
