@@ -224,6 +224,8 @@ class MedusaPipeline:
         frame_rate: float,
         output_path: str,
         image_strength: float = 1.0,
+        last_image_path: str | None = None,
+        last_image_strength: float = 1.0,
         prompt_override: str | None = None,
         negative_override: str | None = None,
     ) -> None:
@@ -240,6 +242,8 @@ class MedusaPipeline:
             frame_rate: FPS output.
             output_path: Chemin de sortie MP4.
             image_strength: Force du conditioning image (0-1).
+            last_image_path: Chemin vers l'image last frame (optionnel).
+            last_image_strength: Force du conditioning last image (0-1).
             prompt_override: Prompt custom (sinon utilise le cache camera).
             negative_override: Negative prompt custom.
         """
@@ -270,8 +274,13 @@ class MedusaPipeline:
         stepper = EulerDiffusionStep()
 
         # 4. Image conditioning
+        images = [(image_path, 0, image_strength)]
+        if last_image_path is not None:
+            last_latent_idx = (num_frames - 1) // 8
+            images.append((last_image_path, last_latent_idx, last_image_strength))
+
         conditionings = image_conditionings_by_replacing_latent(
-            images=[(image_path, 0, image_strength)],
+            images=images,
             height=height,
             width=width,
             video_encoder=self._video_encoder,

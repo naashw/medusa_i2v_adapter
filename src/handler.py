@@ -291,6 +291,8 @@ def handler(job: dict) -> dict:
     num_frames = job_input.get("num_frames", 25)
     frame_rate = job_input.get("frame_rate", 24)
     image_strength = job_input.get("image_strength", 1.0)
+    last_image_data = job_input.get("last_image")
+    last_image_strength = job_input.get("last_image_strength", 1.0)
     prompt_override = job_input.get("prompt")
     negative_override = job_input.get("negative_prompt")
 
@@ -302,10 +304,13 @@ def handler(job: dict) -> dict:
     disk_before = get_disk_usage_mb()
     log.info("Job %s - Disque avant: %.0f MB", job_id, disk_before)
 
-    # --- Resolve image ---
+    # --- Resolve image(s) ---
     tmp_image = None
+    tmp_last_image = None
     try:
         tmp_image = resolve_image(image_data)
+        if last_image_data:
+            tmp_last_image = resolve_image(last_image_data)
 
         # --- Resolution dynamique ---
         height, width = compute_target_resolution(tmp_image)
@@ -332,6 +337,8 @@ def handler(job: dict) -> dict:
             frame_rate=frame_rate,
             output_path=output_path,
             image_strength=image_strength,
+            last_image_path=tmp_last_image,
+            last_image_strength=last_image_strength,
             prompt_override=prompt_override,
             negative_override=negative_override,
         )
@@ -359,9 +366,11 @@ def handler(job: dict) -> dict:
         return {"error": str(e)}
 
     finally:
-        # Cleanup image temporaire
+        # Cleanup images temporaires
         if tmp_image and os.path.isfile(tmp_image):
             os.unlink(tmp_image)
+        if tmp_last_image and os.path.isfile(tmp_last_image):
+            os.unlink(tmp_last_image)
 
 
 # --- Init & Start ---

@@ -41,10 +41,14 @@ Objectif : generation rapide de videos dolly a partir d'images, qualite correcte
     "seed": 12345,
     "num_frames": 25,
     "frame_rate": 24,
-    "image_strength": 1.0
+    "image_strength": 1.0,
+    "last_image": "https://example.com/target.jpg",
+    "last_image_strength": 1.0
   }
 }
 ```
+
+`last_image` et `last_image_strength` sont optionnels. Si `last_image` est fourni, la video est guidee vers cette image cible en derniere frame.
 
 Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib-up, static.
 
