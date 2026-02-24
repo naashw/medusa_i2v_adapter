@@ -12,6 +12,12 @@
 # ============================================================
 # Stage 1 : builder (compile PyTorch, ltx-core, ltx-pipelines)
 # ============================================================
+# --- Audit espace disque volume builder RunPod ---
+FROM alpine:3.21 AS volume-audit
+RUN echo "=== AUDIT VOLUME BUILDER ===" && \
+    du -sh /runpod-volume/* 2>/dev/null | sort -rh | head -20 || echo "Volume non monte" && \
+    echo "==========================="
+
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive \

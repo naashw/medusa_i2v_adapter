@@ -51,6 +51,11 @@ MODELS_DIR="${WORKSPACE}/models"
 echo "[medusa] Workspace: $WORKSPACE"
 echo "[medusa] Models dir: $MODELS_DIR"
 
+# Audit espace disque au demarrage
+echo "[medusa] === Espace disque volume ==="
+du -sh "$WORKSPACE"/* 2>/dev/null | sort -rh | head -20 || echo "[medusa] Volume vide ou inaccessible"
+echo "[medusa] ==========================="
+
 mkdir -p "${MODELS_DIR}/checkpoints"
 mkdir -p "${MODELS_DIR}/text_encoders"
 mkdir -p "${MODELS_DIR}/loras"
