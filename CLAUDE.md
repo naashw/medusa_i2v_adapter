@@ -63,6 +63,7 @@ Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib
   - Embeddings pre-caches sur disque (generes par warmup_embeddings.py)
 - **Eager init** : pipeline init complet AVANT `runpod.serverless.start()` — premier job sans cold start
 - **Download parallele** : `image` et `last_image` telecharges en parallele via ThreadPoolExecutor
+- **torch.compile** : `torch.compile(mode="reduce-overhead")` sur chaque transformer apres build (desactivable via `TORCH_COMPILE=0`)
 - **Ordre d'init** : warmup embeddings (process isole) → transformer (dolly-in) → video encoder → video decoder
 - **warmup_embeddings.py** : charge uniquement les 59 cles TE via safe_open (2.7GB) + Gemma `low_cpu_mem_usage=True`. Peak ~35GB.
 - **Audio skip** : `skip_step=99` sur audio guider → audio compute seulement au step 0/8
@@ -89,3 +90,4 @@ Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib
 - `start.sh` lance le warmup avec `LD_PRELOAD=""` pour desactiver tcmalloc (inutile sur process ephemere)
 - `start.sh` valide les fichiers `.safetensors` existants via `safe_open()` avant de skip le telechargement (detecte les fichiers corrompus/partiels)
 - S3 env vars : `S3_BUCKET`, `S3_ENDPOINT_URL` (defaut OVH SBG), `S3_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+- `TORCH_COMPILE=0` pour desactiver torch.compile (debug ou compatibilite)

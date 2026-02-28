@@ -204,6 +204,17 @@ class MedusaPipeline:
         self._current_camera_lora = camera_lora_path
         del ledger
 
+        # torch.compile pour acceleration inference (8 steps/job)
+        # fullgraph=False requis : control flow dynamique dans BasicAVTransformerBlock
+        # reduce-overhead : optimise pour inference repetee avec shapes fixes
+        if os.environ.get("TORCH_COMPILE", "1") == "1":
+            log.info("torch.compile transformer (mode=reduce-overhead)...")
+            self._transformers[camera_lora_path] = torch.compile(
+                self._transformers[camera_lora_path],
+                mode="reduce-overhead",
+                fullgraph=False,
+            )
+
         self._log_vram(f"apres transformer {os.path.basename(camera_lora_path)}")
         return self._transformers[camera_lora_path]
 
