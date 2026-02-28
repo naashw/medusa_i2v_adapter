@@ -88,8 +88,8 @@ class MedusaPipeline:
         # Video decoder (persistent en VRAM)
         self._video_decoder: torch.nn.Module | None = None
 
-        # Transformer cache en VRAM (toutes LoRAs fusionnees)
-        self._base_transformer: torch.nn.Module | None = None
+        # Transformers caches en VRAM par camera LoRA (toutes LoRAs fusionnees)
+        self._transformers: dict[str, torch.nn.Module] = {}
         self._current_camera_lora: str | None = None
 
         # Embeddings cache (prompt -> (video_ctx, audio_ctx))
@@ -181,15 +181,12 @@ class MedusaPipeline:
     def get_transformer(self, camera_lora_path: str) -> torch.nn.Module:
         """Retourne le transformer avec toutes les LoRAs fusionnees (distilled + I2V + camera).
 
-        Le transformer est cache tant que la meme camera est utilisee.
-        Un changement de camera = rebuild complet via ModelLedger (~5-8s sur H100).
+        Chaque camera LoRA est gardee en VRAM pour swap instantane (H100 80GB).
+        Premier appel pour une camera = build via ModelLedger, ensuite lookup direct.
         """
-        if camera_lora_path == self._current_camera_lora and self._base_transformer is not None:
-            return self._base_transformer
-
-        if self._base_transformer is not None:
-            del self._base_transformer
-            cleanup_memory()
+        if camera_lora_path in self._transformers:
+            self._current_camera_lora = camera_lora_path
+            return self._transformers[camera_lora_path]
 
         log.info("Build transformer avec LoRA: %s", os.path.basename(camera_lora_path))
 
@@ -203,13 +200,12 @@ class MedusaPipeline:
             checkpoint_path=self._checkpoint_path,
             loras=all_loras,
         )
-        self._base_transformer = ledger.transformer()
+        self._transformers[camera_lora_path] = ledger.transformer()
         self._current_camera_lora = camera_lora_path
         del ledger
-        cleanup_memory()
 
-        self._log_vram("apres transformer")
-        return self._base_transformer
+        self._log_vram(f"apres transformer {os.path.basename(camera_lora_path)}")
+        return self._transformers[camera_lora_path]
 
     @torch.inference_mode()
     def generate(
