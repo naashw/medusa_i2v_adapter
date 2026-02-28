@@ -21,6 +21,7 @@ import random
 import shutil
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import boto3
 import requests
@@ -296,21 +297,25 @@ def handler(job: dict) -> dict:
     prompt_override = job_input.get("prompt")
     negative_override = job_input.get("negative_prompt")
 
-    # --- Lazy init pipeline (seulement si cache miss) ---
+    # --- Pipeline deja init au startup (eager init) ---
     if pipeline is None:
-        log.info("Pipeline non init — cold start...")
-        pipeline = init_pipeline()
+        raise RuntimeError("Pipeline non initialise — le worker doit etre lance via __main__")
 
     disk_before = get_disk_usage_mb()
     log.info("Job %s - Disque avant: %.0f MB", job_id, disk_before)
 
-    # --- Resolve image(s) ---
+    # --- Resolve image(s) en parallele ---
     tmp_image = None
     tmp_last_image = None
     try:
-        tmp_image = resolve_image(image_data)
         if last_image_data:
-            tmp_last_image = resolve_image(last_image_data)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_image = pool.submit(resolve_image, image_data)
+                fut_last = pool.submit(resolve_image, last_image_data)
+                tmp_image = fut_image.result()
+                tmp_last_image = fut_last.result()
+        else:
+            tmp_image = resolve_image(image_data)
 
         # --- Resolution dynamique ---
         height, width = compute_target_resolution(tmp_image)
@@ -398,5 +403,6 @@ def init_pipeline() -> MedusaPipeline:
 
 
 if __name__ == "__main__":
-    # Pas d'init ici — lazy init dans le handler au premier cache miss
+    # Eager init — le pipeline est pret avant le premier job
+    pipeline = init_pipeline()
     runpod.serverless.start({"handler": handler})

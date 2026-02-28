@@ -25,7 +25,7 @@ Objectif : generation rapide de videos dolly a partir d'images, qualite correcte
 - `src/start.sh` — script de demarrage (telecharge modeles via hf_xet + valide safetensors + lance handler)
 - `src/warmup_embeddings.py` — warmup embeddings low-RAM (safe_open direct, sans ModelLedger)
 - `src/pipeline.py` — classe MedusaPipeline (inference ltx-pipelines)
-- `src/handler.py` — handler RunPod serverless (API simplifiee)
+- `src/handler.py` — handler RunPod serverless (API simplifiee, eager init, download images parallele)
 - `workflows/` — reference ComfyUI (plus utilises en production)
 - `scripts/` — scripts utilitaires (test, envoi, conversion)
 - `docs/` — documentation et exemples
@@ -61,6 +61,8 @@ Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib
   - Chaque camera LoRA buildee une seule fois via ModelLedger puis gardee en VRAM (H100 80GB)
   - 3 LoRAs fusionnees par transformer : distilled + I2V + camera
   - Embeddings pre-caches sur disque (generes par warmup_embeddings.py)
+- **Eager init** : pipeline init complet AVANT `runpod.serverless.start()` — premier job sans cold start
+- **Download parallele** : `image` et `last_image` telecharges en parallele via ThreadPoolExecutor
 - **Ordre d'init** : warmup embeddings (process isole) → transformer (dolly-in) → video encoder → video decoder
 - **warmup_embeddings.py** : charge uniquement les 59 cles TE via safe_open (2.7GB) + Gemma `low_cpu_mem_usage=True`. Peak ~35GB.
 - **Audio skip** : `skip_step=99` sur audio guider → audio compute seulement au step 0/8
