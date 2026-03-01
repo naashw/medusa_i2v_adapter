@@ -277,6 +277,7 @@ class MedusaPipeline:
 
             # torch.compile pour acceleration inference (8 steps/job)
             if os.environ.get("TORCH_COMPILE", "1") == "1":
+                torch._dynamo.config.allow_unspec_int_on_nn_module = True
                 log.info("torch.compile transformer (mode=reduce-overhead)...")
                 self._transformer = torch.compile(
                     self._transformer,
