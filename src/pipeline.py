@@ -5,7 +5,7 @@ Remplace ComfyUI par un appel Python direct a ltx-core / ltx-pipelines.
 Gestion du lifecycle des modeles entre jobs :
   - Video encoder  : persistent en VRAM (~1GB)
   - Video decoder  : persistent en VRAM (~2GB)
-  - Transformer    : cache par camera LoRA, rebuild via ModelLedger si camera change
+  - Transformer    : base (distilled + I2V) persistante, camera LoRA fuse/unfuse in-place
   - Text encoder   : charge sur CPU au warmup, embeddings caches sur disque
 """
 
@@ -16,6 +16,7 @@ import os
 from collections.abc import Iterator
 
 import torch
+from safetensors.torch import load_file as load_safetensors
 
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
 from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
@@ -88,9 +89,12 @@ class MedusaPipeline:
         # Video decoder (persistent en VRAM)
         self._video_decoder: torch.nn.Module | None = None
 
-        # Transformers caches en VRAM par camera LoRA (toutes LoRAs fusionnees)
-        self._transformers: dict[str, torch.nn.Module] = {}
+        # Transformer base en VRAM (distilled + I2V fusionnes, camera LoRA fuse/unfuse dynamiquement)
+        self._transformer: torch.nn.Module | None = None
         self._current_camera_lora: str | None = None
+
+        # Cache des deltas camera LoRA precalcules (path -> {param_name: delta_tensor CPU})
+        self._camera_deltas: dict[str, dict[str, torch.Tensor]] = {}
 
         # Embeddings cache (prompt -> (video_ctx, audio_ctx))
         self._embeddings_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -178,45 +182,118 @@ class MedusaPipeline:
             rsvd = torch.cuda.memory_reserved() / 2**30
             log.info("VRAM [%s]: %.2fGB alloc, %.2fGB reserved", label, alloc, rsvd)
 
-    def get_transformer(self, camera_lora_path: str) -> torch.nn.Module:
-        """Retourne le transformer avec toutes les LoRAs fusionnees (distilled + I2V + camera).
+    def _get_orig_module(self) -> torch.nn.Module:
+        """Unwrap torch.compile OptimizedModule si besoin."""
+        mod = self._transformer
+        if hasattr(mod, "_orig_mod"):
+            return mod._orig_mod
+        return mod
 
-        Chaque camera LoRA est gardee en VRAM pour swap instantane (H100 80GB).
-        Premier appel pour une camera = build via ModelLedger, ensuite lookup direct.
+    def _compute_camera_delta(self, camera_lora_path: str) -> dict[str, torch.Tensor]:
+        """Charge un camera LoRA et calcule les deltas poids (caches sur CPU).
+
+        Formule : delta = strength * alpha/rank * (lora_up @ lora_down)
+        Les deltas sont caches pour reutilisation lors des switch cameras.
         """
-        if camera_lora_path in self._transformers:
-            self._current_camera_lora = camera_lora_path
-            return self._transformers[camera_lora_path]
+        if camera_lora_path in self._camera_deltas:
+            return self._camera_deltas[camera_lora_path]
 
-        log.info("Build transformer avec LoRA: %s", os.path.basename(camera_lora_path))
+        log.info("Calcul delta camera LoRA: %s", os.path.basename(camera_lora_path))
+        raw = load_safetensors(camera_lora_path, device="cpu")
 
-        all_loras = [
-            *self._base_loras,
-            LoraPathStrengthAndSDOps(camera_lora_path, CAMERA_LORA_STRENGTH, LTXV_LORA_COMFY_RENAMING_MAP),
-        ]
-        ledger = ModelLedger(
-            dtype=self.dtype,
-            device=self.device,
-            checkpoint_path=self._checkpoint_path,
-            loras=all_loras,
-        )
-        self._transformers[camera_lora_path] = ledger.transformer()
-        self._current_camera_lora = camera_lora_path
-        del ledger
+        # Grouper les paires lora_up/lora_down par cle de base
+        pairs: dict[str, dict[str, torch.Tensor]] = {}
+        for key, tensor in raw.items():
+            # LTXV_LORA_COMFY_RENAMING_MAP : strip "diffusion_model." prefix
+            clean = key.replace("diffusion_model.", "", 1) if key.startswith("diffusion_model.") else key
 
-        # torch.compile pour acceleration inference (8 steps/job)
-        # fullgraph=False requis : control flow dynamique dans BasicAVTransformerBlock
-        # reduce-overhead : optimise pour inference repetee avec shapes fixes
-        if os.environ.get("TORCH_COMPILE", "1") == "1":
-            log.info("torch.compile transformer (mode=reduce-overhead)...")
-            self._transformers[camera_lora_path] = torch.compile(
-                self._transformers[camera_lora_path],
-                mode="reduce-overhead",
-                fullgraph=False,
+            if ".lora_down.weight" in clean:
+                base = clean.replace(".lora_down.weight", "")
+                pairs.setdefault(base, {})["down"] = tensor
+            elif ".lora_up.weight" in clean:
+                base = clean.replace(".lora_up.weight", "")
+                pairs.setdefault(base, {})["up"] = tensor
+            elif ".alpha" in clean:
+                base = clean.replace(".alpha", "")
+                pairs.setdefault(base, {})["alpha"] = tensor
+
+        deltas: dict[str, torch.Tensor] = {}
+        for base_key, pair in pairs.items():
+            if "down" not in pair or "up" not in pair:
+                continue
+            down = pair["down"].to(dtype=self.dtype, device=self.device)
+            up = pair["up"].to(dtype=self.dtype, device=self.device)
+
+            delta = up @ down
+
+            if "alpha" in pair:
+                rank = down.shape[0]
+                alpha_val = pair["alpha"].item()
+                delta = delta * (alpha_val / rank)
+
+            delta = delta * CAMERA_LORA_STRENGTH
+            deltas[f"{base_key}.weight"] = delta.cpu()
+            del down, up, delta
+
+        self._camera_deltas[camera_lora_path] = deltas
+        log.info("Delta camera: %d params calcules", len(deltas))
+        return deltas
+
+    def _apply_camera_delta(self, camera_lora_path: str, sign: float = 1.0) -> None:
+        """Fuse (sign=1) ou unfuse (sign=-1) un camera LoRA delta in-place."""
+        deltas = self._compute_camera_delta(camera_lora_path)
+        module = self._get_orig_module()
+        params = dict(module.named_parameters())
+        applied = 0
+        for key, delta_cpu in deltas.items():
+            if key in params:
+                params[key].data.add_(delta_cpu.to(self.device), alpha=sign)
+                applied += 1
+        action = "Fuse" if sign > 0 else "Unfuse"
+        log.info("%s camera LoRA: %s (%d/%d params)", action, os.path.basename(camera_lora_path), applied, len(deltas))
+
+    def get_transformer(self, camera_lora_path: str) -> torch.nn.Module:
+        """Retourne le transformer avec la camera LoRA demandee.
+
+        Base (distilled + I2V) construite une seule fois via ModelLedger.
+        Camera LoRA fuse/unfuse dynamiquement in-place (~0.1s de switch).
+        Compatible torch.compile car modification in-place (memes adresses memoire).
+        """
+        # Meme camera → retourner directement
+        if self._current_camera_lora == camera_lora_path:
+            return self._transformer
+
+        # Premier appel → build base transformer (distilled + I2V seulement)
+        if self._transformer is None:
+            log.info("Build base transformer (distilled + I2V)...")
+            ledger = ModelLedger(
+                dtype=self.dtype,
+                device=self.device,
+                checkpoint_path=self._checkpoint_path,
+                loras=self._base_loras,
             )
+            self._transformer = ledger.transformer()
+            del ledger
 
-        self._log_vram(f"apres transformer {os.path.basename(camera_lora_path)}")
-        return self._transformers[camera_lora_path]
+            # torch.compile pour acceleration inference (8 steps/job)
+            if os.environ.get("TORCH_COMPILE", "1") == "1":
+                log.info("torch.compile transformer (mode=reduce-overhead)...")
+                self._transformer = torch.compile(
+                    self._transformer,
+                    mode="reduce-overhead",
+                    fullgraph=False,
+                )
+
+            self._log_vram("apres base transformer")
+        else:
+            # Switch camera → unfuse l'ancienne
+            self._apply_camera_delta(self._current_camera_lora, sign=-1.0)
+
+        # Fuse la nouvelle camera LoRA
+        self._apply_camera_delta(camera_lora_path, sign=1.0)
+        self._current_camera_lora = camera_lora_path
+        self._log_vram(f"apres camera {os.path.basename(camera_lora_path)}")
+        return self._transformer
 
     @torch.inference_mode()
     def generate(

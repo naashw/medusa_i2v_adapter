@@ -10,7 +10,7 @@ Objectif : generation rapide de videos dolly a partir d'images, qualite correcte
 ## Contexte Technique
 
 - **Runtime** : ltx-pipelines (Python direct) sur RunPod Serverless (H100 80GB, HBM3)
-- **Modele principal** : LTX-2 19B AV model (BF16, ~38GB VRAM avec 3 LoRAs fusionnees)
+- **Modele principal** : LTX-2 19B AV model (BF16, ~35GB VRAM base + camera LoRA fuse dynamique)
 - **Text encoder** : Gemma 3 12B (BF16, CPU — ~24GB RAM, format HuggingFace)
 - **Approche** : Pipeline 1 passe, 720p natif, 8 steps Euler distilled, audio skip
 - **Output** : H264 MP4, 24fps, ~1 seconde (25 frames)
@@ -57,14 +57,14 @@ Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib
 - **MedusaPipeline** : encapsule ltx-pipelines avec gestion lifecycle modeles
   - Video encoder persistent en VRAM (~1GB)
   - Video decoder persistent en VRAM (~2GB)
-  - Transformers caches en VRAM par camera LoRA (dict), swap instantane sans rebuild
-  - Chaque camera LoRA buildee une seule fois via ModelLedger puis gardee en VRAM (H100 80GB)
-  - 3 LoRAs fusionnees par transformer : distilled + I2V + camera
+  - Transformer base (distilled + I2V) permanent en VRAM (~35GB), compile une seule fois
+  - Camera LoRA fuse/unfuse dynamiquement in-place (delta = lora_up @ lora_down, ~0.1s de switch)
+  - Deltas camera precalcules et caches sur CPU, transferes vers GPU a la demande
   - Embeddings pre-caches sur disque (generes par warmup_embeddings.py)
 - **Eager init** : pipeline init complet AVANT `runpod.serverless.start()` — premier job sans cold start
 - **Download parallele** : `image` et `last_image` telecharges en parallele via ThreadPoolExecutor
-- **torch.compile** : `torch.compile(mode="reduce-overhead")` sur chaque transformer apres build (desactivable via `TORCH_COMPILE=0`)
-- **Ordre d'init** : warmup embeddings (process isole) → transformer (dolly-in) → video encoder → video decoder
+- **torch.compile** : `torch.compile(mode="reduce-overhead")` sur le transformer base (desactivable via `TORCH_COMPILE=0`). Compatible fuse/unfuse car modification in-place (adresses memoire stables).
+- **Ordre d'init** : warmup embeddings (process isole) → base transformer (distilled + I2V) → fuse camera dolly-in → video encoder → video decoder
 - **warmup_embeddings.py** : charge uniquement les 59 cles TE via safe_open (2.7GB) + Gemma `low_cpu_mem_usage=True`. Peak ~35GB.
 - **Audio skip** : `skip_step=99` sur audio guider → audio compute seulement au step 0/8
 - **CFG desactive** : `cfg_scale=1.0, stg_scale=0.0` → 1 seul forward par step
