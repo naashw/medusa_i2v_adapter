@@ -6,7 +6,7 @@ Reprend les fonctionnalites cles de handler_wrapper.py :
   - Dedup cache par hash
   - Sauvegarde outputs sur network volume
   - Cleanup disque ephemere
-  - Resolution dynamique (aspect ratio preserve, ~0.92M px, align 32px)
+  - Resolution dynamique (720p 1-stage ou 1080p 2-stage, aspect ratio preserve)
 """
 
 from __future__ import annotations
@@ -161,25 +161,33 @@ def resolve_image(image_data: str) -> str:
     return tmp.name
 
 
+RESOLUTION_CONFIGS: dict[str, tuple[float, int]] = {
+    "720p": (0.92, 32),
+    "1080p": (2.0, 64),
+}
+
+
 def compute_target_resolution(
     image_path: str,
-    target_megapixels: float = 0.92,
+    resolution: str = "720p",
 ) -> tuple[int, int]:
     """Calcule la resolution cible en preservant l'aspect ratio.
 
-    Reproduit la logique ComfyUI (ResizeImageMaskNode scale 0.92M + align 32px).
+    720p : ~0.92M px, align 32px (1-stage).
+    1080p : ~2M px, align 64px (2-stage, half-res doit etre multiple de 32).
 
     Returns:
-        (height, width) alignes sur 32 pixels.
+        (height, width) alignes sur le step d'alignement.
     """
+    target_megapixels, align = RESOLUTION_CONFIGS[resolution]
     img = Image.open(image_path)
     w, h = img.size
     scale = math.sqrt(target_megapixels * 1_000_000 / (w * h))
-    target_w = round(w * scale / 32) * 32
-    target_h = round(h * scale / 32) * 32
+    target_w = round(w * scale / align) * align
+    target_h = round(h * scale / align) * align
     # Clamp minimum
-    target_w = max(target_w, 32)
-    target_h = max(target_h, 32)
+    target_w = max(target_w, align)
+    target_h = max(target_h, align)
     return target_h, target_w
 
 
@@ -297,6 +305,10 @@ def handler(job: dict) -> dict:
     prompt_override = job_input.get("prompt")
     negative_override = job_input.get("negative_prompt")
 
+    resolution = job_input.get("resolution", "720p")
+    if resolution not in RESOLUTION_CONFIGS:
+        return {"error": f"Resolution inconnue: {resolution}. Choix: {list(RESOLUTION_CONFIGS.keys())}"}
+
     # --- Pipeline deja init au startup (eager init) ---
     if pipeline is None:
         raise RuntimeError("Pipeline non initialise — le worker doit etre lance via __main__")
@@ -318,8 +330,9 @@ def handler(job: dict) -> dict:
             tmp_image = resolve_image(image_data)
 
         # --- Resolution dynamique ---
-        height, width = compute_target_resolution(tmp_image)
-        log.info("Resolution cible: %dx%d (aspect ratio preserve, ~0.92M px)", width, height)
+        height, width = compute_target_resolution(tmp_image, resolution=resolution)
+        two_stage = resolution == "1080p"
+        log.info("Resolution cible: %dx%d (%s, %s)", width, height, resolution, "2-stage" if two_stage else "1-stage")
 
         # --- Camera LoRA ---
         lora_filename, _default_prompt = CAMERAS[camera]
@@ -346,6 +359,7 @@ def handler(job: dict) -> dict:
             last_image_strength=last_image_strength,
             prompt_override=prompt_override,
             negative_override=negative_override,
+            two_stage=two_stage,
         )
         elapsed = time.time() - start_time
         log.info("Generation terminee: %.1fs", elapsed)
@@ -394,9 +408,10 @@ def init_pipeline() -> MedusaPipeline:
     dolly_in_path = os.path.join(MODELS_DIR, "loras", CAMERAS["dolly-in"][0])
     p.get_transformer(dolly_in_path)
 
-    # 3. Charger video encoder + video decoder (persistent)
+    # 3. Charger video encoder + video decoder + spatial upsampler (persistent)
     p.load_video_encoder()
     p.load_video_decoder()
+    p.load_spatial_upsampler()
 
     log.info("Pipeline pret.")
     return p

@@ -23,18 +23,20 @@ from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
+from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import decode_video as vae_decode_video
 
 from ltx_core.text_encoders.gemma import encode_text
 from ltx_core.types import LatentState, VideoPixelShape
 from ltx_pipelines.utils import ModelLedger
-from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES
+from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
 from ltx_pipelines.utils.helpers import (
     cleanup_memory,
     denoise_audio_video,
     euler_denoising_loop,
     image_conditionings_by_replacing_latent,
     multi_modal_guider_denoising_func,
+    simple_denoising_func,
 )
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.types import PipelineComponents
@@ -66,6 +68,7 @@ class MedusaPipeline:
         self._gemma_root = os.path.join(models_dir, "text_encoders", "gemma-3-12b-it")
         self._distilled_lora = os.path.join(models_dir, "loras", "ltx-2-19b-distilled-lora-384.safetensors")
         self._i2v_adapter = os.path.join(models_dir, "loras", "LTX-2-Image2Vid-Adapter.safetensors")
+        self._upsampler_path = os.path.join(models_dir, "upscalers", "ltx-2-spatial-upscaler-x2-1.0.safetensors")
 
         # Pipeline components (patchifiers + scale factors)
         self._components = PipelineComponents(dtype=self.dtype, device=self.device)
@@ -76,11 +79,12 @@ class MedusaPipeline:
             LoraPathStrengthAndSDOps(self._i2v_adapter, I2V_ADAPTER_STRENGTH, LTXV_LORA_COMFY_RENAMING_MAP),
         ]
 
-        # Base ModelLedger SANS LoRAs — uniquement pour video_encoder et video_decoder (VAE)
+        # Base ModelLedger SANS LoRAs — pour video_encoder, video_decoder (VAE) et spatial upsampler
         self._base_ledger = ModelLedger(
             dtype=self.dtype,
             device=self.device,
             checkpoint_path=self._checkpoint_path,
+            spatial_upsampler_path=self._upsampler_path,
         )
 
         # Video encoder (persistent en VRAM)
@@ -88,6 +92,9 @@ class MedusaPipeline:
 
         # Video decoder (persistent en VRAM)
         self._video_decoder: torch.nn.Module | None = None
+
+        # Spatial upsampler x2 (persistent en VRAM, ~1GB)
+        self._spatial_upsampler: torch.nn.Module | None = None
 
         # Transformer base en VRAM (distilled + I2V fusionnes, camera LoRA fuse/unfuse dynamiquement)
         self._transformer: torch.nn.Module | None = None
@@ -99,9 +106,12 @@ class MedusaPipeline:
         # Embeddings cache (prompt -> (video_ctx, audio_ctx))
         self._embeddings_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
-        # Sigmas distilled (8 steps)
+        # Sigmas distilled (8 steps stage 1, 3 steps stage 2)
         self._sigmas = torch.tensor(
             DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=self.device
+        )
+        self._stage2_sigmas = torch.tensor(
+            STAGE_2_DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=self.device
         )
 
     def warmup_embeddings(self, cache_dir: str) -> None:
@@ -163,6 +173,12 @@ class MedusaPipeline:
         log.info("Chargement video decoder (persistent)...")
         self._video_decoder = self._base_ledger.video_decoder()
         self._log_vram("apres video decoder")
+
+    def load_spatial_upsampler(self) -> None:
+        """Charge le spatial upsampler x2 en VRAM (~1GB). Persistent entre jobs."""
+        log.info("Chargement spatial upsampler x2 (persistent)...")
+        self._spatial_upsampler = self._base_ledger.spatial_upsampler()
+        self._log_vram("apres spatial upsampler")
 
     def _load_embeddings_cache(self, cache_path: str) -> None:
         """Charge les embeddings depuis un fichier .pt."""
@@ -313,6 +329,7 @@ class MedusaPipeline:
         last_image_strength: float = 1.0,
         prompt_override: str | None = None,
         negative_override: str | None = None,
+        two_stage: bool = False,
     ) -> None:
         """Genere une video I2V et sauvegarde en MP4.
 
@@ -321,8 +338,8 @@ class MedusaPipeline:
             camera_lora_path: Chemin vers le safetensors du camera LoRA.
             camera_key: Cle camera (dolly-in, etc.) pour lookup embeddings.
             seed: Seed pour la generation.
-            height: Hauteur output (multiple de 32).
-            width: Largeur output (multiple de 32).
+            height: Hauteur output (multiple de 32, ou 64 si two_stage).
+            width: Largeur output (multiple de 32, ou 64 si two_stage).
             num_frames: Nombre de frames (k*8+1).
             frame_rate: FPS output.
             output_path: Chemin de sortie MP4.
@@ -331,6 +348,7 @@ class MedusaPipeline:
             last_image_strength: Force du conditioning last image (0-1).
             prompt_override: Prompt custom (sinon utilise le cache camera).
             negative_override: Negative prompt custom.
+            two_stage: Si True, pipeline 2-stage (half-res → upscale x2 → refine).
         """
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
@@ -358,20 +376,11 @@ class MedusaPipeline:
         noiser = GaussianNoiser(generator=generator)
         stepper = EulerDiffusionStep()
 
-        # 4. Image conditioning
+        # 4. Image list
         images = [(image_path, 0, image_strength)]
         if last_image_path is not None:
             last_latent_idx = (num_frames - 1) // 8
             images.append((last_image_path, last_latent_idx, last_image_strength))
-
-        conditionings = image_conditionings_by_replacing_latent(
-            images=images,
-            height=height,
-            width=width,
-            video_encoder=self._video_encoder,
-            dtype=self.dtype,
-            device=self.device,
-        )
 
         # 5. Guiders : video (toujours actif) + audio (skip 87.5%)
         video_guider_params = MultiModalGuiderParams(
@@ -387,8 +396,8 @@ class MedusaPipeline:
             skip_step=AUDIO_SKIP_STEP,
         )
 
-        # Denoising loop closure
-        def denoising_loop(
+        # Denoising loop closure (guiders — used for 1-stage and stage 1 of 2-stage)
+        def denoising_loop_guided(
             sigmas: torch.Tensor,
             video_state: LatentState,
             audio_state: LatentState,
@@ -414,22 +423,124 @@ class MedusaPipeline:
                 ),
             )
 
-        # 6. Denoise
-        output_shape = VideoPixelShape(
-            batch=1, frames=num_frames, width=width, height=height, fps=frame_rate,
-        )
+        if two_stage:
+            # --- 2-stage pipeline (1080p) ---
+            half_h = height // 2
+            half_w = width // 2
 
-        video_state, _audio_state = denoise_audio_video(
-            output_shape=output_shape,
-            conditionings=conditionings,
-            noiser=noiser,
-            sigmas=self._sigmas,
-            stepper=stepper,
-            denoising_loop_fn=denoising_loop,
-            components=self._components,
-            dtype=self.dtype,
-            device=self.device,
-        )
+            # Stage 1 — denoise at half-res (8 steps)
+            log.info("Stage 1: denoise %dx%d (half-res, 8 steps)...", half_w, half_h)
+            conditionings_s1 = image_conditionings_by_replacing_latent(
+                images=images,
+                height=half_h,
+                width=half_w,
+                video_encoder=self._video_encoder,
+                dtype=self.dtype,
+                device=self.device,
+            )
+
+            output_shape_s1 = VideoPixelShape(
+                batch=1, frames=num_frames, width=half_w, height=half_h, fps=frame_rate,
+            )
+
+            video_state_s1, audio_state_s1 = denoise_audio_video(
+                output_shape=output_shape_s1,
+                conditionings=conditionings_s1,
+                noiser=noiser,
+                sigmas=self._sigmas,
+                stepper=stepper,
+                denoising_loop_fn=denoising_loop_guided,
+                components=self._components,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self._log_vram("apres stage 1")
+
+            # Spatial upscale x2 in latent space
+            log.info("Upscale latent x2...")
+            upscaled_latent = upsample_video(
+                latent=video_state_s1.latent[:1],
+                video_encoder=self._video_encoder,
+                upsampler=self._spatial_upsampler,
+            )
+            self._log_vram("apres upscale")
+
+            # Stage 2 — refine at full-res (3 steps)
+            log.info("Stage 2: refine %dx%d (full-res, 3 steps)...", width, height)
+            conditionings_s2 = image_conditionings_by_replacing_latent(
+                images=images,
+                height=height,
+                width=width,
+                video_encoder=self._video_encoder,
+                dtype=self.dtype,
+                device=self.device,
+            )
+
+            def denoising_loop_s2(
+                sigmas: torch.Tensor,
+                video_state: LatentState,
+                audio_state: LatentState,
+                stepper_arg: DiffusionStepProtocol,
+            ) -> tuple[LatentState, LatentState]:
+                return euler_denoising_loop(
+                    sigmas=sigmas,
+                    video_state=video_state,
+                    audio_state=audio_state,
+                    stepper=stepper_arg,
+                    denoise_fn=simple_denoising_func(
+                        video_context=v_context_p,
+                        audio_context=a_context_p,
+                        transformer=transformer,
+                    ),
+                )
+
+            output_shape_s2 = VideoPixelShape(
+                batch=1, frames=num_frames, width=width, height=height, fps=frame_rate,
+            )
+
+            video_state, _audio_state = denoise_audio_video(
+                output_shape=output_shape_s2,
+                conditionings=conditionings_s2,
+                noiser=noiser,
+                sigmas=self._stage2_sigmas,
+                stepper=stepper,
+                denoising_loop_fn=denoising_loop_s2,
+                components=self._components,
+                dtype=self.dtype,
+                device=self.device,
+                noise_scale=self._stage2_sigmas[0].item(),
+                initial_video_latent=upscaled_latent,
+                initial_audio_latent=audio_state_s1.latent,
+            )
+            self._log_vram("apres stage 2")
+
+        else:
+            # --- 1-stage pipeline (720p) ---
+            log.info("1-stage: denoise %dx%d (8 steps)...", width, height)
+            conditionings = image_conditionings_by_replacing_latent(
+                images=images,
+                height=height,
+                width=width,
+                video_encoder=self._video_encoder,
+                dtype=self.dtype,
+                device=self.device,
+            )
+
+            output_shape = VideoPixelShape(
+                batch=1, frames=num_frames, width=width, height=height, fps=frame_rate,
+            )
+
+            video_state, _audio_state = denoise_audio_video(
+                output_shape=output_shape,
+                conditionings=conditionings,
+                noiser=noiser,
+                sigmas=self._sigmas,
+                stepper=stepper,
+                denoising_loop_fn=denoising_loop_guided,
+                components=self._components,
+                dtype=self.dtype,
+                device=self.device,
+            )
 
         # 7. VAE decode (sans tiling — H100 80GB)
         log.info("VAE decode...")

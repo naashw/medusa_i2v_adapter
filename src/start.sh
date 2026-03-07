@@ -59,6 +59,7 @@ echo "[medusa] ==========================="
 mkdir -p "${MODELS_DIR}/checkpoints"
 mkdir -p "${MODELS_DIR}/text_encoders"
 mkdir -p "${MODELS_DIR}/loras"
+mkdir -p "${MODELS_DIR}/upscalers"
 
 # Exporter pour handler.py
 export MODELS_DIR="$MODELS_DIR"
@@ -147,6 +148,9 @@ for entry in "${CAMERA_LORAS[@]}"; do
     filename="${entry##*|}"
     download_model "$repo_id" "$filename" "${MODELS_DIR}/loras"
 done
+
+# --- Spatial upscaler x2 (~1GB) ---
+download_model "Lightricks/LTX-2" "ltx-2-spatial-upscaler-x2-1.0.safetensors" "${MODELS_DIR}/upscalers"
 
 # --- Gemma 3 12B (format HuggingFace, ~24GB BF16) ---
 GEMMA_DIR="${MODELS_DIR}/text_encoders/gemma-3-12b-it"

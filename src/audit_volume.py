@@ -52,6 +52,9 @@ def audit_volume(volume_root: str) -> tuple[list[dict], list[dict], list[dict], 
             "Distilled LoRA (pipeline.py _base_loras)",
         os.path.join(models_dir, "loras", "LTX-2-Image2Vid-Adapter.safetensors"):
             "I2V Adapter LoRA (pipeline.py _base_loras)",
+        # Spatial upscaler
+        os.path.join(models_dir, "upscalers", "ltx-2-spatial-upscaler-x2-1.0.safetensors"):
+            "Spatial upscaler x2 (pipeline.py)",
         # Camera LoRAs
         os.path.join(models_dir, "loras", "ltx-2-19b-lora-camera-control-dolly-in.safetensors"):
             "Camera LoRA dolly-in (handler.py CAMERAS)",
