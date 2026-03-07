@@ -60,6 +60,7 @@ mkdir -p "${MODELS_DIR}/checkpoints"
 mkdir -p "${MODELS_DIR}/text_encoders"
 mkdir -p "${MODELS_DIR}/loras"
 mkdir -p "${MODELS_DIR}/upscalers"
+mkdir -p "${WORKSPACE}/cache/transformer"
 
 # Exporter pour handler.py
 export MODELS_DIR="$MODELS_DIR"

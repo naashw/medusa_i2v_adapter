@@ -65,6 +65,7 @@ Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib
   - Camera LoRA fuse/unfuse dynamiquement in-place (delta = lora_up @ lora_down, ~0.1s de switch)
   - Deltas camera precalcules et caches sur CPU, transferes vers GPU a la demande
   - Embeddings pre-caches sur disque (generes par warmup_embeddings.py)
+  - Cache transformer pre-fusionne dans `/runpod-volume/cache/transformer/` (checkpoint safetensors avec distilled + I2V deja fusionnes, elimine ~1-2 min de LoRA fusion aux cold starts suivants, invalidation auto par hash checkpoint + LoRAs + strengths, desactivable via `TRANSFORMER_CACHE=0`)
 - **Pipeline 2-stage** :
   - Stage 1 : denoise a ~540p (half-res), 8 steps distilled, guiders (CFG=1, STG=0, audio skip)
   - Upscale : `upsample_video()` x2 en espace latent (un-normalize → upsampler → normalize)
@@ -102,3 +103,4 @@ Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib
 - `start.sh` valide les fichiers `.safetensors` existants via `safe_open()` avant de skip le telechargement (detecte les fichiers corrompus/partiels)
 - S3 env vars : `S3_BUCKET`, `S3_ENDPOINT_URL` (defaut OVH SBG), `S3_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
 - `TORCH_COMPILE=0` pour desactiver torch.compile (debug ou compatibilite)
+- `TRANSFORMER_CACHE=0` pour desactiver le cache transformer pre-fusionne (force rebuild a chaque cold start)

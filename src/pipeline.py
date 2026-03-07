@@ -11,12 +11,15 @@ Gestion du lifecycle des modeles entre jobs :
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from collections.abc import Iterator
 
+import safetensors
 import torch
 from safetensors.torch import load_file as load_safetensors
+from safetensors.torch import save_file as save_safetensors
 
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
 from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
@@ -51,6 +54,9 @@ CAMERA_LORA_STRENGTH = 1.0
 
 # Audio skip : audio calcule seulement au step 0 / 8
 AUDIO_SKIP_STEP = 99
+
+# Version du cache transformer (incrementer pour invalider tous les caches existants)
+CACHE_VERSION = "v1"
 
 
 class MedusaPipeline:
@@ -268,6 +274,73 @@ class MedusaPipeline:
         action = "Fuse" if sign > 0 else "Unfuse"
         log.info("%s camera LoRA: %s (%d/%d params)", action, os.path.basename(camera_lora_path), applied, len(deltas))
 
+    def _cache_fingerprint(self) -> str:
+        """Hash d'invalidation pour le cache transformer pre-fusionne.
+
+        Combine CACHE_VERSION, taille du checkpoint, et basename/taille/strength
+        de chaque LoRA de base. Retourne un hash court (16 chars).
+        """
+        h = hashlib.sha256()
+        h.update(CACHE_VERSION.encode())
+        h.update(str(os.path.getsize(self._checkpoint_path)).encode())
+        for lora in self._base_loras:
+            h.update(os.path.basename(lora.path).encode())
+            h.update(str(os.path.getsize(lora.path)).encode())
+            h.update(str(lora.strength).encode())
+        return h.hexdigest()[:16]
+
+    def _save_transformer_cache(self, cache_path: str) -> None:
+        """Sauvegarde le transformer fusionne (distilled + I2V) en format checkpoint.
+
+        Extrait le state_dict du LTXModel interne, re-ajoute le prefixe
+        `model.diffusion_model.` pour compatibilite avec ModelLedger,
+        et copie les metadonnees du checkpoint original.
+        Ecriture atomique via .tmp + os.replace().
+        """
+        module = self._get_orig_module()
+        raw_sd = module.velocity_model.state_dict()
+
+        # Re-ajouter le prefixe checkpoint (inverse du renaming fait par ModelLedger)
+        sd = {f"model.diffusion_model.{k}": v.cpu() for k, v in raw_sd.items()}
+
+        # Copier les metadonnees du checkpoint original (config architecture, etc.)
+        metadata: dict[str, str] = {}
+        with safetensors.safe_open(self._checkpoint_path, framework="pt") as f:
+            orig_meta = f.metadata()
+            if orig_meta:
+                metadata.update(orig_meta)
+
+        # Ecriture atomique
+        tmp_path = cache_path + ".tmp"
+        try:
+            save_safetensors(sd, tmp_path, metadata=metadata)
+            os.replace(tmp_path, cache_path)
+            size_gb = os.path.getsize(cache_path) / 2**30
+            log.info("Cache transformer sauvegarde: %s (%.1fGB)", cache_path, size_gb)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    def _load_transformer_cache(self, cache_path: str) -> torch.nn.Module:
+        """Charge le transformer pre-fusionne depuis le cache.
+
+        Utilise ModelLedger sans LoRAs (le fichier contient deja les poids fusionnes).
+        Retourne un X0Model pret a l'emploi.
+        """
+        log.info("Chargement transformer depuis cache: %s", cache_path)
+        ledger = ModelLedger(
+            dtype=self.dtype,
+            device=self.device,
+            checkpoint_path=cache_path,
+            loras=[],
+        )
+        transformer = ledger.transformer()
+        del ledger
+        return transformer
+
     def get_transformer(self, camera_lora_path: str) -> torch.nn.Module:
         """Retourne le transformer avec la camera LoRA demandee.
 
@@ -281,15 +354,35 @@ class MedusaPipeline:
 
         # Premier appel → build base transformer (distilled + I2V seulement)
         if self._transformer is None:
-            log.info("Build base transformer (distilled + I2V)...")
-            ledger = ModelLedger(
-                dtype=self.dtype,
-                device=self.device,
-                checkpoint_path=self._checkpoint_path,
-                loras=self._base_loras,
-            )
-            self._transformer = ledger.transformer()
-            del ledger
+            cache_dir = os.path.join(os.path.dirname(self.models_dir), "cache", "transformer")
+            os.makedirs(cache_dir, exist_ok=True)
+            fingerprint = self._cache_fingerprint()
+            cache_path = os.path.join(cache_dir, f"transformer_{fingerprint}.safetensors")
+            cache_enabled = os.environ.get("TRANSFORMER_CACHE", "1") == "1"
+
+            if cache_enabled and os.path.isfile(cache_path):
+                try:
+                    self._transformer = self._load_transformer_cache(cache_path)
+                except Exception as e:
+                    log.warning("Cache transformer invalide, rebuild: %s", e)
+                    try:
+                        os.unlink(cache_path)
+                    except OSError:
+                        pass
+
+            if self._transformer is None:
+                log.info("Build base transformer (distilled + I2V)...")
+                ledger = ModelLedger(
+                    dtype=self.dtype,
+                    device=self.device,
+                    checkpoint_path=self._checkpoint_path,
+                    loras=self._base_loras,
+                )
+                self._transformer = ledger.transformer()
+                del ledger
+
+                if cache_enabled:
+                    self._save_transformer_cache(cache_path)
 
             # torch.compile pour acceleration inference (8 steps/job)
             if os.environ.get("TORCH_COMPILE", "1") == "1":

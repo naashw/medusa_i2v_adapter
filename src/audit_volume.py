@@ -85,6 +85,8 @@ def audit_volume(volume_root: str) -> tuple[list[dict], list[dict], list[dict], 
     dynamic_dirs: dict[str, str] = {
         os.path.join(volume_root, "cache", "dedup"):
             "Cache dedup par hash input",
+        os.path.join(volume_root, "cache", "transformer"):
+            "Cache transformer pre-fusionne (pipeline.py, regenerable)",
         os.path.join(volume_root, "output"):
             "Outputs video des jobs",
     }
