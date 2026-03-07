@@ -192,7 +192,7 @@ class MedusaPipeline:
     def _compute_camera_delta(self, camera_lora_path: str) -> dict[str, torch.Tensor]:
         """Charge un camera LoRA et calcule les deltas poids (caches sur CPU).
 
-        Formule : delta = strength * alpha/rank * (lora_up @ lora_down)
+        Formule : delta = strength * alpha/rank * (lora_B @ lora_A)
         Les deltas sont caches pour reutilisation lors des switch cameras.
         """
         if camera_lora_path in self._camera_deltas:
@@ -201,17 +201,17 @@ class MedusaPipeline:
         log.info("Calcul delta camera LoRA: %s", os.path.basename(camera_lora_path))
         raw = load_safetensors(camera_lora_path, device="cpu")
 
-        # Grouper les paires lora_up/lora_down par cle de base
+        # Grouper les paires lora_A/lora_B par cle de base (convention ltx-core)
         pairs: dict[str, dict[str, torch.Tensor]] = {}
         for key, tensor in raw.items():
             # LTXV_LORA_COMFY_RENAMING_MAP : strip "diffusion_model." prefix
             clean = key.replace("diffusion_model.", "", 1) if key.startswith("diffusion_model.") else key
 
-            if ".lora_down.weight" in clean:
-                base = clean.replace(".lora_down.weight", "")
+            if ".lora_A.weight" in clean:
+                base = clean.replace(".lora_A.weight", "")
                 pairs.setdefault(base, {})["down"] = tensor
-            elif ".lora_up.weight" in clean:
-                base = clean.replace(".lora_up.weight", "")
+            elif ".lora_B.weight" in clean:
+                base = clean.replace(".lora_B.weight", "")
                 pairs.setdefault(base, {})["up"] = tensor
             elif ".alpha" in clean:
                 base = clean.replace(".alpha", "")
