@@ -44,6 +44,8 @@ from ltx_pipelines.utils.helpers import (
     euler_denoising_loop,
     image_conditionings_by_replacing_latent,
     modality_from_latent_state,
+    noise_audio_state,
+    noise_video_state,
     simple_denoising_func,
 )
 from ltx_pipelines.utils.media_io import encode_video
@@ -210,6 +212,11 @@ class MedusaPipeline:
         """Charge le video decoder en VRAM (~2GB). Persistent entre jobs."""
         log.info("Chargement video decoder (persistent)...")
         self._video_decoder = self._base_ledger.video_decoder()
+        if os.environ.get("VAE_COMPILE", "1") == "1":
+            log.info("torch.compile video decoder (mode=reduce-overhead)...")
+            self._video_decoder = torch.compile(
+                self._video_decoder, mode="reduce-overhead", fullgraph=False,
+            )
         self._log_vram("apres video decoder")
 
     def load_spatial_upsampler(self) -> None:
@@ -459,7 +466,7 @@ class MedusaPipeline:
         return self._transformer
 
     @torch.inference_mode()
-    def generate(
+    def generate_frames(
         self,
         image_path: str,
         camera_lora_path: str,
@@ -469,32 +476,17 @@ class MedusaPipeline:
         width: int,
         num_frames: int,
         frame_rate: float,
-        output_path: str,
         image_strength: float = 1.0,
         last_image_path: str | None = None,
         last_image_strength: float = 1.0,
         prompt_override: str | None = None,
         negative_override: str | None = None,
         two_stage: bool = False,
-    ) -> None:
-        """Genere une video I2V et sauvegarde en MP4.
+    ) -> list[torch.Tensor]:
+        """Genere les frames I2V sans encoder en MP4.
 
-        Args:
-            image_path: Chemin vers l'image source (fichier local).
-            camera_lora_path: Chemin vers le safetensors du camera LoRA.
-            camera_key: Cle camera (dolly-in, etc.) pour lookup embeddings.
-            seed: Seed pour la generation.
-            height: Hauteur output (multiple de 32, ou 64 si two_stage).
-            width: Largeur output (multiple de 32, ou 64 si two_stage).
-            num_frames: Nombre de frames (k*8+1).
-            frame_rate: FPS output.
-            output_path: Chemin de sortie MP4.
-            image_strength: Force du conditioning image (0-1).
-            last_image_path: Chemin vers l'image last frame (optionnel).
-            last_image_strength: Force du conditioning last image (0-1).
-            prompt_override: Prompt custom (sinon utilise le cache camera).
-            negative_override: Negative prompt custom.
-            two_stage: Si True, pipeline 2-stage (half-res → upscale x2 → refine).
+        Retourne les frames decodees sur CPU pour post-processing async.
+        Memes parametres que generate() sauf output_path.
         """
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
@@ -696,10 +688,54 @@ class MedusaPipeline:
             generator,
         )
 
-        # 8. Encode MP4 (sans audio)
+        # 8. Materialiser frames sur CPU pour post-processing async
+        frames = [chunk.cpu() for chunk in decoded_video]
+        log.info("Frames generees: %d chunks", len(frames))
+        return frames
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        image_path: str,
+        camera_lora_path: str,
+        camera_key: str,
+        seed: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        output_path: str,
+        image_strength: float = 1.0,
+        last_image_path: str | None = None,
+        last_image_strength: float = 1.0,
+        prompt_override: str | None = None,
+        negative_override: str | None = None,
+        two_stage: bool = False,
+    ) -> None:
+        """Genere une video I2V et sauvegarde en MP4 (retro-compatible).
+
+        Delegue a generate_frames() puis encode le MP4.
+        """
+        frames = self.generate_frames(
+            image_path=image_path,
+            camera_lora_path=camera_lora_path,
+            camera_key=camera_key,
+            seed=seed,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            image_strength=image_strength,
+            last_image_path=last_image_path,
+            last_image_strength=last_image_strength,
+            prompt_override=prompt_override,
+            negative_override=negative_override,
+            two_stage=two_stage,
+        )
+
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         encode_video(
-            video=decoded_video,
+            video=iter(frames),
             fps=int(frame_rate),
             audio=None,
             audio_sample_rate=None,
@@ -707,6 +743,284 @@ class MedusaPipeline:
             video_chunks_number=1,
         )
         log.info("Video sauvegardee: %s", output_path)
+
+    @torch.inference_mode()
+    def generate_batch_frames(
+        self,
+        items: list[dict],
+        camera_lora_path: str,
+        camera_key: str,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        image_strength: float = 1.0,
+        two_stage: bool = False,
+    ) -> list[list[torch.Tensor]]:
+        """Genere les frames pour un batch d'items (meme camera, images/seeds differents).
+
+        Chaque item dict doit avoir:
+            image_path: str (fichier local)
+            seed: int
+        Optionnel:
+            last_image_path: str
+            last_image_strength: float (defaut 1.0)
+
+        Le denoising tourne en batch=N sur un seul forward transformer.
+        Le VAE decode est sequentiel par item (limitation vae_decode_video).
+
+        Returns:
+            Liste de listes de frames CPU, une par item.
+        """
+        batch_size = len(items)
+        log.info(
+            "Batch generate: %d items, %dx%d, %s",
+            batch_size, width, height, "2-stage" if two_stage else "1-stage",
+        )
+
+        # 1. Embeddings (partages pour tout le batch, meme camera)
+        if camera_key in self._embeddings_cache:
+            v_context_p, a_context_p = self._embeddings_cache[camera_key]
+        else:
+            raise ValueError(f"Camera '{camera_key}' non trouvee dans le cache embeddings")
+
+        # Expand context au batch size
+        if v_context_p.shape[0] == 1 and batch_size > 1:
+            v_ctx_batch = v_context_p.expand(batch_size, -1, -1)
+            a_ctx_batch = a_context_p.expand(batch_size, -1, -1)
+        else:
+            v_ctx_batch = v_context_p
+            a_ctx_batch = a_context_p
+
+        # 2. Transformer avec camera LoRA
+        self._log_vram("debut batch generate")
+        transformer = self.get_transformer(camera_lora_path)
+
+        # 3. Setup
+        stepper = EulerDiffusionStep()
+        generators = [
+            torch.Generator(device=self.device).manual_seed(item["seed"])
+            for item in items
+        ]
+
+        # --- Helper : creer N etats individuels puis concatener en batch ---
+        def create_batched_states(
+            h: int,
+            w: int,
+            initial_video_latents: torch.Tensor | None = None,
+            initial_audio_latents: torch.Tensor | None = None,
+            noise_scale: float = 1.0,
+        ) -> tuple[LatentState, LatentState, tuple]:
+            video_states: list[LatentState] = []
+            audio_states: list[LatentState] = []
+            tools_ref = None
+
+            for i, item in enumerate(items):
+                noiser_i = GaussianNoiser(generator=generators[i])
+
+                # Conditionings per item (batch=1)
+                images_i = [(item["image_path"], 0, image_strength)]
+                last_img = item.get("last_image_path")
+                if last_img:
+                    last_idx = (num_frames - 1) // 8
+                    last_str = item.get("last_image_strength", 1.0)
+                    images_i.append((last_img, last_idx, last_str))
+
+                conds_i = image_conditionings_by_replacing_latent(
+                    images=images_i,
+                    height=h,
+                    width=w,
+                    video_encoder=self._video_encoder,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+
+                shape_i = VideoPixelShape(
+                    batch=1, frames=num_frames, width=w, height=h, fps=frame_rate,
+                )
+
+                init_vid_i = initial_video_latents[i:i+1] if initial_video_latents is not None else None
+                init_aud_i = initial_audio_latents[i:i+1] if initial_audio_latents is not None else None
+
+                vs_i, vt_i = noise_video_state(
+                    output_shape=shape_i,
+                    noiser=noiser_i,
+                    conditionings=conds_i,
+                    components=self._components,
+                    dtype=self.dtype,
+                    device=self.device,
+                    noise_scale=noise_scale,
+                    initial_latent=init_vid_i,
+                )
+                as_i, at_i = noise_audio_state(
+                    output_shape=shape_i,
+                    noiser=noiser_i,
+                    conditionings=[],
+                    components=self._components,
+                    dtype=self.dtype,
+                    device=self.device,
+                    noise_scale=noise_scale,
+                    initial_latent=init_aud_i,
+                )
+
+                video_states.append(vs_i)
+                audio_states.append(as_i)
+                if tools_ref is None:
+                    tools_ref = (vt_i, at_i)
+
+            # Concatener le long de batch dim
+            batched_video = LatentState(
+                latent=torch.cat([s.latent for s in video_states], dim=0),
+                denoise_mask=torch.cat([s.denoise_mask for s in video_states], dim=0),
+                positions=torch.cat([s.positions for s in video_states], dim=0),
+                clean_latent=torch.cat([s.clean_latent for s in video_states], dim=0),
+            )
+            batched_audio = LatentState(
+                latent=torch.cat([s.latent for s in audio_states], dim=0),
+                denoise_mask=torch.cat([s.denoise_mask for s in audio_states], dim=0),
+                positions=torch.cat([s.positions for s in audio_states], dim=0),
+                clean_latent=torch.cat([s.clean_latent for s in audio_states], dim=0),
+            )
+            return batched_video, batched_audio, tools_ref
+
+        # --- Denoising loop avec context batche ---
+        def denoising_loop_guided(
+            sigmas: torch.Tensor,
+            video_state: LatentState,
+            audio_state: LatentState,
+            stepper_arg: DiffusionStepProtocol,
+        ) -> tuple[LatentState, LatentState]:
+
+            def denoise_step(
+                video_state: LatentState,
+                audio_state: LatentState,
+                sigmas: torch.Tensor,
+                step_index: int,
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                t0 = time.perf_counter()
+                sigma = sigmas[step_index]
+                vid_mod = modality_from_latent_state(
+                    video_state, v_ctx_batch, sigma, enabled=True,
+                )
+                aud_mod = modality_from_latent_state(
+                    audio_state, a_ctx_batch, sigma, enabled=False,
+                )
+                denoised_video, denoised_audio = transformer(
+                    video=vid_mod, audio=aud_mod, perturbations=None,
+                )
+                torch.cuda.synchronize()
+                dt = time.perf_counter() - t0
+                if step_index == 0:
+                    alloc = torch.cuda.memory_allocated() / 2**30
+                    rsvd = torch.cuda.memory_reserved() / 2**30
+                    log.info(
+                        "batch step %d: %.2fs (sigma=%.4f) VRAM %.2fGB alloc %.2fGB rsvd",
+                        step_index, dt, sigma.item(), alloc, rsvd,
+                    )
+                else:
+                    log.debug("batch step %d: %.2fs (sigma=%.4f)", step_index, dt, sigma.item())
+                if dt > 10.0:
+                    log.warning("batch step %d took %.1fs — possible Dynamo recompilation", step_index, dt)
+                return denoised_video, denoised_audio
+
+            return euler_denoising_loop(
+                sigmas=sigmas,
+                video_state=video_state,
+                audio_state=audio_state,
+                stepper=stepper_arg,
+                denoise_fn=denoise_step,
+            )
+
+        if two_stage:
+            # --- 2-stage batch pipeline ---
+            half_h, half_w = height // 2, width // 2
+
+            # Stage 1 — half-res batch denoise
+            log.info("Batch Stage 1: denoise %dx%d (half-res, 8 steps)...", half_w, half_h)
+            bv_s1, ba_s1, (vtools_s1, atools_s1) = create_batched_states(half_h, half_w)
+
+            bv_s1, ba_s1 = denoising_loop_guided(self._sigmas, bv_s1, ba_s1, stepper)
+            bv_s1 = vtools_s1.clear_conditioning(bv_s1)
+            bv_s1 = vtools_s1.unpatchify(bv_s1)
+            ba_s1 = atools_s1.clear_conditioning(ba_s1)
+            ba_s1 = atools_s1.unpatchify(ba_s1)
+            self._log_vram("apres batch stage 1")
+
+            # Upscale per item (sequentiel)
+            log.info("Batch upscale latent x2...")
+            upscaled_latents = []
+            for i in range(batch_size):
+                up_i = upsample_video(
+                    latent=bv_s1.latent[i:i+1],
+                    video_encoder=self._video_encoder,
+                    upsampler=self._spatial_upsampler,
+                )
+                upscaled_latents.append(up_i)
+            upscaled_batch = torch.cat(upscaled_latents, dim=0)
+            self._log_vram("apres batch upscale")
+
+            # Stage 2 — full-res batch refine
+            log.info("Batch Stage 2: refine %dx%d (full-res, 3 steps)...", width, height)
+
+            def denoising_loop_s2(
+                sigmas: torch.Tensor,
+                video_state: LatentState,
+                audio_state: LatentState,
+                stepper_arg: DiffusionStepProtocol,
+            ) -> tuple[LatentState, LatentState]:
+                def denoise_step_s2(
+                    video_state: LatentState,
+                    audio_state: LatentState,
+                    sigmas: torch.Tensor,
+                    step_index: int,
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+                    sigma = sigmas[step_index]
+                    vid_mod = modality_from_latent_state(video_state, v_ctx_batch, sigma)
+                    aud_mod = modality_from_latent_state(audio_state, a_ctx_batch, sigma)
+                    return transformer(video=vid_mod, audio=aud_mod, perturbations=None)
+
+                return euler_denoising_loop(
+                    sigmas=sigmas,
+                    video_state=video_state,
+                    audio_state=audio_state,
+                    stepper=stepper_arg,
+                    denoise_fn=denoise_step_s2,
+                )
+
+            bv_s2, ba_s2, (vtools_s2, atools_s2) = create_batched_states(
+                height, width,
+                initial_video_latents=upscaled_batch,
+                initial_audio_latents=ba_s1.latent,
+                noise_scale=self._stage2_sigmas[0].item(),
+            )
+
+            bv_s2, ba_s2 = denoising_loop_s2(self._stage2_sigmas, bv_s2, ba_s2, stepper)
+            bv_s2 = vtools_s2.clear_conditioning(bv_s2)
+            video_state = vtools_s2.unpatchify(bv_s2)
+            self._log_vram("apres batch stage 2")
+
+        else:
+            # --- 1-stage batch pipeline ---
+            log.info("Batch 1-stage: denoise %dx%d (8 steps)...", width, height)
+            batched_video, batched_audio, (vtools, atools) = create_batched_states(height, width)
+
+            batched_video, batched_audio = denoising_loop_guided(
+                self._sigmas, batched_video, batched_audio, stepper,
+            )
+            batched_video = vtools.clear_conditioning(batched_video)
+            video_state = vtools.unpatchify(batched_video)
+
+        # VAE decode sequentiel par item (vae_decode_video ne supporte que batch=1)
+        log.info("Batch VAE decode (%d items)...", batch_size)
+        all_frames: list[list[torch.Tensor]] = []
+        for i in range(batch_size):
+            latent_i = video_state.latent[i:i+1]
+            decoded = vae_decode_video(latent_i, self._video_decoder, None, generators[i])
+            frames = [chunk.cpu() for chunk in decoded]
+            all_frames.append(frames)
+
+        log.info("Batch frames generees: %d items", len(all_frames))
+        return all_frames
 
     def _encode_prompt(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode un prompt custom via le text encoder (cold path, rarement utilise)."""

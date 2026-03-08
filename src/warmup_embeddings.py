@@ -1,7 +1,7 @@
-"""Script standalone de warmup embeddings (low-RAM version).
+"""Script standalone de warmup embeddings (GPU-accelerated).
 
-Charge le text encoder Gemma 3 12B directement (sans ModelLedger)
-pour eviter le chargement du checkpoint complet de 27 GB en RAM.
+Charge le text encoder Gemma 3 12B et encode les prompts camera.
+Utilise le GPU si disponible pour accelerer l'encodage (~5-10s vs ~30-40s CPU).
 
 Peak RAM : ~35 GB (vs ~106 GB avec ModelLedger)
 Compatible RunPod serverless (57 GB RAM dispo).
@@ -42,11 +42,19 @@ def ram_mb() -> int:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
 
 
+def vram_gb() -> str:
+    """VRAM allouee en GB (ou 'N/A' si pas de GPU)."""
+    if torch.cuda.is_available():
+        alloc = torch.cuda.memory_allocated() / 2**30
+        return f"{alloc:.2f}GB"
+    return "N/A"
+
+
 def build_text_encoder(checkpoint_path: str, gemma_root: str) -> torch.nn.Module:
     """Construit le AVGemmaTextEncoderModel sans ModelLedger.
 
     Charge seulement les 59 cles text encoder (2.7 GB) du checkpoint,
-    puis Gemma depuis HuggingFace avec low_cpu_mem_usage=True.
+    puis Gemma depuis HuggingFace. Utilise le GPU si disponible.
     Peak RAM ~35 GB au lieu de ~106 GB.
     """
     from ltx_core.text_encoders.gemma.encoders.av_encoder import (
@@ -55,6 +63,9 @@ def build_text_encoder(checkpoint_path: str, gemma_root: str) -> torch.nn.Module
     )
     from ltx_core.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
     from transformers import Gemma3ForConditionalGeneration
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    log.info("Text encoder device: %s", device)
 
     # 1. Extraire seulement les 59 cles text encoder du checkpoint
     log.info("Extraction des cles text encoder du checkpoint...")
@@ -91,15 +102,32 @@ def build_text_encoder(checkpoint_path: str, gemma_root: str) -> torch.nn.Module
     te_model = AVGemmaTextEncoderModelConfigurator.from_config(config["transformer"])
     log.info("Modele shell cree. RAM: %d MB", ram_mb())
 
-    # 3. Charger Gemma depuis HuggingFace (low memory)
-    log.info("Chargement Gemma 3 12B (low_cpu_mem_usage)...")
-    gemma = Gemma3ForConditionalGeneration.from_pretrained(
-        gemma_root,
-        dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-    )
+    # 3. Charger Gemma depuis HuggingFace (GPU direct si disponible)
+    log.info("Chargement Gemma 3 12B (device=%s)...", device)
+    try:
+        gemma = Gemma3ForConditionalGeneration.from_pretrained(
+            gemma_root,
+            dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            device_map=device,
+        )
+        log.info(
+            "Gemma charge via device_map=%s. RAM: %d MB, VRAM: %s",
+            device, ram_mb(), vram_gb(),
+        )
+    except Exception as e:
+        log.warning("device_map=%s echoue (%s), fallback CPU + .to()", device, e)
+        gemma = Gemma3ForConditionalGeneration.from_pretrained(
+            gemma_root,
+            dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+        )
+        if device == "cuda":
+            gemma = gemma.to(device)
+        log.info("Gemma charge (fallback). RAM: %d MB, VRAM: %s", ram_mb(), vram_gb())
+
     te_model.model = gemma
-    log.info("Gemma charge. RAM: %d MB", ram_mb())
+    log.info("Gemma assigne. RAM: %d MB", ram_mb())
 
     # 4. Charger les connectors/projection
     missing, unexpected = te_model.load_state_dict(remapped, strict=False)
@@ -116,8 +144,15 @@ def build_text_encoder(checkpoint_path: str, gemma_root: str) -> torch.nn.Module
 
     # 6. RoPE setup
     te_model = create_and_populate(te_model)
-    log.info("Text encoder pret. RAM: %d MB", ram_mb())
 
+    # 7. Deplacer les connectors/projection vers device (Gemma deja sur device)
+    if device == "cuda":
+        for name, child in te_model.named_children():
+            if name != "model":
+                child.to(device)
+        log.info("Connectors deplaces vers %s. VRAM: %s", device, vram_gb())
+
+    log.info("Text encoder pret. RAM: %d MB, VRAM: %s", ram_mb(), vram_gb())
     return te_model
 
 
@@ -133,6 +168,9 @@ def main() -> int:
 
     log.info("Generation du cache embeddings: %s", cache_path)
 
+    if torch.cuda.is_available():
+        log.info("VRAM avant warmup: %s", vram_gb())
+
     checkpoint_path = os.path.join(
         models_dir, "checkpoints", "ltx-2-19b-dev.safetensors"
     )
@@ -145,7 +183,7 @@ def main() -> int:
         log.error("Gemma introuvable: %s", gemma_root)
         return 1
 
-    # Construire le text encoder (low RAM)
+    # Construire le text encoder (GPU si disponible)
     te_model = build_text_encoder(checkpoint_path, gemma_root)
 
     # Encoder tous les prompts : 7 cameras + 1 negative
@@ -156,7 +194,7 @@ def main() -> int:
     log.info("Encoding %d prompts...", len(all_prompts))
 
     results = encode_text(te_model, prompts=all_prompts)
-    log.info("Encoding termine. RAM: %d MB", ram_mb())
+    log.info("Encoding termine. RAM: %d MB, VRAM: %s", ram_mb(), vram_gb())
 
     # Construire et sauvegarder le cache
     cache_data: dict[str, dict[str, torch.Tensor]] = {}
@@ -167,9 +205,12 @@ def main() -> int:
     torch.save(cache_data, cache_path)
     log.info("Cache sauvegarde: %s (%d prompts)", cache_path, len(cache_data))
 
-    # Cleanup
-    del te_model, results
+    # Cleanup complet (CPU + GPU)
+    del te_model, results, cache_data
     gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        log.info("VRAM apres cleanup: %s", vram_gb())
 
     log.info("Warmup termine. RAM pic: %d MB", ram_mb())
     return 0

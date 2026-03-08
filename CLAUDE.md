@@ -26,7 +26,7 @@ Objectif : generation rapide de videos dolly a partir d'images, qualite correcte
 
 - **Runtime** : ltx-pipelines (Python direct) sur RunPod Serverless (H100 80GB, HBM3)
 - **Modele principal** : LTX-2 19B AV model (BF16, ~35GB VRAM base + camera LoRA fuse dynamique)
-- **Text encoder** : Gemma 3 12B IT (BF16, CPU — ~24GB RAM, format HuggingFace)
+- **Text encoder** : Gemma 3 12B IT (BF16, GPU si dispo sinon CPU, format HuggingFace)
 - **Approche** : Pipeline 1-stage (720p) ou 2-stage (540p → upscale x2 → refine 1080p), Euler distilled, audio skip
 - **Output** : H264 MP4, 24fps, ~1 seconde (25 frames), 720p ou 1080p
 - **S3** : Upload OVH S3 optionnel (boto3, active via `S3_BUCKET` env var)
@@ -46,6 +46,7 @@ Objectif : generation rapide de videos dolly a partir d'images, qualite correcte
 
 ## API Input
 
+### Single image (retro-compatible)
 ```json
 {
   "input": {
@@ -62,9 +63,23 @@ Objectif : generation rapide de videos dolly a partir d'images, qualite correcte
 }
 ```
 
+### Batch (multi-images)
+```json
+{
+  "input": {
+    "images": ["https://example.com/photo1.jpg", "https://example.com/photo2.jpg"],
+    "camera": "dolly-in",
+    "seed": 12345,
+    "resolution": "720p"
+  }
+}
+```
+
 `last_image` et `last_image_strength` sont optionnels. Si `last_image` est fourni, la video est guidee vers cette image cible en derniere frame.
 
 `resolution` : `"720p"` (defaut) ou `"1080p"`. 720p = pipeline 1-stage (~0.92M px). 1080p = pipeline 2-stage (540p → upscale x2 → refine, ~2M px).
+
+`images` (pluriel) : liste d'URLs/base64 pour generation batch. Chaque image recoit un seed unique (`seed + index`). Le denoising tourne en batch=N sur un seul forward transformer. Retro-compatible avec `image` (singulier).
 
 Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib-up, static.
 
@@ -100,10 +115,13 @@ Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib
   - Meme transformer pour les 2 stages (pas de rebuild), camera LoRA reste fuse
 - **Eager init** : pipeline init complet AVANT `runpod.serverless.start()` — premier job sans cold start
 - **Download parallele** : `image` et `last_image` telecharges en parallele via ThreadPoolExecutor
-- **torch.compile** : `torch.compile(mode="reduce-overhead")` sur le transformer base (desactivable via `TORCH_COMPILE=0`). 2 shapes (540p + 1080p) → 2 CUDA graph captures au premier job, cachees ensuite.
+- **torch.compile** : `torch.compile(mode="reduce-overhead")` sur le transformer base ET le video decoder (desactivable via `TORCH_COMPILE=0` et `VAE_COMPILE=0`). 2 shapes (540p + 1080p) → 2 CUDA graph captures au premier job, cachees ensuite.
+- **Batching** : `generate_batch_frames()` traite N images en un seul forward transformer (batch=N). Per-item noise (seeds differents), image encoding individuel, VAE decode sequentiel. Configurable via `BATCH_SIZE` (defaut 2).
+- **Async post-processing** : MP4 encode + S3 upload en parallele du GPU via ThreadPoolExecutor(3). `generate_frames()` retourne frames CPU, post-processing dans thread pool.
+- **Pipeline overlapping** : prefetch des images du batch suivant pendant le denoising GPU. Double buffer via prefetch_pool.
 - **SageAttention2++** : patch runtime `attention_function` sur les modules `Attention` du transformer uniquement (pas VAE, pas encoder, pas upsampler). Kernel INT8-QK/FP8-PV auto-selectionne sur H100 sm_90. Fallback `PytorchAttention` (SDPA) si mask present. Desactivable via `SAGE_ATTENTION=0`.
 - **Ordre d'init** : warmup embeddings (process isole) → base transformer (distilled + I2V) → patch SageAttention → torch.compile → fuse camera dolly-in → video encoder → video decoder → spatial upsampler
-- **warmup_embeddings.py** : charge uniquement les 59 cles TE via safe_open (2.7GB) + Gemma `low_cpu_mem_usage=True`. Peak ~35GB.
+- **warmup_embeddings.py** : charge les 59 cles TE via safe_open (2.7GB) + Gemma sur GPU (device_map) si dispo. Encoding ~5-10s GPU vs ~30-40s CPU. Cleanup VRAM complet apres. Peak ~35GB RAM.
 - **Audio skip** : `skip_step=99` sur audio guider → audio compute seulement au step 0/8
 - **CFG desactive** : `cfg_scale=1.0, stg_scale=0.0` → 1 seul forward par step
 - **Sigmas distilled** : stage 1 = 8 steps (DISTILLED_SIGMA_VALUES), stage 2 = 3 steps (STAGE_2_DISTILLED_SIGMA_VALUES)
@@ -121,26 +139,41 @@ Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib
 
 ## Flow d'Init Pipeline (eager, 1 seule fois)
 
-1. `warmup_embeddings()` — cache .pt ou Gemma 3 12B CPU (~35GB RAM peak) → encode 7 prompts camera + 1 negative → liberer
+1. `warmup_embeddings()` — cache .pt ou Gemma 3 12B GPU (device_map, ~24GB VRAM) → encode 7 prompts camera + 1 negative → cleanup VRAM complet
 2. `get_transformer(dolly-in)` — cache pre-fusionne ou ModelLedger(checkpoint + distilled + I2V) → patch SageAttention2++ → torch.compile(reduce-overhead) → fuse camera delta
 3. `load_video_encoder()` → VRAM (~1GB, persistent)
-4. `load_video_decoder()` → VRAM (~2GB, persistent)
+4. `load_video_decoder()` → VRAM (~2GB, persistent) + torch.compile(reduce-overhead)
 5. `load_spatial_upsampler()` → VRAM (~1GB, persistent)
 
 ## Flow d'Inference (par job)
 
+### Single image
 1. Hash input SHA256 → check dedup cache → return si hit
 2. Parse input + download images en parallele (ThreadPoolExecutor)
 3. Calcul resolution cible (aspect ratio preserve) : 720p align 32px (1-stage), 1080p align 64px (2-stage)
-4. `pipeline.generate()` :
+4. `pipeline.generate_frames()` :
    - Embeddings depuis cache (ou encode CPU si override)
    - Camera LoRA switch si differente (~0.1s, delta = lora_B @ lora_A * alpha/rank * strength)
    - Setup : GaussianNoiser + EulerDiffusionStep, CFG=1.0, STG=0.0, audio skip_step=99
    - Image → latent via video_encoder
    - **720p** : denoise 8 steps (DISTILLED_SIGMA_VALUES) avec guiders
    - **1080p** : Stage 1 denoise ~540p 8 steps → upsample_video() x2 latent → Stage 2 refine ~1080p 3 steps (simple_denoising)
-   - VAE decode (sans tiling) → encode_video() → H264 MP4
-5. Sauvegarde volume + upload S3 + dedup cache
+   - VAE decode (sans tiling) → frames CPU
+5. Post-processing async (thread pool) : encode_video() → H264 MP4 + sauvegarde volume + upload S3 + dedup cache
+
+### Batch multi-images
+1. Hash input SHA256 → check dedup cache → return si hit
+2. Split `images[]` en sub-batches de `BATCH_SIZE`
+3. Pour chaque sub-batch :
+   - Recuperer images prefetchees (ou resolve si premier batch)
+   - Lancer prefetch du batch suivant AVANT denoising
+   - `pipeline.generate_batch_frames()` : N items en un forward transformer
+     - Per-item : image encoding, GaussianNoiser(seed_i), LatentState batch=1
+     - Concatenation LatentState le long de batch dim → batch=N
+     - Denoising loop : un seul forward transformer pour N items
+     - VAE decode sequentiel par item (limitation vae_decode_video)
+   - Post-processing async pour chaque item (MP4 encode + S3 upload)
+4. Attendre tous les post-processing → return
 
 ## Conventions
 
@@ -165,4 +198,6 @@ Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib
 - `SAGE_ATTENTION=1` (defaut) : active SageAttention2++ sur le transformer. `0` pour rollback complet vers SDPA
 - `SAGE_COMPILE_DISABLE=0` (defaut) : `1` wrappe sageattn dans `torch.compiler.disable` si CUDA graphs posent probleme
 - `TORCH_COMPILE=0` pour desactiver torch.compile (debug ou compatibilite)
+- `VAE_COMPILE=1` (defaut) : torch.compile(reduce-overhead) sur le video decoder. `0` pour desactiver
 - `TRANSFORMER_CACHE=0` pour desactiver le cache transformer pre-fusionne (force rebuild a chaque cold start)
+- `BATCH_SIZE=2` (defaut) : taille max du sous-batch pour le denoising transformer en batch mode

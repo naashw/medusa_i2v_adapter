@@ -29,6 +29,8 @@ import runpod
 from botocore.config import Config
 from PIL import Image
 
+from ltx_pipelines.utils.media_io import encode_video
+
 from pipeline import MedusaPipeline
 
 logging.basicConfig(level=logging.INFO, format="[handler] %(message)s")
@@ -41,6 +43,7 @@ OUTPUT_VOLUME_DIR = os.environ.get("OUTPUT_VOLUME_DIR", "/runpod-volume/output")
 CACHE_DIR = os.environ.get("CACHE_DIR", "/runpod-volume/cache")
 VOLUME_ROOT = os.environ.get("VOLUME_ROOT", "/runpod-volume")
 MODELS_DIR = os.environ.get("MODELS_DIR", "/runpod-volume/models")
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "2"))
 
 # Mapping camera → (fichier LoRA, prompt par defaut)
 CAMERAS: dict[str, tuple[str, str]] = {
@@ -268,13 +271,69 @@ def collect_output(source_file: str, job_id: str) -> dict:
     return result
 
 
+# --- Post-processing pool (MP4 encode + S3 upload en parallele du GPU) ---
+
+postprocess_pool = ThreadPoolExecutor(max_workers=3)
+
+
+def postprocess_and_upload(
+    frames: list,
+    frame_rate: int,
+    output_dir: str,
+    output_filename: str,
+    job_id: str,
+    input_hash: str,
+) -> dict:
+    """Encode MP4 + copie volume + S3 upload + cache dedup (thread pool worker)."""
+    output_path = os.path.join(output_dir, output_filename)
+    os.makedirs(output_dir, exist_ok=True)
+
+    encode_video(
+        video=iter(frames),
+        fps=frame_rate,
+        audio=None,
+        audio_sample_rate=None,
+        output_path=output_path,
+        video_chunks_number=1,
+    )
+    log.info("MP4 encode: %s", output_filename)
+
+    output_meta = collect_output(output_path, job_id)
+    save_to_cache(input_hash, output_path)
+    log.info("Cache sauvegarde (%s)", input_hash)
+
+    # Cleanup temp dir
+    shutil.rmtree(output_dir, ignore_errors=True)
+    return output_meta
+
+
+# --- Prefetch pool (download images pendant que le GPU travaille) ---
+
+prefetch_pool = ThreadPoolExecutor(max_workers=max(BATCH_SIZE, 2))
+
+
+def resolve_and_preprocess(
+    image_data: str,
+    resolution: str = "720p",
+) -> tuple[str, int, int]:
+    """Download + resolve image + compute target resolution (thread prefetch)."""
+    tmp_path = resolve_image(image_data)
+    height, width = compute_target_resolution(tmp_path, resolution=resolution)
+    return tmp_path, height, width
+
+
 # --- Handler ---
 
 pipeline: MedusaPipeline | None = None
 
 
 def handler(job: dict) -> dict:
-    """Handler RunPod pour generation I2V."""
+    """Handler RunPod pour generation I2V.
+
+    Supporte:
+      - image (singulier) : generation single item (retro-compatible)
+      - images (liste) : generation batch avec overlapping
+    """
     global pipeline
 
     job_id = job.get("id", f"unknown-{int(time.time())}")
@@ -287,16 +346,22 @@ def handler(job: dict) -> dict:
         log.info("Cache hit (%s) - %d fichier(s), skip execution", input_hash, len(cached))
         return {"images": cached, "cached": True}
 
-    # --- Parse input ---
-    image_data = job_input.get("image")
-    if not image_data:
-        return {"error": "Le champ 'image' est requis (URL https ou base64)"}
+    # --- Parse input : support image (singulier) et images (pluriel) ---
+    image_data_list = job_input.get("images")
+    single_image = job_input.get("image")
+    if image_data_list:
+        is_batch = len(image_data_list) > 1
+    elif single_image:
+        image_data_list = [single_image]
+        is_batch = False
+    else:
+        return {"error": "Le champ 'image' ou 'images' est requis (URL https ou base64)"}
 
     camera = job_input.get("camera", "dolly-in")
     if camera not in CAMERAS:
         return {"error": f"Camera inconnue: {camera}. Choix: {list(CAMERAS.keys())}"}
 
-    seed = job_input.get("seed", random.randint(0, 2**32 - 1))
+    base_seed = job_input.get("seed", random.randint(0, 2**32 - 1))
     num_frames = job_input.get("num_frames", 25)
     frame_rate = job_input.get("frame_rate", 24)
     image_strength = job_input.get("image_strength", 1.0)
@@ -314,71 +379,187 @@ def handler(job: dict) -> dict:
         raise RuntimeError("Pipeline non initialise — le worker doit etre lance via __main__")
 
     disk_before = get_disk_usage_mb()
-    log.info("Job %s - Disque avant: %.0f MB", job_id, disk_before)
+    total_images = len(image_data_list)
+    log.info("Job %s - %d image(s), disque avant: %.0f MB", job_id, total_images, disk_before)
 
-    # --- Resolve image(s) en parallele ---
-    tmp_image = None
-    tmp_last_image = None
+    lora_filename, _default_prompt = CAMERAS[camera]
+    camera_lora_path = os.path.join(MODELS_DIR, "loras", lora_filename)
+    two_stage = resolution == "1080p"
+
+    # Seeds uniques par item
+    seeds = [base_seed + i for i in range(total_images)]
+
+    tmp_images: list[str] = []
+    tmp_last_image: str | None = None
+    all_futures: list = []
+
     try:
+        # Resolve last_image une seule fois (partage par tous les items)
         if last_image_data:
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                fut_image = pool.submit(resolve_image, image_data)
-                fut_last = pool.submit(resolve_image, last_image_data)
-                tmp_image = fut_image.result()
-                tmp_last_image = fut_last.result()
+            tmp_last_image = resolve_image(last_image_data)
+
+        if not is_batch:
+            # ===== SINGLE IMAGE (retro-compatible, identique a l'ancien handler) =====
+            if last_image_data and tmp_last_image:
+                tmp_img = resolve_image(image_data_list[0])
+            else:
+                tmp_img = resolve_image(image_data_list[0])
+            tmp_images.append(tmp_img)
+
+            height, width = compute_target_resolution(tmp_img, resolution=resolution)
+            log.info(
+                "Resolution cible: %dx%d (%s, %s)",
+                width, height, resolution, "2-stage" if two_stage else "1-stage",
+            )
+
+            start_time = time.time()
+            frames = pipeline.generate_frames(
+                image_path=tmp_img,
+                camera_lora_path=camera_lora_path,
+                camera_key=camera,
+                seed=base_seed,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                frame_rate=frame_rate,
+                image_strength=image_strength,
+                last_image_path=tmp_last_image,
+                last_image_strength=last_image_strength,
+                prompt_override=prompt_override,
+                negative_override=negative_override,
+                two_stage=two_stage,
+            )
+            elapsed = time.time() - start_time
+            log.info("Generation frames terminee: %.1fs", elapsed)
+
+            output_dir = tempfile.mkdtemp(prefix="medusa_")
+            output_filename = f"medusa_i2v_{job_id}.mp4"
+            future = postprocess_pool.submit(
+                postprocess_and_upload,
+                frames, int(frame_rate),
+                output_dir, output_filename,
+                job_id, input_hash,
+            )
+            output_meta = future.result()
+
+            disk_after = get_disk_usage_mb()
+            log.info("Disque apres: %.0f MB (libere: %.0f MB)", disk_after, disk_before - disk_after)
+            return {"images": [output_meta]}
+
         else:
-            tmp_image = resolve_image(image_data)
+            # ===== BATCH MODE (overlapping + prefetch) =====
+            log.info("Batch mode: %d images, BATCH_SIZE=%d", total_images, BATCH_SIZE)
 
-        # --- Resolution dynamique ---
-        height, width = compute_target_resolution(tmp_image, resolution=resolution)
-        two_stage = resolution == "1080p"
-        log.info("Resolution cible: %dx%d (%s, %s)", width, height, resolution, "2-stage" if two_stage else "1-stage")
+            # Split en sub-batches
+            sub_batches = [
+                image_data_list[i:i + BATCH_SIZE]
+                for i in range(0, total_images, BATCH_SIZE)
+            ]
+            sub_seeds = [
+                seeds[i:i + BATCH_SIZE]
+                for i in range(0, total_images, BATCH_SIZE)
+            ]
 
-        # --- Camera LoRA ---
-        lora_filename, _default_prompt = CAMERAS[camera]
-        camera_lora_path = os.path.join(MODELS_DIR, "loras", lora_filename)
+            next_batch_futures = None
+            height: int | None = None
+            width: int | None = None
 
-        # --- Generate ---
-        output_dir = tempfile.mkdtemp(prefix="medusa_")
-        output_filename = f"medusa_i2v_{job_id}.mp4"
-        output_path = os.path.join(output_dir, output_filename)
+            for batch_idx, (batch_urls, batch_seeds) in enumerate(zip(sub_batches, sub_seeds)):
+                batch_size = len(batch_urls)
 
-        start_time = time.time()
-        pipeline.generate(
-            image_path=tmp_image,
-            camera_lora_path=camera_lora_path,
-            camera_key=camera,
-            seed=seed,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            frame_rate=frame_rate,
-            output_path=output_path,
-            image_strength=image_strength,
-            last_image_path=tmp_last_image,
-            last_image_strength=last_image_strength,
-            prompt_override=prompt_override,
-            negative_override=negative_override,
-            two_stage=two_stage,
-        )
-        elapsed = time.time() - start_time
-        log.info("Generation terminee: %.1fs", elapsed)
+                # --- Recuperer images (prefetchees ou resolve maintenant) ---
+                if next_batch_futures is not None:
+                    current_images = [f.result() for f in next_batch_futures]
+                else:
+                    # Premier batch — resolve en parallele
+                    with ThreadPoolExecutor(max_workers=batch_size) as pool:
+                        current_images = list(pool.map(resolve_image, batch_urls))
+                tmp_images.extend(current_images)
 
-        # --- Collect output ---
-        output_meta = collect_output(output_path, job_id)
+                # Resolution depuis la premiere image du premier batch
+                if height is None:
+                    height, width = compute_target_resolution(current_images[0], resolution=resolution)
+                    log.info(
+                        "Resolution cible: %dx%d (%s, %s)",
+                        width, height, resolution, "2-stage" if two_stage else "1-stage",
+                    )
 
-        # --- Save to dedup cache ---
-        save_to_cache(input_hash, output_path)
-        log.info("Cache sauvegarde (%s)", input_hash)
+                # --- Prefetch du batch suivant AVANT le denoising GPU ---
+                if batch_idx + 1 < len(sub_batches):
+                    next_batch_futures = [
+                        prefetch_pool.submit(resolve_image, url)
+                        for url in sub_batches[batch_idx + 1]
+                    ]
+                else:
+                    next_batch_futures = None
 
-        # --- Cleanup ---
-        shutil.rmtree(output_dir, ignore_errors=True)
+                # --- Generation batch (GPU) ---
+                start_time = time.time()
 
-        disk_after = get_disk_usage_mb()
-        freed = disk_before - disk_after
-        log.info("Disque apres: %.0f MB (libere: %.0f MB)", disk_after, freed)
+                if batch_size > 1:
+                    items = []
+                    for img_path, seed_i in zip(current_images, batch_seeds):
+                        item: dict = {"image_path": img_path, "seed": seed_i}
+                        if tmp_last_image:
+                            item["last_image_path"] = tmp_last_image
+                            item["last_image_strength"] = last_image_strength
+                        items.append(item)
 
-        return {"images": [output_meta]}
+                    batch_frames = pipeline.generate_batch_frames(
+                        items=items,
+                        camera_lora_path=camera_lora_path,
+                        camera_key=camera,
+                        height=height,
+                        width=width,
+                        num_frames=num_frames,
+                        frame_rate=frame_rate,
+                        image_strength=image_strength,
+                        two_stage=two_stage,
+                    )
+                else:
+                    # Sub-batch de 1 — utiliser generate_frames (single item)
+                    frames = pipeline.generate_frames(
+                        image_path=current_images[0],
+                        camera_lora_path=camera_lora_path,
+                        camera_key=camera,
+                        seed=batch_seeds[0],
+                        height=height,
+                        width=width,
+                        num_frames=num_frames,
+                        frame_rate=frame_rate,
+                        image_strength=image_strength,
+                        last_image_path=tmp_last_image,
+                        last_image_strength=last_image_strength,
+                        two_stage=two_stage,
+                    )
+                    batch_frames = [frames]
+
+                elapsed = time.time() - start_time
+                log.info(
+                    "Sub-batch %d/%d: %.1fs (%d items)",
+                    batch_idx + 1, len(sub_batches), elapsed, batch_size,
+                )
+
+                # --- Post-processing async (Opt 4) ---
+                for item_idx, item_frames in enumerate(batch_frames):
+                    global_idx = batch_idx * BATCH_SIZE + item_idx
+                    output_dir = tempfile.mkdtemp(prefix="medusa_")
+                    output_filename = f"medusa_i2v_{job_id}_{global_idx}.mp4"
+
+                    fut = postprocess_pool.submit(
+                        postprocess_and_upload,
+                        item_frames, int(frame_rate),
+                        output_dir, output_filename,
+                        job_id, input_hash,
+                    )
+                    all_futures.append(fut)
+
+            # --- Attendre tous les post-processing avant return ---
+            results = [f.result() for f in all_futures]
+
+            disk_after = get_disk_usage_mb()
+            log.info("Disque apres: %.0f MB (libere: %.0f MB)", disk_after, disk_before - disk_after)
+            return {"images": results}
 
     except Exception as e:
         log.error("Erreur generation: %s", e, exc_info=True)
@@ -386,8 +567,9 @@ def handler(job: dict) -> dict:
 
     finally:
         # Cleanup images temporaires
-        if tmp_image and os.path.isfile(tmp_image):
-            os.unlink(tmp_image)
+        for tmp_img in tmp_images:
+            if os.path.isfile(tmp_img):
+                os.unlink(tmp_img)
         if tmp_last_image and os.path.isfile(tmp_last_image):
             os.unlink(tmp_last_image)
 

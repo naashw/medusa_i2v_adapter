@@ -195,7 +195,7 @@ if [ "${SERVERLESS:-}" = "true" ] || [ -n "${RUNPOD_ENDPOINT_ID:-}" ]; then
 
     # Warmup embeddings dans un process isole (l'OS recupere 100% RAM a la fin)
     echo "[medusa] Warmup embeddings (process isole)..."
-    CUDA_VISIBLE_DEVICES="" LD_PRELOAD="" python /app/warmup_embeddings.py
+    LD_PRELOAD="" python /app/warmup_embeddings.py
     echo "[medusa] Warmup termine, lancement handler..."
 
     exec env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python /app/handler.py
