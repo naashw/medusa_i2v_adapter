@@ -62,23 +62,13 @@ echo "[medusa] ==========================="
 migrate_volume() {
     echo "[medusa] === Migration volume LTX-2 → LTX-2.3 ==="
 
-    # Verifier espace disque
-    local volume_bytes
-    volume_bytes=$(du -sb "$WORKSPACE" 2>/dev/null | awk '{print $1}')
-    local volume_gb=$(( volume_bytes / 1073741824 ))
-    if [[ "$volume_gb" -gt 115 ]]; then
-        echo "[medusa] ERREUR: Volume trop plein (${volume_gb}GB > 115GB). Migration impossible."
-        exit 1
-    fi
-    echo "[medusa] Volume actuel: ${volume_gb}GB"
-
     # Supprimer anciens caches (invalides avec nouveau modele)
     local cache_dirs=("cache/transformer" "cache/embeddings" "cache/dedup" "output")
     for d in "${cache_dirs[@]}"; do
         local target="${WORKSPACE}/${d}"
         if [[ -d "$target" ]]; then
             echo "[medusa] Suppression cache: $target"
-            trash-put "$target"
+            rm -rf "$target"
         fi
     done
 
@@ -93,7 +83,7 @@ migrate_volume() {
         local target="${WORKSPACE}/${f}"
         if [[ -f "$target" ]]; then
             echo "[medusa] Suppression ancien: $target"
-            trash-put "$target"
+            rm -f "$target"
         fi
     done
 
@@ -111,15 +101,27 @@ migrate_volume() {
         local target="${MODELS_DIR}/loras/${f}"
         if [[ -f "$target" ]]; then
             echo "[medusa] Suppression camera LoRA: $target"
-            trash-put "$target"
+            rm -f "$target"
         fi
     done
 
     # Supprimer cache HuggingFace residuel
     if [[ -d "${WORKSPACE}/.cache/huggingface" ]]; then
         echo "[medusa] Suppression cache HuggingFace residuel"
-        trash-put "${WORKSPACE}/.cache/huggingface"
+        rm -rf "${WORKSPACE}/.cache/huggingface"
     fi
+
+    # Supprimer corbeille trash-put residuelle
+    if [[ -d "${WORKSPACE}/.Trash" ]]; then
+        echo "[medusa] Suppression corbeille residuelle"
+        rm -rf "${WORKSPACE}/.Trash"
+    fi
+
+    # Log espace disque apres nettoyage
+    local volume_bytes
+    volume_bytes=$(du -sb "$WORKSPACE" 2>/dev/null | awk '{print $1}')
+    local volume_gb=$(( volume_bytes / 1073741824 ))
+    echo "[medusa] Volume apres nettoyage: ${volume_gb}GB"
 
     echo "[medusa] === Migration terminee ==="
 }
