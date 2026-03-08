@@ -24,7 +24,7 @@ trap 'cleanup SIGINT' SIGINT
 trap 'cleanup SIGQUIT' SIGQUIT
 
 echo "============================================"
-echo "  Medusa I2V - ltx-pipelines + LTX-2 19B"
+echo "  Medusa I2V - ltx-pipelines + LTX-2.3 22B FP8"
 echo "============================================"
 
 # -----------------------------------------------
@@ -56,6 +56,76 @@ echo "[medusa] === Espace disque volume ==="
 du -sh "$WORKSPACE"/* 2>/dev/null | sort -rh | head -20 || echo "[medusa] Volume vide ou inaccessible"
 echo "[medusa] ==========================="
 
+# -----------------------------------------------
+# 2b. Migration volume LTX-2 → LTX-2.3 (idempotent)
+# -----------------------------------------------
+migrate_volume() {
+    echo "[medusa] === Migration volume LTX-2 → LTX-2.3 ==="
+
+    # Verifier espace disque
+    local volume_bytes
+    volume_bytes=$(du -sb "$WORKSPACE" 2>/dev/null | awk '{print $1}')
+    local volume_gb=$(( volume_bytes / 1073741824 ))
+    if [[ "$volume_gb" -gt 115 ]]; then
+        echo "[medusa] ERREUR: Volume trop plein (${volume_gb}GB > 115GB). Migration impossible."
+        exit 1
+    fi
+    echo "[medusa] Volume actuel: ${volume_gb}GB"
+
+    # Supprimer anciens caches (invalides avec nouveau modele)
+    local cache_dirs=("cache/transformer" "cache/embeddings" "cache/dedup" "output")
+    for d in "${cache_dirs[@]}"; do
+        local target="${WORKSPACE}/${d}"
+        if [[ -d "$target" ]]; then
+            echo "[medusa] Suppression cache: $target"
+            trash-put "$target"
+        fi
+    done
+
+    # Supprimer anciens fichiers LTX-2
+    local old_files=(
+        "models/checkpoints/ltx-2-19b-dev.safetensors"
+        "models/loras/ltx-2-19b-distilled-lora-384.safetensors"
+        "models/loras/LTX-2-Image2Vid-Adapter.safetensors"
+        "models/upscalers/ltx-2-spatial-upscaler-x2-1.0.safetensors"
+    )
+    for f in "${old_files[@]}"; do
+        local target="${WORKSPACE}/${f}"
+        if [[ -f "$target" ]]; then
+            echo "[medusa] Suppression ancien: $target"
+            trash-put "$target"
+        fi
+    done
+
+    # Supprimer les 7 camera LoRAs
+    local camera_loras=(
+        "ltx-2-19b-lora-camera-control-dolly-in.safetensors"
+        "ltx-2-19b-lora-camera-control-dolly-out.safetensors"
+        "ltx-2-19b-lora-camera-control-dolly-left.safetensors"
+        "ltx-2-19b-lora-camera-control-dolly-right.safetensors"
+        "ltx-2-19b-lora-camera-control-jib-down.safetensors"
+        "ltx-2-19b-lora-camera-control-jib-up.safetensors"
+        "ltx-2-19b-lora-camera-control-static.safetensors"
+    )
+    for f in "${camera_loras[@]}"; do
+        local target="${MODELS_DIR}/loras/${f}"
+        if [[ -f "$target" ]]; then
+            echo "[medusa] Suppression camera LoRA: $target"
+            trash-put "$target"
+        fi
+    done
+
+    # Supprimer cache HuggingFace residuel
+    if [[ -d "${WORKSPACE}/.cache/huggingface" ]]; then
+        echo "[medusa] Suppression cache HuggingFace residuel"
+        trash-put "${WORKSPACE}/.cache/huggingface"
+    fi
+
+    echo "[medusa] === Migration terminee ==="
+}
+
+migrate_volume
+
 mkdir -p "${MODELS_DIR}/checkpoints"
 mkdir -p "${MODELS_DIR}/text_encoders"
 mkdir -p "${MODELS_DIR}/loras"
@@ -82,7 +152,7 @@ download_model() {
                 local file_size
                 file_size=$(stat -c%s "$filepath" 2>/dev/null || echo "?")
                 echo "[medusa] CORROMPU: $filename (${file_size} bytes) — suppression et re-telechargement"
-                rm -f "$filepath"
+                trash-put "$filepath"
             else
                 echo "[medusa] Deja present (valide): $filename"
                 return 0
@@ -124,34 +194,17 @@ hf_hub_download(
 # -----------------------------------------------
 echo "[medusa] Demarrage des telechargements (sequentiel, hf_xet)..."
 
-# --- Checkpoint (~38GB) ---
-download_model "Lightricks/LTX-2" "ltx-2-19b-dev.safetensors" "${MODELS_DIR}/checkpoints"
+# --- Checkpoint FP8 (~29GB) — le plus gros, echouer tot ---
+download_model "Lightricks/LTX-2.3-fp8" "ltx-2.3-22b-dev-fp8.safetensors" "${MODELS_DIR}/checkpoints"
 
-# --- Distilled LoRA ---
-download_model "Lightricks/LTX-2" "ltx-2-19b-distilled-lora-384.safetensors" "${MODELS_DIR}/loras"
-
-# --- I2V Adapter ---
-download_model "MachineDelusions/LTX-2_Image2Video_Adapter_LoRa" "LTX-2-Image2Vid-Adapter.safetensors" "${MODELS_DIR}/loras"
-
-# --- Camera LoRAs ---
-CAMERA_LORAS=(
-    "Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-In|ltx-2-19b-lora-camera-control-dolly-in.safetensors"
-    "Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-Out|ltx-2-19b-lora-camera-control-dolly-out.safetensors"
-    "Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-Left|ltx-2-19b-lora-camera-control-dolly-left.safetensors"
-    "Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-Right|ltx-2-19b-lora-camera-control-dolly-right.safetensors"
-    "Lightricks/LTX-2-19b-LoRA-Camera-Control-Jib-Down|ltx-2-19b-lora-camera-control-jib-down.safetensors"
-    "Lightricks/LTX-2-19b-LoRA-Camera-Control-Jib-Up|ltx-2-19b-lora-camera-control-jib-up.safetensors"
-    "Lightricks/LTX-2-19b-LoRA-Camera-Control-Static|ltx-2-19b-lora-camera-control-static.safetensors"
-)
-
-for entry in "${CAMERA_LORAS[@]}"; do
-    repo_id="${entry%%|*}"
-    filename="${entry##*|}"
-    download_model "$repo_id" "$filename" "${MODELS_DIR}/loras"
-done
+# --- Distilled LoRA (~7.6GB) ---
+download_model "Lightricks/LTX-2.3" "ltx-2.3-22b-distilled-lora-384.safetensors" "${MODELS_DIR}/loras"
 
 # --- Spatial upscaler x2 (~1GB) ---
-download_model "Lightricks/LTX-2" "ltx-2-spatial-upscaler-x2-1.0.safetensors" "${MODELS_DIR}/upscalers"
+download_model "Lightricks/LTX-2.3" "ltx-2.3-spatial-upscaler-x2-1.0.safetensors" "${MODELS_DIR}/upscalers"
+
+# --- Temporal upscaler x2 (~262MB) ---
+download_model "Lightricks/LTX-2.3" "ltx-2.3-temporal-upscaler-x2-1.0.safetensors" "${MODELS_DIR}/upscalers"
 
 # --- Gemma 3 12B (format HuggingFace, ~24GB BF16) ---
 GEMMA_DIR="${MODELS_DIR}/text_encoders/gemma-3-12b-it"

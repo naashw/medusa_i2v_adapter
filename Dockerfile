@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Medusa I2V - ltx-pipelines + LTX-2 19B
+# Medusa I2V - ltx-pipelines + LTX-2.3 22B FP8
 # Image legere : les modeles sont telecharges au runtime sur le network volume
 # Supporte 2 modes : GPU Pod (interactif) et RunPod Serverless (API)
 #
@@ -45,9 +45,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         --extra-index-url https://pypi.org/simple/
 
 # --- ltx-core + ltx-pipelines depuis le repo Lightricks/LTX-2 ---
-# Pin au commit 28c3c73 (2026-02-09) — inclut CPU fallback natif pour fuse_loras FP8
+# Pin au commit 9e8a28e — LTX-2.3 support (FP8 cast, temporal upscaler, I2V natif)
 RUN git clone --filter=blob:none --quiet https://github.com/Lightricks/LTX-2.git /tmp/LTX-2 && \
-    cd /tmp/LTX-2 && git checkout 28c3c73fe557666c3de176e1e50a5220152ccfca
+    cd /tmp/LTX-2 && git checkout 9e8a28e17ac4dd9e49695223d50753a1ebda36fe
 
 # Installer ltx-core d'abord (dependance de ltx-pipelines)
 RUN cd /tmp/LTX-2/packages/ltx-core && pip install --no-cache-dir .

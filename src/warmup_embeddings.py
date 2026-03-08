@@ -27,7 +27,7 @@ import torch
 from safetensors import safe_open
 
 sys.path.insert(0, os.path.dirname(__file__) if "__file__" in dir() else "/app")
-from prompts import CAMERA_PROMPTS, DEFAULT_NEGATIVE_PROMPT  # noqa: E402
+from prompts import CAMERA_PRESETS, DEFAULT_NEGATIVE_PROMPT  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -172,7 +172,7 @@ def main() -> int:
         log.info("VRAM avant warmup: %s", vram_gb())
 
     checkpoint_path = os.path.join(
-        models_dir, "checkpoints", "ltx-2-19b-dev.safetensors"
+        models_dir, "checkpoints", "ltx-2.3-22b-dev-fp8.safetensors"
     )
     gemma_root = os.path.join(models_dir, "text_encoders", "gemma-3-12b-it")
 
@@ -189,8 +189,8 @@ def main() -> int:
     # Encoder tous les prompts : 7 cameras + 1 negative
     from ltx_core.text_encoders.gemma import encode_text
 
-    all_prompts = list(CAMERA_PROMPTS.values()) + [DEFAULT_NEGATIVE_PROMPT]
-    all_keys = list(CAMERA_PROMPTS.keys()) + ["_negative"]
+    all_prompts = list(CAMERA_PRESETS.values()) + [DEFAULT_NEGATIVE_PROMPT]
+    all_keys = list(CAMERA_PRESETS.keys()) + ["_negative"]
     log.info("Encoding %d prompts...", len(all_prompts))
 
     results = encode_text(te_model, prompts=all_prompts)

@@ -6,12 +6,12 @@ DEFAULT_NEGATIVE_PROMPT = (
     "compressed artifacts, jpeg artifacts, noise, grainy"
 )
 
-CAMERA_PROMPTS: dict[str, str] = {
-    "dolly-in": "A steady dolly-in camera movement, smooth forward motion, cinematic.",
-    "dolly-out": "A steady dolly-out camera movement, smooth backward motion, cinematic.",
-    "dolly-left": "A steady dolly-left camera movement, smooth lateral motion to the left, cinematic.",
-    "dolly-right": "A steady dolly-right camera movement, smooth lateral motion to the right, cinematic.",
-    "jib-down": "A steady jib-down camera movement, smooth downward motion, cinematic.",
-    "jib-up": "A steady jib-up camera movement, smooth upward motion, cinematic.",
-    "static": "A static camera, no movement, cinematic.",
+CAMERA_PRESETS: dict[str, str] = {
+    "dolly-in": "The camera slowly moves forward into the scene",
+    "dolly-out": "The camera slowly pulls back from the scene",
+    "dolly-left": "The camera smoothly translates to the left",
+    "dolly-right": "The camera smoothly translates to the right",
+    "jib-up": "The camera rises vertically",
+    "jib-down": "The camera descends vertically",
+    "static": "Static camera, no movement",
 }

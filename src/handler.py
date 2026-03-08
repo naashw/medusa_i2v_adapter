@@ -1,7 +1,7 @@
 """
 Handler RunPod Serverless pour Medusa I2V (ltx-pipelines direct).
 
-API simplifiee : image + camera → video MP4.
+API simplifiee : image + camera_motion → video MP4.
 Reprend les fonctionnalites cles de handler_wrapper.py :
   - Dedup cache par hash
   - Sauvegarde outputs sur network volume
@@ -45,36 +45,15 @@ VOLUME_ROOT = os.environ.get("VOLUME_ROOT", "/runpod-volume")
 MODELS_DIR = os.environ.get("MODELS_DIR", "/runpod-volume/models")
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "2"))
 
-# Mapping camera → (fichier LoRA, prompt par defaut)
-CAMERAS: dict[str, tuple[str, str]] = {
-    "dolly-in": (
-        "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
-        "A steady dolly-in camera movement, smooth forward motion, cinematic.",
-    ),
-    "dolly-out": (
-        "ltx-2-19b-lora-camera-control-dolly-out.safetensors",
-        "A steady dolly-out camera movement, smooth backward motion, cinematic.",
-    ),
-    "dolly-left": (
-        "ltx-2-19b-lora-camera-control-dolly-left.safetensors",
-        "A steady dolly-left camera movement, smooth lateral motion to the left, cinematic.",
-    ),
-    "dolly-right": (
-        "ltx-2-19b-lora-camera-control-dolly-right.safetensors",
-        "A steady dolly-right camera movement, smooth lateral motion to the right, cinematic.",
-    ),
-    "jib-down": (
-        "ltx-2-19b-lora-camera-control-jib-down.safetensors",
-        "A steady jib-down camera movement, smooth downward motion, cinematic.",
-    ),
-    "jib-up": (
-        "ltx-2-19b-lora-camera-control-jib-up.safetensors",
-        "A steady jib-up camera movement, smooth upward motion, cinematic.",
-    ),
-    "static": (
-        "ltx-2-19b-lora-camera-control-static.safetensors",
-        "A static camera, no movement, cinematic.",
-    ),
+# Presets camera_motion (preset connu → description pour le prompt)
+CAMERA_PRESETS: dict[str, str] = {
+    "dolly-in": "The camera slowly moves forward into the scene",
+    "dolly-out": "The camera slowly pulls back from the scene",
+    "dolly-left": "The camera smoothly translates to the left",
+    "dolly-right": "The camera smoothly translates to the right",
+    "jib-up": "The camera rises vertically",
+    "jib-down": "The camera descends vertically",
+    "static": "Static camera, no movement",
 }
 
 # --- S3 ---
@@ -357,9 +336,9 @@ def handler(job: dict) -> dict:
     else:
         return {"error": "Le champ 'image' ou 'images' est requis (URL https ou base64)"}
 
-    camera = job_input.get("camera", "dolly-in")
-    if camera not in CAMERAS:
-        return {"error": f"Camera inconnue: {camera}. Choix: {list(CAMERAS.keys())}"}
+    # --- camera_motion : preset connu → description, sinon texte libre ---
+    camera_motion = job_input.get("camera_motion", job_input.get("camera", "static"))
+    camera_motion_text = CAMERA_PRESETS.get(camera_motion, camera_motion)
 
     base_seed = job_input.get("seed", random.randint(0, 2**32 - 1))
     num_frames = job_input.get("num_frames", 25)
@@ -367,7 +346,6 @@ def handler(job: dict) -> dict:
     image_strength = job_input.get("image_strength", 1.0)
     last_image_data = job_input.get("last_image")
     last_image_strength = job_input.get("last_image_strength", 1.0)
-    prompt_override = job_input.get("prompt")
     negative_override = job_input.get("negative_prompt")
 
     resolution = job_input.get("resolution", "720p")
@@ -380,10 +358,8 @@ def handler(job: dict) -> dict:
 
     disk_before = get_disk_usage_mb()
     total_images = len(image_data_list)
-    log.info("Job %s - %d image(s), disque avant: %.0f MB", job_id, total_images, disk_before)
+    log.info("Job %s - %d image(s), camera_motion=%s, disque avant: %.0f MB", job_id, total_images, camera_motion, disk_before)
 
-    lora_filename, _default_prompt = CAMERAS[camera]
-    camera_lora_path = os.path.join(MODELS_DIR, "loras", lora_filename)
     two_stage = resolution == "1080p"
 
     # Seeds uniques par item
@@ -399,11 +375,8 @@ def handler(job: dict) -> dict:
             tmp_last_image = resolve_image(last_image_data)
 
         if not is_batch:
-            # ===== SINGLE IMAGE (retro-compatible, identique a l'ancien handler) =====
-            if last_image_data and tmp_last_image:
-                tmp_img = resolve_image(image_data_list[0])
-            else:
-                tmp_img = resolve_image(image_data_list[0])
+            # ===== SINGLE IMAGE (retro-compatible) =====
+            tmp_img = resolve_image(image_data_list[0])
             tmp_images.append(tmp_img)
 
             height, width = compute_target_resolution(tmp_img, resolution=resolution)
@@ -415,8 +388,7 @@ def handler(job: dict) -> dict:
             start_time = time.time()
             frames = pipeline.generate_frames(
                 image_path=tmp_img,
-                camera_lora_path=camera_lora_path,
-                camera_key=camera,
+                prompt=camera_motion_text,
                 seed=base_seed,
                 height=height,
                 width=width,
@@ -425,7 +397,6 @@ def handler(job: dict) -> dict:
                 image_strength=image_strength,
                 last_image_path=tmp_last_image,
                 last_image_strength=last_image_strength,
-                prompt_override=prompt_override,
                 negative_override=negative_override,
                 two_stage=two_stage,
             )
@@ -507,8 +478,7 @@ def handler(job: dict) -> dict:
 
                     batch_frames = pipeline.generate_batch_frames(
                         items=items,
-                        camera_lora_path=camera_lora_path,
-                        camera_key=camera,
+                        prompt=camera_motion_text,
                         height=height,
                         width=width,
                         num_frames=num_frames,
@@ -520,8 +490,7 @@ def handler(job: dict) -> dict:
                     # Sub-batch de 1 — utiliser generate_frames (single item)
                     frames = pipeline.generate_frames(
                         image_path=current_images[0],
-                        camera_lora_path=camera_lora_path,
-                        camera_key=camera,
+                        prompt=camera_motion_text,
                         seed=batch_seeds[0],
                         height=height,
                         width=width,
@@ -586,9 +555,8 @@ def init_pipeline() -> MedusaPipeline:
     os.makedirs(embeddings_cache_dir, exist_ok=True)
     p.warmup_embeddings(embeddings_cache_dir)
 
-    # 2. Build transformer avec camera par defaut (dolly-in)
-    dolly_in_path = os.path.join(MODELS_DIR, "loras", CAMERAS["dolly-in"][0])
-    p.get_transformer(dolly_in_path)
+    # 2. Build transformer (distilled LoRA fusionnee)
+    p.get_transformer()
 
     # 3. Charger video encoder + video decoder + spatial upsampler (persistent)
     p.load_video_encoder()

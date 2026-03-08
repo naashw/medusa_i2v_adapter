@@ -45,31 +45,17 @@ def audit_volume(volume_root: str) -> tuple[list[dict], list[dict], list[dict], 
     # --- Fichiers REQUIS (pipeline les utilise directement) ---
     required_files: dict[str, str] = {
         # Checkpoint principal
-        os.path.join(models_dir, "checkpoints", "ltx-2-19b-dev.safetensors"):
-            "Checkpoint LTX-2 19B BF16 (pipeline.py)",
-        # LoRAs de base
-        os.path.join(models_dir, "loras", "ltx-2-19b-distilled-lora-384.safetensors"):
+        os.path.join(models_dir, "checkpoints", "ltx-2.3-22b-dev-fp8.safetensors"):
+            "Checkpoint LTX-2.3 22B FP8 (pipeline.py)",
+        # Distilled LoRA
+        os.path.join(models_dir, "loras", "ltx-2.3-22b-distilled-lora-384.safetensors"):
             "Distilled LoRA (pipeline.py _base_loras)",
-        os.path.join(models_dir, "loras", "LTX-2-Image2Vid-Adapter.safetensors"):
-            "I2V Adapter LoRA (pipeline.py _base_loras)",
         # Spatial upscaler
-        os.path.join(models_dir, "upscalers", "ltx-2-spatial-upscaler-x2-1.0.safetensors"):
+        os.path.join(models_dir, "upscalers", "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"):
             "Spatial upscaler x2 (pipeline.py)",
-        # Camera LoRAs
-        os.path.join(models_dir, "loras", "ltx-2-19b-lora-camera-control-dolly-in.safetensors"):
-            "Camera LoRA dolly-in (handler.py CAMERAS)",
-        os.path.join(models_dir, "loras", "ltx-2-19b-lora-camera-control-dolly-out.safetensors"):
-            "Camera LoRA dolly-out (handler.py CAMERAS)",
-        os.path.join(models_dir, "loras", "ltx-2-19b-lora-camera-control-dolly-left.safetensors"):
-            "Camera LoRA dolly-left (handler.py CAMERAS)",
-        os.path.join(models_dir, "loras", "ltx-2-19b-lora-camera-control-dolly-right.safetensors"):
-            "Camera LoRA dolly-right (handler.py CAMERAS)",
-        os.path.join(models_dir, "loras", "ltx-2-19b-lora-camera-control-jib-down.safetensors"):
-            "Camera LoRA jib-down (handler.py CAMERAS)",
-        os.path.join(models_dir, "loras", "ltx-2-19b-lora-camera-control-jib-up.safetensors"):
-            "Camera LoRA jib-up (handler.py CAMERAS)",
-        os.path.join(models_dir, "loras", "ltx-2-19b-lora-camera-control-static.safetensors"):
-            "Camera LoRA static (handler.py CAMERAS)",
+        # Temporal upscaler
+        os.path.join(models_dir, "upscalers", "ltx-2.3-temporal-upscaler-x2-1.0.safetensors"):
+            "Temporal upscaler x2 (pipeline.py)",
     }
 
     # --- Dossiers REQUIS ---

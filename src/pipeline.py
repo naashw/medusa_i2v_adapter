@@ -1,16 +1,17 @@
 """
-MedusaPipeline — ltx-pipelines direct inference for LTX-2 19B I2V.
+MedusaPipeline — ltx-pipelines direct inference for LTX-2.3 22B FP8.
 
 Remplace ComfyUI par un appel Python direct a ltx-core / ltx-pipelines.
 Gestion du lifecycle des modeles entre jobs :
   - Video encoder  : persistent en VRAM (~1GB)
   - Video decoder  : persistent en VRAM (~2GB)
-  - Transformer    : base (distilled + I2V) persistante, camera LoRA fuse/unfuse in-place
-  - Text encoder   : charge sur CPU au warmup, embeddings caches sur disque
+  - Transformer    : base (distilled) persistante, FP8 cast (stockage FP8, compute BF16)
+  - Text encoder   : charge sur GPU a la demande, embeddings caches sur disque
 """
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import logging
 import os
@@ -52,7 +53,7 @@ from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.types import PipelineComponents
 from ltx_core.model.transformer.attention import Attention, PytorchAttention
 
-from prompts import CAMERA_PROMPTS, DEFAULT_NEGATIVE_PROMPT
+from prompts import CAMERA_PRESETS, DEFAULT_NEGATIVE_PROMPT
 
 log = logging.getLogger("medusa")
 
@@ -84,17 +85,15 @@ class SageAttentionCallable:
         return out
 
 
-# LoRA strengths (matches current ComfyUI workflow)
+# LoRA strength
 DISTILLED_LORA_STRENGTH = 0.7
-I2V_ADAPTER_STRENGTH = 0.8
-CAMERA_LORA_STRENGTH = 1.0
 
 # Version du cache transformer (incrementer pour invalider tous les caches existants)
-CACHE_VERSION = "v1"
+CACHE_VERSION = "v2"
 
 
 class MedusaPipeline:
-    """Pipeline I2V utilisant ltx-pipelines avec audio skip et transformer cache."""
+    """Pipeline I2V utilisant ltx-pipelines avec LTX-2.3 22B FP8 Cast."""
 
     def __init__(self, models_dir: str, device: torch.device | None = None) -> None:
         self.device = device or (
@@ -103,20 +102,19 @@ class MedusaPipeline:
         self.dtype = torch.bfloat16
         self.models_dir = models_dir
 
-        # Paths modeles
-        self._checkpoint_path = os.path.join(models_dir, "checkpoints", "ltx-2-19b-dev.safetensors")
+        # Paths modeles LTX-2.3
+        self._checkpoint_path = os.path.join(models_dir, "checkpoints", "ltx-2.3-22b-dev-fp8.safetensors")
         self._gemma_root = os.path.join(models_dir, "text_encoders", "gemma-3-12b-it")
-        self._distilled_lora = os.path.join(models_dir, "loras", "ltx-2-19b-distilled-lora-384.safetensors")
-        self._i2v_adapter = os.path.join(models_dir, "loras", "LTX-2-Image2Vid-Adapter.safetensors")
-        self._upsampler_path = os.path.join(models_dir, "upscalers", "ltx-2-spatial-upscaler-x2-1.0.safetensors")
+        self._distilled_lora = os.path.join(models_dir, "loras", "ltx-2.3-22b-distilled-lora-384.safetensors")
+        self._upsampler_path = os.path.join(models_dir, "upscalers", "ltx-2.3-spatial-upscaler-x2-1.0.safetensors")
+        self._temporal_upsampler_path = os.path.join(models_dir, "upscalers", "ltx-2.3-temporal-upscaler-x2-1.0.safetensors")
 
         # Pipeline components (patchifiers + scale factors)
         self._components = PipelineComponents(dtype=self.dtype, device=self.device)
 
-        # Base LoRAs (distilled + i2v adapter, utilisees pour chaque transformer build)
+        # Base LoRAs (distilled seulement — I2V natif LTX-2.3)
         self._base_loras = [
             LoraPathStrengthAndSDOps(self._distilled_lora, DISTILLED_LORA_STRENGTH, LTXV_LORA_COMFY_RENAMING_MAP),
-            LoraPathStrengthAndSDOps(self._i2v_adapter, I2V_ADAPTER_STRENGTH, LTXV_LORA_COMFY_RENAMING_MAP),
         ]
 
         # Base ModelLedger SANS LoRAs — pour video_encoder, video_decoder (VAE) et spatial upsampler
@@ -136,14 +134,10 @@ class MedusaPipeline:
         # Spatial upsampler x2 (persistent en VRAM, ~1GB)
         self._spatial_upsampler: torch.nn.Module | None = None
 
-        # Transformer base en VRAM (distilled + I2V fusionnes, camera LoRA fuse/unfuse dynamiquement)
+        # Transformer base en VRAM (distilled fusionnee, FP8 cast)
         self._transformer: torch.nn.Module | None = None
-        self._current_camera_lora: str | None = None
 
-        # Cache des deltas camera LoRA precalcules (path -> {param_name: delta_tensor CPU})
-        self._camera_deltas: dict[str, dict[str, torch.Tensor]] = {}
-
-        # Embeddings cache (prompt -> (video_ctx, audio_ctx))
+        # Embeddings cache (prompt/key -> (video_ctx, audio_ctx))
         self._embeddings_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
         # Sigmas distilled (8 steps stage 1, 3 steps stage 2)
@@ -155,10 +149,9 @@ class MedusaPipeline:
         )
 
     def warmup_embeddings(self, cache_dir: str) -> None:
-        """Encode tous les prompts camera + negative, sauvegarde sur disque.
+        """Charge les embeddings depuis cache disque (genere par warmup_embeddings.py).
 
-        Charge le text encoder Gemma 3 12B sur CPU (~24GB RAM),
-        encode les prompts, sauvegarde le cache, puis libere la memoire.
+        Si le cache n'existe pas, genere les embeddings avec Gemma sur GPU.
         """
         cache_path = os.path.join(cache_dir, "embeddings_cache.pt")
 
@@ -168,22 +161,23 @@ class MedusaPipeline:
             self._load_embeddings_cache(cache_path)
             return
 
-        log.info("Pas de cache embeddings — generation avec text encoder sur CPU...")
+        log.info("Pas de cache embeddings — generation avec text encoder sur GPU...")
 
-        # Creer un ledger CPU dedie au text encoder
+        # Creer un ledger dedie au text encoder
+        te_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         cpu_ledger = ModelLedger(
             dtype=self.dtype,
-            device=torch.device("cpu"),
+            device=te_device,
             checkpoint_path=self._checkpoint_path,
             gemma_root_path=self._gemma_root,
         )
         text_encoder = cpu_ledger.text_encoder()
 
-        # Encoder tous les prompts : 7 cameras + 1 negative
-        all_prompts = list(CAMERA_PROMPTS.values()) + [DEFAULT_NEGATIVE_PROMPT]
-        all_keys = list(CAMERA_PROMPTS.keys()) + ["_negative"]
+        # Encoder tous les prompts : 7 presets camera + 1 negative
+        all_prompts = list(CAMERA_PRESETS.values()) + [DEFAULT_NEGATIVE_PROMPT]
+        all_keys = list(CAMERA_PRESETS.keys()) + ["_negative"]
 
-        log.info("Encoding %d prompts sur CPU...", len(all_prompts))
+        log.info("Encoding %d prompts...", len(all_prompts))
         results = encode_text(text_encoder, prompts=all_prompts)
 
         # Construire le cache
@@ -250,56 +244,6 @@ class MedusaPipeline:
             return mod._orig_mod
         return mod
 
-    def _compute_camera_delta(self, camera_lora_path: str) -> dict[str, torch.Tensor]:
-        """Charge un camera LoRA et calcule les deltas poids (caches sur CPU).
-
-        Formule : delta = strength * alpha/rank * (lora_B @ lora_A)
-        Les deltas sont caches pour reutilisation lors des switch cameras.
-        """
-        if camera_lora_path in self._camera_deltas:
-            return self._camera_deltas[camera_lora_path]
-
-        log.info("Calcul delta camera LoRA: %s", os.path.basename(camera_lora_path))
-        raw = load_safetensors(camera_lora_path, device="cpu")
-
-        # Grouper les paires lora_A/lora_B par cle de base (convention ltx-core)
-        pairs: dict[str, dict[str, torch.Tensor]] = {}
-        for key, tensor in raw.items():
-            # LTXV_LORA_COMFY_RENAMING_MAP : strip "diffusion_model." prefix
-            clean = key.replace("diffusion_model.", "", 1) if key.startswith("diffusion_model.") else key
-
-            if ".lora_A.weight" in clean:
-                base = clean.replace(".lora_A.weight", "")
-                pairs.setdefault(base, {})["down"] = tensor
-            elif ".lora_B.weight" in clean:
-                base = clean.replace(".lora_B.weight", "")
-                pairs.setdefault(base, {})["up"] = tensor
-            elif ".alpha" in clean:
-                base = clean.replace(".alpha", "")
-                pairs.setdefault(base, {})["alpha"] = tensor
-
-        deltas: dict[str, torch.Tensor] = {}
-        for base_key, pair in pairs.items():
-            if "down" not in pair or "up" not in pair:
-                continue
-            down = pair["down"].to(dtype=self.dtype, device=self.device)
-            up = pair["up"].to(dtype=self.dtype, device=self.device)
-
-            delta = up @ down
-
-            if "alpha" in pair:
-                rank = down.shape[0]
-                alpha_val = pair["alpha"].item()
-                delta = delta * (alpha_val / rank)
-
-            delta = delta * CAMERA_LORA_STRENGTH
-            deltas[f"{base_key}.weight"] = delta.cpu()
-            del down, up, delta
-
-        self._camera_deltas[camera_lora_path] = deltas
-        log.info("Delta camera: %d params calcules", len(deltas))
-        return deltas
-
     @staticmethod
     def _patch_sage_attention(transformer: torch.nn.Module) -> int:
         """Remplace attention_function par SageAttention2++ sur les modules Attention."""
@@ -310,19 +254,6 @@ class MedusaPipeline:
                 module.attention_function = sage_attn
                 patched += 1
         return patched
-
-    def _apply_camera_delta(self, camera_lora_path: str, sign: float = 1.0) -> None:
-        """Fuse (sign=1) ou unfuse (sign=-1) un camera LoRA delta in-place."""
-        deltas = self._compute_camera_delta(camera_lora_path)
-        module = self._get_orig_module()
-        params = dict(module.named_parameters())
-        applied = 0
-        for key, delta_cpu in deltas.items():
-            if key in params:
-                params[key].data.add_(delta_cpu.to(self.device), alpha=sign)
-                applied += 1
-        action = "Fuse" if sign > 0 else "Unfuse"
-        log.info("%s camera LoRA: %s (%d/%d params)", action, os.path.basename(camera_lora_path), applied, len(deltas))
 
     def _cache_fingerprint(self) -> str:
         """Hash d'invalidation pour le cache transformer pre-fusionne.
@@ -340,7 +271,7 @@ class MedusaPipeline:
         return h.hexdigest()[:16]
 
     def _save_transformer_cache(self, cache_path: str) -> None:
-        """Sauvegarde le transformer fusionne (distilled + I2V) en format checkpoint.
+        """Sauvegarde le transformer fusionne (distilled) en format checkpoint.
 
         Extrait le state_dict du LTXModel interne, re-ajoute le prefixe
         `model.diffusion_model.` pour compatibilite avec ModelLedger,
@@ -391,86 +322,120 @@ class MedusaPipeline:
         del ledger
         return transformer
 
-    def get_transformer(self, camera_lora_path: str) -> torch.nn.Module:
-        """Retourne le transformer avec la camera LoRA demandee.
+    def get_transformer(self) -> torch.nn.Module:
+        """Retourne le transformer FP8 avec distilled LoRA fusionnee.
 
-        Base (distilled + I2V) construite une seule fois via ModelLedger.
-        Camera LoRA fuse/unfuse dynamiquement in-place (~0.1s de switch).
-        Compatible torch.compile car modification in-place (memes adresses memoire).
+        Base (distilled) construite une seule fois via ModelLedger.
+        FP8 Cast : stockage FP8, compute BF16 — compatible torch.compile + SageAttention.
         """
-        # Meme camera → retourner directement
-        if self._current_camera_lora == camera_lora_path:
+        if self._transformer is not None:
             return self._transformer
 
-        # Premier appel → build base transformer (distilled + I2V seulement)
+        cache_dir = os.path.join(os.path.dirname(self.models_dir), "cache", "transformer")
+        os.makedirs(cache_dir, exist_ok=True)
+        fingerprint = self._cache_fingerprint()
+        cache_path = os.path.join(cache_dir, f"transformer_{fingerprint}.safetensors")
+        cache_enabled = os.environ.get("TRANSFORMER_CACHE", "1") == "1"
+
+        if cache_enabled and os.path.isfile(cache_path):
+            try:
+                self._transformer = self._load_transformer_cache(cache_path)
+            except Exception as e:
+                log.warning("Cache transformer invalide, rebuild: %s", e)
+                try:
+                    os.unlink(cache_path)
+                except OSError:
+                    pass
+
         if self._transformer is None:
-            cache_dir = os.path.join(os.path.dirname(self.models_dir), "cache", "transformer")
-            os.makedirs(cache_dir, exist_ok=True)
-            fingerprint = self._cache_fingerprint()
-            cache_path = os.path.join(cache_dir, f"transformer_{fingerprint}.safetensors")
-            cache_enabled = os.environ.get("TRANSFORMER_CACHE", "1") == "1"
+            log.info("Build base transformer (distilled LoRA)...")
+            ledger = ModelLedger(
+                dtype=self.dtype,
+                device=self.device,
+                checkpoint_path=self._checkpoint_path,
+                loras=self._base_loras,
+            )
+            self._transformer = ledger.transformer()
+            del ledger
 
-            if cache_enabled and os.path.isfile(cache_path):
-                try:
-                    self._transformer = self._load_transformer_cache(cache_path)
-                except Exception as e:
-                    log.warning("Cache transformer invalide, rebuild: %s", e)
-                    try:
-                        os.unlink(cache_path)
-                    except OSError:
-                        pass
+            if cache_enabled:
+                self._save_transformer_cache(cache_path)
 
-            if self._transformer is None:
-                log.info("Build base transformer (distilled + I2V)...")
-                ledger = ModelLedger(
-                    dtype=self.dtype,
-                    device=self.device,
-                    checkpoint_path=self._checkpoint_path,
-                    loras=self._base_loras,
-                )
-                self._transformer = ledger.transformer()
-                del ledger
+        # SageAttention2++ (remplace SDPA sur les modules Attention du transformer)
+        if os.environ.get("SAGE_ATTENTION", "1") == "1":
+            try:
+                patched = self._patch_sage_attention(self._transformer)
+                log.info("SageAttention2++ active: %d modules patches", patched)
+            except ImportError:
+                log.warning("SageAttention non installe, fallback SDPA")
+            except Exception as e:
+                log.warning("SageAttention init echoue, fallback SDPA: %s", e)
 
-                if cache_enabled:
-                    self._save_transformer_cache(cache_path)
+        # torch.compile pour acceleration inference (8 steps/job)
+        if os.environ.get("TORCH_COMPILE", "1") == "1":
+            torch._dynamo.config.allow_unspec_int_on_nn_module = True
+            log.info("torch.compile transformer (mode=reduce-overhead)...")
+            self._transformer = torch.compile(
+                self._transformer,
+                mode="reduce-overhead",
+                fullgraph=False,
+            )
 
-            # SageAttention2++ (remplace SDPA sur les modules Attention du transformer)
-            if os.environ.get("SAGE_ATTENTION", "1") == "1":
-                try:
-                    patched = self._patch_sage_attention(self._transformer)
-                    log.info("SageAttention2++ active: %d modules patches", patched)
-                except ImportError:
-                    log.warning("SageAttention non installe, fallback SDPA")
-                except Exception as e:
-                    log.warning("SageAttention init echoue, fallback SDPA: %s", e)
-
-            # torch.compile pour acceleration inference (8 steps/job)
-            if os.environ.get("TORCH_COMPILE", "1") == "1":
-                torch._dynamo.config.allow_unspec_int_on_nn_module = True
-                log.info("torch.compile transformer (mode=reduce-overhead)...")
-                self._transformer = torch.compile(
-                    self._transformer,
-                    mode="reduce-overhead",
-                    fullgraph=False,
-                )
-
-            self._log_vram("apres base transformer")
-        else:
-            # Switch camera → unfuse l'ancienne
-            self._apply_camera_delta(self._current_camera_lora, sign=-1.0)
-
-        # Fuse la nouvelle camera LoRA
-        self._apply_camera_delta(camera_lora_path, sign=1.0)
-        self._current_camera_lora = camera_lora_path
-        self._log_vram(f"apres camera {os.path.basename(camera_lora_path)}")
+        self._log_vram("apres base transformer")
         return self._transformer
+
+    def encode_prompt(self, prompt: str, negative: str | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode un prompt (cache hit ou Gemma GPU on-demand).
+
+        1. Verifie si le prompt est un preset connu dans le cache
+        2. Sinon charge Gemma GPU → encode → cleanup VRAM → retourne
+        """
+        # Chercher dans le cache par valeur (preset text → key)
+        for key, preset_text in CAMERA_PRESETS.items():
+            if prompt == preset_text and key in self._embeddings_cache:
+                return self._embeddings_cache[key]
+
+        # Chercher par key directe (ex: "dolly-in")
+        if prompt in self._embeddings_cache:
+            return self._embeddings_cache[prompt]
+
+        # On-demand : charger Gemma GPU et encoder
+        log.info("Encoding prompt custom via Gemma GPU: %s", prompt[:80])
+        te_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        te_ledger = ModelLedger(
+            dtype=self.dtype,
+            device=te_device,
+            checkpoint_path=self._checkpoint_path,
+            gemma_root_path=self._gemma_root,
+        )
+        text_encoder = te_ledger.text_encoder()
+
+        prompts_to_encode = [prompt]
+        if negative and negative != DEFAULT_NEGATIVE_PROMPT:
+            prompts_to_encode.append(negative)
+
+        results = encode_text(text_encoder, prompts=prompts_to_encode)
+        v_ctx, a_ctx = results[0]
+
+        del text_encoder, te_ledger
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        log.info("Gemma cleanup done")
+
+        return v_ctx.to(self.device), a_ctx.to(self.device)
+
+    def _get_negative_embeddings(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Retourne les embeddings du negative prompt (toujours pre-cache)."""
+        if "_negative" in self._embeddings_cache:
+            return self._embeddings_cache["_negative"]
+        return self.encode_prompt(DEFAULT_NEGATIVE_PROMPT)
 
     @torch.inference_mode()
     def generate_frames(
         self,
         image_path: str,
-        camera_lora_path: str,
-        camera_key: str,
+        prompt: str,
         seed: int,
         height: int,
         width: int,
@@ -479,28 +444,21 @@ class MedusaPipeline:
         image_strength: float = 1.0,
         last_image_path: str | None = None,
         last_image_strength: float = 1.0,
-        prompt_override: str | None = None,
         negative_override: str | None = None,
         two_stage: bool = False,
     ) -> list[torch.Tensor]:
         """Genere les frames I2V sans encoder en MP4.
 
         Retourne les frames decodees sur CPU pour post-processing async.
-        Memes parametres que generate() sauf output_path.
         """
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
-        # 1. Embeddings depuis cache
-        if prompt_override:
-            v_context_p, a_context_p = self._encode_prompt(prompt_override)
-        elif camera_key in self._embeddings_cache:
-            v_context_p, a_context_p = self._embeddings_cache[camera_key]
-        else:
-            raise ValueError(f"Camera '{camera_key}' non trouvee dans le cache embeddings")
+        # 1. Embeddings (cache hit si preset, Gemma on-demand sinon)
+        v_context_p, a_context_p = self.encode_prompt(prompt)
 
-        # 2. Transformer avec bon camera LoRA
+        # 2. Transformer (deja build au startup)
         self._log_vram("debut generate")
-        transformer = self.get_transformer(camera_lora_path)
+        transformer = self.get_transformer()
 
         # 3. Setup denoising
         noiser = GaussianNoiser(generator=generator)
@@ -697,8 +655,7 @@ class MedusaPipeline:
     def generate(
         self,
         image_path: str,
-        camera_lora_path: str,
-        camera_key: str,
+        prompt: str,
         seed: int,
         height: int,
         width: int,
@@ -708,7 +665,6 @@ class MedusaPipeline:
         image_strength: float = 1.0,
         last_image_path: str | None = None,
         last_image_strength: float = 1.0,
-        prompt_override: str | None = None,
         negative_override: str | None = None,
         two_stage: bool = False,
     ) -> None:
@@ -718,8 +674,7 @@ class MedusaPipeline:
         """
         frames = self.generate_frames(
             image_path=image_path,
-            camera_lora_path=camera_lora_path,
-            camera_key=camera_key,
+            prompt=prompt,
             seed=seed,
             height=height,
             width=width,
@@ -728,7 +683,6 @@ class MedusaPipeline:
             image_strength=image_strength,
             last_image_path=last_image_path,
             last_image_strength=last_image_strength,
-            prompt_override=prompt_override,
             negative_override=negative_override,
             two_stage=two_stage,
         )
@@ -748,8 +702,7 @@ class MedusaPipeline:
     def generate_batch_frames(
         self,
         items: list[dict],
-        camera_lora_path: str,
-        camera_key: str,
+        prompt: str,
         height: int,
         width: int,
         num_frames: int,
@@ -757,7 +710,7 @@ class MedusaPipeline:
         image_strength: float = 1.0,
         two_stage: bool = False,
     ) -> list[list[torch.Tensor]]:
-        """Genere les frames pour un batch d'items (meme camera, images/seeds differents).
+        """Genere les frames pour un batch d'items (meme prompt, images/seeds differents).
 
         Chaque item dict doit avoir:
             image_path: str (fichier local)
@@ -778,11 +731,8 @@ class MedusaPipeline:
             batch_size, width, height, "2-stage" if two_stage else "1-stage",
         )
 
-        # 1. Embeddings (partages pour tout le batch, meme camera)
-        if camera_key in self._embeddings_cache:
-            v_context_p, a_context_p = self._embeddings_cache[camera_key]
-        else:
-            raise ValueError(f"Camera '{camera_key}' non trouvee dans le cache embeddings")
+        # 1. Embeddings (partages pour tout le batch, meme prompt)
+        v_context_p, a_context_p = self.encode_prompt(prompt)
 
         # Expand context au batch size
         if v_context_p.shape[0] == 1 and batch_size > 1:
@@ -792,9 +742,9 @@ class MedusaPipeline:
             v_ctx_batch = v_context_p
             a_ctx_batch = a_context_p
 
-        # 2. Transformer avec camera LoRA
+        # 2. Transformer
         self._log_vram("debut batch generate")
-        transformer = self.get_transformer(camera_lora_path)
+        transformer = self.get_transformer()
 
         # 3. Setup
         stepper = EulerDiffusionStep()
@@ -1021,20 +971,3 @@ class MedusaPipeline:
 
         log.info("Batch frames generees: %d items", len(all_frames))
         return all_frames
-
-    def _encode_prompt(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
-        """Encode un prompt custom via le text encoder (cold path, rarement utilise)."""
-        log.warning("Encoding prompt custom sur CPU (lent): %s", prompt[:50])
-        cpu_ledger = ModelLedger(
-            dtype=self.dtype,
-            device=torch.device("cpu"),
-            checkpoint_path=self._checkpoint_path,
-            gemma_root_path=self._gemma_root,
-        )
-        text_encoder = cpu_ledger.text_encoder()
-        results = encode_text(text_encoder, prompts=[prompt])
-        v_ctx, a_ctx = results[0]
-        del text_encoder
-        del cpu_ledger
-        cleanup_memory()
-        return v_ctx.to(self.device), a_ctx.to(self.device)
