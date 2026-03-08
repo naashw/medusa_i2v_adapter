@@ -58,13 +58,23 @@ RUN cd /tmp/LTX-2/packages/ltx-pipelines && pip install --no-cache-dir .
 # Cleanup repo clone
 RUN rm -rf /tmp/LTX-2
 
+# H100 sm_90 pour kernels SageAttention CUDA/Triton
+ENV TORCH_CUDA_ARCH_LIST="9.0"
+
+# --- SageAttention 2++ from source (attention optimisee H100) ---
+RUN git clone --depth 1 https://github.com/thu-ml/SageAttention /tmp/sageattention && \
+    cd /tmp/sageattention && \
+    MAX_JOBS=2 pip install --no-build-isolation -v . && \
+    rm -rf /tmp/sageattention
+
 # --- Runtime Python dependencies (runpod, requests, etc.) ---
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-# Verification builder : ltx_core et ltx_pipelines importables
+# Verification builder : ltx_core, ltx_pipelines et SageAttention importables
 RUN python -c "import ltx_core; print('ltx_core OK:', ltx_core.__file__)" && \
     python -c "import ltx_pipelines; print('ltx_pipelines OK')" && \
+    python -c "from sageattention import sageattn; print('SageAttention OK')" && \
     pip list | grep -i ltx
 
 # ============================================================
