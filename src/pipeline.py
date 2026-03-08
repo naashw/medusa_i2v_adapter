@@ -14,15 +14,20 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import time
+import warnings
 from collections.abc import Iterator
 
 import safetensors
 import torch
+
+# Supprimer les warnings internes torch.compile/dynamo (pas de bug, juste du bruit)
+warnings.filterwarnings("ignore", message=".*lru_cache.*", module=r"torch\._dynamo")
+warnings.filterwarnings("ignore", message=".*To copy construct from a tensor.*", module=r"torch\.")
 from safetensors.torch import load_file as load_safetensors
 from safetensors.torch import save_file as save_safetensors
 
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
-from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
@@ -38,22 +43,49 @@ from ltx_pipelines.utils.helpers import (
     denoise_audio_video,
     euler_denoising_loop,
     image_conditionings_by_replacing_latent,
-    multi_modal_guider_denoising_func,
+    modality_from_latent_state,
     simple_denoising_func,
 )
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.types import PipelineComponents
+from ltx_core.model.transformer.attention import Attention, PytorchAttention
+
 from prompts import CAMERA_PROMPTS, DEFAULT_NEGATIVE_PROMPT
 
 log = logging.getLogger("medusa")
+
+
+class SageAttentionCallable:
+    """SageAttention2++ (H100 sm_90), fallback SDPA si mask present."""
+
+    def __init__(self) -> None:
+        from sageattention import sageattn
+
+        if os.environ.get("SAGE_COMPILE_DISABLE", "0") == "1":
+            self._sageattn = torch.compiler.disable(sageattn)
+        else:
+            self._sageattn = sageattn
+        self._fallback = PytorchAttention()
+
+    def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: torch.Tensor | None = None) -> torch.Tensor:
+        if mask is not None:
+            return self._fallback(q, k, v, heads, mask)
+
+        b, _, dim_head = q.shape
+        dim_head //= heads
+        q = q.to(torch.bfloat16)
+        k = k.to(torch.bfloat16)
+        v = v.to(torch.bfloat16)
+        q, k, v = (t.view(b, -1, heads, dim_head).transpose(1, 2) for t in (q, k, v))
+        out = self._sageattn(q, k, v, tensor_layout="HND", is_causal=False)
+        out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
+        return out
+
 
 # LoRA strengths (matches current ComfyUI workflow)
 DISTILLED_LORA_STRENGTH = 0.7
 I2V_ADAPTER_STRENGTH = 0.8
 CAMERA_LORA_STRENGTH = 1.0
-
-# Audio skip : audio calcule seulement au step 0 / 8
-AUDIO_SKIP_STEP = 99
 
 # Version du cache transformer (incrementer pour invalider tous les caches existants)
 CACHE_VERSION = "v1"
@@ -261,6 +293,17 @@ class MedusaPipeline:
         log.info("Delta camera: %d params calcules", len(deltas))
         return deltas
 
+    @staticmethod
+    def _patch_sage_attention(transformer: torch.nn.Module) -> int:
+        """Remplace attention_function par SageAttention2++ sur les modules Attention."""
+        sage_attn = SageAttentionCallable()
+        patched = 0
+        for module in transformer.modules():
+            if isinstance(module, Attention):
+                module.attention_function = sage_attn
+                patched += 1
+        return patched
+
     def _apply_camera_delta(self, camera_lora_path: str, sign: float = 1.0) -> None:
         """Fuse (sign=1) ou unfuse (sign=-1) un camera LoRA delta in-place."""
         deltas = self._compute_camera_delta(camera_lora_path)
@@ -384,6 +427,16 @@ class MedusaPipeline:
                 if cache_enabled:
                     self._save_transformer_cache(cache_path)
 
+            # SageAttention2++ (remplace SDPA sur les modules Attention du transformer)
+            if os.environ.get("SAGE_ATTENTION", "1") == "1":
+                try:
+                    patched = self._patch_sage_attention(self._transformer)
+                    log.info("SageAttention2++ active: %d modules patches", patched)
+                except ImportError:
+                    log.warning("SageAttention non installe, fallback SDPA")
+                except Exception as e:
+                    log.warning("SageAttention init echoue, fallback SDPA: %s", e)
+
             # torch.compile pour acceleration inference (8 steps/job)
             if os.environ.get("TORCH_COMPILE", "1") == "1":
                 torch._dynamo.config.allow_unspec_int_on_nn_module = True
@@ -453,14 +506,6 @@ class MedusaPipeline:
         else:
             raise ValueError(f"Camera '{camera_key}' non trouvee dans le cache embeddings")
 
-        neg_key = "_negative"
-        if negative_override:
-            v_context_n, a_context_n = self._encode_prompt(negative_override)
-        elif neg_key in self._embeddings_cache:
-            v_context_n, a_context_n = self._embeddings_cache[neg_key]
-        else:
-            raise ValueError("Negative prompt non trouve dans le cache embeddings")
-
         # 2. Transformer avec bon camera LoRA
         self._log_vram("debut generate")
         transformer = self.get_transformer(camera_lora_path)
@@ -475,45 +520,52 @@ class MedusaPipeline:
             last_latent_idx = (num_frames - 1) // 8
             images.append((last_image_path, last_latent_idx, last_image_strength))
 
-        # 5. Guiders : video (toujours actif) + audio (skip 87.5%)
-        video_guider_params = MultiModalGuiderParams(
-            cfg_scale=1.0,
-            stg_scale=0.0,
-            modality_scale=1.0,
-            skip_step=0,
-        )
-        audio_guider_params = MultiModalGuiderParams(
-            cfg_scale=1.0,
-            stg_scale=0.0,
-            modality_scale=1.0,
-            skip_step=AUDIO_SKIP_STEP,
-        )
-
-        # Denoising loop closure (guiders — used for 1-stage and stage 1 of 2-stage)
+        # 5. Denoising loop — audio disabled (single CUDA graph, no guidance)
+        # CFG=1.0, STG=0.0 → guiders are no-ops, audio not used for video generation.
+        # Keeping audio.enabled constant across all steps avoids Dynamo recompilation.
         def denoising_loop_guided(
             sigmas: torch.Tensor,
             video_state: LatentState,
             audio_state: LatentState,
             stepper_arg: DiffusionStepProtocol,
         ) -> tuple[LatentState, LatentState]:
+
+            def denoise_step(
+                video_state: LatentState,
+                audio_state: LatentState,
+                sigmas: torch.Tensor,
+                step_index: int,
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                t0 = time.perf_counter()
+                sigma = sigmas[step_index]
+                vid_mod = modality_from_latent_state(
+                    video_state, v_context_p, sigma, enabled=True,
+                )
+                aud_mod = modality_from_latent_state(
+                    audio_state, a_context_p, sigma, enabled=False,
+                )
+                denoised_video, denoised_audio = transformer(
+                    video=vid_mod, audio=aud_mod, perturbations=None,
+                )
+                torch.cuda.synchronize()
+                dt = time.perf_counter() - t0
+                if step_index == 0:
+                    alloc = torch.cuda.memory_allocated() / 2**30
+                    rsvd = torch.cuda.memory_reserved() / 2**30
+                    log.info("step %d: %.2fs (sigma=%.4f) VRAM %.2fGB alloc %.2fGB rsvd",
+                             step_index, dt, sigma.item(), alloc, rsvd)
+                else:
+                    log.debug("step %d: %.2fs (sigma=%.4f)", step_index, dt, sigma.item())
+                if dt > 10.0:
+                    log.warning("step %d took %.1fs — possible Dynamo recompilation", step_index, dt)
+                return denoised_video, denoised_audio
+
             return euler_denoising_loop(
                 sigmas=sigmas,
                 video_state=video_state,
                 audio_state=audio_state,
                 stepper=stepper_arg,
-                denoise_fn=multi_modal_guider_denoising_func(
-                    video_guider=MultiModalGuider(
-                        params=video_guider_params,
-                        negative_context=v_context_n,
-                    ),
-                    audio_guider=MultiModalGuider(
-                        params=audio_guider_params,
-                        negative_context=a_context_n,
-                    ),
-                    v_context=v_context_p,
-                    a_context=a_context_p,
-                    transformer=transformer,
-                ),
+                denoise_fn=denoise_step,
             )
 
         if two_stage:
