@@ -62,6 +62,12 @@ def audit_volume(volume_root: str) -> tuple[list[dict], list[dict], list[dict], 
         # Cache persistant — sans ce dossier, le warmup doit recharger Gemma 12B (~24GB RAM)
         os.path.join(volume_root, "cache", "embeddings"):
             "Cache embeddings persistant — NE PAS SUPPRIMER (warmup_embeddings.py, pipeline.py)",
+        # Cache Triton — resultats autotuning max-autotune-no-cudagraphs (~5-10 min cold start)
+        os.path.join(volume_root, "cache", "triton"):
+            "Cache Triton autotuning — NE PAS SUPPRIMER (torch.compile max-autotune, TRITON_CACHE_DIR)",
+        # Cache TorchInductor — graphes compiles persistants entre pods
+        os.path.join(volume_root, "cache", "inductor"):
+            "Cache TorchInductor — NE PAS SUPPRIMER (torch.compile, TORCHINDUCTOR_CACHE_DIR)",
     }
 
     # --- Dossiers DYNAMIQUES (generes au runtime, supprimables) ---
