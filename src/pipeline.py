@@ -29,11 +29,11 @@ warnings.filterwarnings("ignore", message=".*To copy construct from a tensor.*",
 from safetensors.torch import load_file as load_safetensors
 from safetensors.torch import save_file as save_safetensors
 
-from ltx_core.components.diffusion_steps import EulerDiffusionStep
+from ltx_core.components.diffusion_steps import EulerDiffusionStep, Res2sDiffusionStep
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.model.upsampler import upsample_video
-from ltx_core.model.video_vae import decode_video as vae_decode_video
+from ltx_core.model.video_vae import TilingConfig, decode_video as vae_decode_video
 
 from ltx_core.types import LatentState, VideoPixelShape
 from ltx_pipelines.utils import ModelLedger
@@ -66,9 +66,8 @@ class SageAttentionCallable:
     def __init__(self) -> None:
         from sageattention import sageattn
 
-        # compiler.disable : empeche Dynamo de tracer sageattn avec FakeTensors
-        # (sageattn utilise Triton/pybind11 incompatibles avec la shape inference)
-        self._sageattn = torch.compiler.disable(sageattn)
+        # SA 2.2.0+ : custom_op + register_fake permet torch.compile natif
+        self._sageattn = sageattn
         self._fallback = PytorchAttention()
 
     def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -359,13 +358,16 @@ class MedusaPipeline:
             except Exception as e:
                 log.warning("SageAttention init echoue, fallback SDPA: %s", e)
 
-        # torch.compile pour acceleration inference (8 steps/job)
-        # SageAttention utilise Triton/pybind11 incompatibles avec FakeTensors :
-        # compiler.disable cree des graph breaks → reduce-overhead capture des
-        # sous-graphes vides → mode=default requis quand SageAttention actif
+        # torch.compile — mode configurable via COMPILE_MODE (defaut: reduce-overhead)
+        # SA 2.2.0+ supporte torch.compile via custom_op (graph breaks mineurs au dispatch)
         if os.environ.get("TORCH_COMPILE", "1") == "1":
+            torch._dynamo.config.automatic_dynamic_shapes = True
             torch._dynamo.config.allow_unspec_int_on_nn_module = True
-            compile_mode = "default" if sage_active else "reduce-overhead"
+            compile_mode = os.environ.get("COMPILE_MODE", "reduce-overhead")
+            valid_modes = {"default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"}
+            if compile_mode not in valid_modes:
+                log.warning("COMPILE_MODE=%s invalide, fallback reduce-overhead", compile_mode)
+                compile_mode = "reduce-overhead"
             log.info("torch.compile transformer (mode=%s)...", compile_mode)
             self._transformer = torch.compile(
                 self._transformer,
@@ -453,7 +455,8 @@ class MedusaPipeline:
 
         # 3. Setup denoising
         noiser = GaussianNoiser(generator=generator)
-        stepper = EulerDiffusionStep()
+        use_res2s = os.environ.get("SAMPLER", "euler") == "res2s"
+        stepper = Res2sDiffusionStep() if use_res2s else EulerDiffusionStep()
 
         # 4. Image list
         images = [ImageConditioningInput(path=image_path, frame_idx=0, strength=image_strength)]
@@ -628,12 +631,13 @@ class MedusaPipeline:
                 device=self.device,
             )
 
-        # 7. VAE decode (sans tiling — H100 80GB)
-        log.info("VAE decode...")
+        # 7. VAE decode (tiling optionnel pour 1080p)
+        tiling = TilingConfig.default() if os.environ.get("VAE_TILING", "0") == "1" else None
+        log.info("VAE decode%s...", " (tiled)" if tiling else "")
         decoded_video: Iterator[torch.Tensor] = vae_decode_video(
             video_state.latent,
             self._video_decoder,
-            None,
+            tiling,
             generator,
         )
 
@@ -737,7 +741,8 @@ class MedusaPipeline:
         transformer = self.get_transformer()
 
         # 3. Setup
-        stepper = EulerDiffusionStep()
+        use_res2s = os.environ.get("SAMPLER", "euler") == "res2s"
+        stepper = Res2sDiffusionStep() if use_res2s else EulerDiffusionStep()
         generators = [
             torch.Generator(device=self.device).manual_seed(item["seed"])
             for item in items
@@ -955,7 +960,8 @@ class MedusaPipeline:
         all_frames: list[list[torch.Tensor]] = []
         for i in range(batch_size):
             latent_i = video_state.latent[i:i+1]
-            decoded = vae_decode_video(latent_i, self._video_decoder, None, generators[i])
+            tiling = TilingConfig.default() if os.environ.get("VAE_TILING", "0") == "1" else None
+            decoded = vae_decode_video(latent_i, self._video_decoder, tiling, generators[i])
             frames = [chunk.cpu() for chunk in decoded]
             all_frames.append(frames)
 

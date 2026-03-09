@@ -112,7 +112,7 @@ Objectif : generation rapide de videos a partir d'images, qualite correcte.
   - Meme transformer pour les 2 stages
 - **Eager init** : pipeline init complet AVANT `runpod.serverless.start()` — premier job sans cold start
 - **Download parallele** : `image` et `last_image` telecharges en parallele via ThreadPoolExecutor
-- **torch.compile** : `torch.compile(mode="reduce-overhead")` sur le transformer ET le video decoder (desactivable via `TORCH_COMPILE=0` et `VAE_COMPILE=0`)
+- **torch.compile** : `torch.compile(mode=COMPILE_MODE)` sur le transformer (defaut `reduce-overhead`, configurable) ET le video decoder (desactivable via `TORCH_COMPILE=0` et `VAE_COMPILE=0`). `automatic_dynamic_shapes` active pour reduire les recompilations Dynamo entre jobs de shapes differentes.
 - **Batching** : `generate_batch_frames()` traite N images en un seul forward transformer (batch=N). Per-item noise (seeds differents), image encoding individuel, VAE decode sequentiel. Configurable via `BATCH_SIZE` (defaut 2).
 - **Async post-processing** : MP4 encode + S3 upload en parallele du GPU via ThreadPoolExecutor(3)
 - **Pipeline overlapping** : prefetch des images du batch suivant pendant le denoising GPU
@@ -150,11 +150,11 @@ Objectif : generation rapide de videos a partir d'images, qualite correcte.
 3. Calcul resolution cible (aspect ratio preserve) : 720p align 32px (1-stage), 1080p align 64px (2-stage)
 4. `pipeline.generate_frames()` :
    - Embeddings depuis cache (preset) ou Gemma on-demand (custom)
-   - Setup : GaussianNoiser + EulerDiffusionStep, CFG=1.0, STG=0.0, audio disabled
+   - Setup : GaussianNoiser + stepper (Euler ou Res2s via `SAMPLER`), CFG=1.0, STG=0.0, audio disabled
    - Image → latent via video_encoder
    - **720p** : denoise 8 steps (DISTILLED_SIGMA_VALUES)
    - **1080p** : Stage 1 denoise ~540p 8 steps → upsample_video() x2 latent → Stage 2 refine ~1080p 3 steps (simple_denoising)
-   - VAE decode (sans tiling) → frames CPU
+   - VAE decode (tiling optionnel via `VAE_TILING`) → frames CPU
 5. Post-processing async (thread pool) : encode_video() → H264 MP4 + sauvegarde volume + upload S3 + dedup cache
 
 ### Batch multi-images
@@ -192,9 +192,11 @@ Objectif : generation rapide de videos a partir d'images, qualite correcte.
 - `start.sh` valide les fichiers `.safetensors` existants via `safe_open()` avant de skip le telechargement (detecte les fichiers corrompus/partiels)
 - S3 env vars : `S3_BUCKET`, `S3_ENDPOINT_URL` (defaut OVH SBG), `S3_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
 - `SAGE_ATTENTION=1` (defaut) : active SageAttention2++ sur le transformer. `0` pour rollback complet vers SDPA
-- `SAGE_COMPILE_DISABLE=0` (defaut) : `1` wrappe sageattn dans `torch.compiler.disable` si CUDA graphs posent probleme
-- `TORCH_COMPILE=1` (defaut) : torch.compile(reduce-overhead) sur le transformer. `0` pour desactiver
+- `TORCH_COMPILE=1` (defaut) : torch.compile sur le transformer. `0` pour desactiver
+- `COMPILE_MODE=reduce-overhead` (defaut) : mode torch.compile. Valeurs : `default`, `reduce-overhead`, `max-autotune`, `max-autotune-no-cudagraphs`
 - `VAE_COMPILE=1` (defaut) : torch.compile(reduce-overhead) sur le video decoder. `0` pour desactiver
 - `TRANSFORMER_CACHE=1` (defaut) : cache transformer pre-fusionne. `0` pour desactiver
+- `SAMPLER=euler` (defaut) : stepper de denoising. `res2s` pour Res2sDiffusionStep (second ordre)
+- `VAE_TILING=0` (defaut) : `1` pour activer le tiled VAE decode (reduit VRAM en 1080p, risque ghosting temporal)
 - `BATCH_SIZE=2` (defaut) : taille max du sous-batch pour le denoising transformer en batch mode
 - Le checkpoint FP8 scaled (`ltx-2.3-22b-dev-fp8.safetensors`) est INCOMPATIBLE avec la fusion LoRA dans ltx-core — utiliser le checkpoint distilled BF16 avec `fp8_cast()` a la place

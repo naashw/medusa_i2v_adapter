@@ -62,8 +62,10 @@ RUN rm -rf /tmp/LTX-2
 ENV TORCH_CUDA_ARCH_LIST="9.0"
 
 # --- SageAttention 2++ from source (attention optimisee H100) ---
-RUN git clone --depth 1 https://github.com/thu-ml/SageAttention /tmp/sageattention && \
+# Pin au commit d1a57a5 (2026-01-17) — post-fix SM90 (issue #320), torch.compile support
+RUN git clone --filter=blob:none https://github.com/thu-ml/SageAttention /tmp/sageattention && \
     cd /tmp/sageattention && \
+    git checkout d1a57a5 && \
     MAX_JOBS=2 pip install --no-build-isolation -v . && \
     rm -rf /tmp/sageattention
 
