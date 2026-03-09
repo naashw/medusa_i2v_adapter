@@ -66,8 +66,9 @@ class SageAttentionCallable:
     def __init__(self) -> None:
         from sageattention import sageattn
 
-        # SA 2.2.0+ : custom_op + register_fake permet torch.compile natif
-        self._sageattn = sageattn
+        # compiler.disable : empeche Dynamo de tracer les extensions pybind11 de sageattn
+        # (transpose_pad_permute_cuda, scale_fuse_quant_cuda incompatibles avec FakeTensors)
+        self._sageattn = torch.compiler.disable(sageattn)
         self._fallback = PytorchAttention()
 
     def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -358,17 +359,22 @@ class MedusaPipeline:
             except Exception as e:
                 log.warning("SageAttention init echoue, fallback SDPA: %s", e)
 
-        # torch.compile — mode configurable via COMPILE_MODE (defaut: reduce-overhead)
-        # SA 2.2.0+ supporte torch.compile via custom_op (graph breaks mineurs au dispatch)
+        # torch.compile — mode configurable via COMPILE_MODE
+        # compiler.disable(sageattn) cree des graph breaks → reduce-overhead capture
+        # des sous-graphes vides → mode=default requis quand SageAttention actif.
+        # COMPILE_MODE s'applique uniquement quand SA est desactive (SDPA, pas de graph breaks).
         if os.environ.get("TORCH_COMPILE", "1") == "1":
             torch._dynamo.config.automatic_dynamic_shapes = True
             torch._dynamo.config.allow_unspec_int_on_nn_module = True
-            compile_mode = os.environ.get("COMPILE_MODE", "reduce-overhead")
-            valid_modes = {"default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"}
-            if compile_mode not in valid_modes:
-                log.warning("COMPILE_MODE=%s invalide, fallback reduce-overhead", compile_mode)
-                compile_mode = "reduce-overhead"
-            log.info("torch.compile transformer (mode=%s)...", compile_mode)
+            if sage_active:
+                compile_mode = "default"
+            else:
+                compile_mode = os.environ.get("COMPILE_MODE", "reduce-overhead")
+                valid_modes = {"default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"}
+                if compile_mode not in valid_modes:
+                    log.warning("COMPILE_MODE=%s invalide, fallback reduce-overhead", compile_mode)
+                    compile_mode = "reduce-overhead"
+            log.info("torch.compile transformer (mode=%s, sage=%s)...", compile_mode, sage_active)
             self._transformer = torch.compile(
                 self._transformer,
                 mode=compile_mode,

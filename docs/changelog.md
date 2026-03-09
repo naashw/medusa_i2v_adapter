@@ -9,8 +9,8 @@ Aucun. Tous les defauts sont retro-compatibles.
 ### Corrections
 
 - **SageAttention pin commit `d1a57a5`** — Dockerfile utilise `--filter=blob:none` + `git checkout d1a57a5` au lieu de `--depth 1`. Ce commit inclut le fix SM90 (issue #320) et le support `custom_op + register_fake` pour torch.compile natif.
-- **Suppression `torch.compiler.disable(sageattn)`** — SA 2.2.0+ gere nativement torch.compile via `custom_op`. Le wrapper `compiler.disable` qui forcait des graph breaks (et imposait `mode="default"`) est supprime.
-- **Restauration `reduce-overhead`** — Le mode torch.compile n'est plus conditionne par SageAttention. `reduce-overhead` est le defaut pour tous les cas.
+- **`torch.compiler.disable(sageattn)` conserve** — Les extensions pybind11 de SA (`transpose_pad_permute_cuda`, `scale_fuse_quant_cuda`) restent opaques a Dynamo. `compiler.disable` est requis pour eviter les FakeTensors crashes. `mode=default` quand SA actif (graph breaks → CUDA graphs vides avec `reduce-overhead`).
+- **`COMPILE_MODE` env var** — Configurable quand SA desactive (`SAGE_ATTENTION=0`). Quand SA actif, force `mode=default`.
 
 ### Ajouts
 
