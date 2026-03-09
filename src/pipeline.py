@@ -52,6 +52,7 @@ from ltx_pipelines.utils.samplers import euler_denoising_loop
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.types import PipelineComponents
 from ltx_core.model.transformer.attention import Attention, PytorchAttention
+from ltx_core.quantization import QuantizationPolicy
 
 from prompts import CAMERA_PRESETS, DEFAULT_NEGATIVE_PROMPT
 
@@ -89,7 +90,7 @@ class SageAttentionCallable:
 DISTILLED_LORA_STRENGTH = 0.7
 
 # Version du cache transformer (incrementer pour invalider tous les caches existants)
-CACHE_VERSION = "v2"
+CACHE_VERSION = "v3"
 
 
 class MedusaPipeline:
@@ -315,6 +316,7 @@ class MedusaPipeline:
             device=self.device,
             checkpoint_path=cache_path,
             loras=[],
+            quantization=QuantizationPolicy.fp8_cast(),
         )
         transformer = ledger.transformer()
         del ledger
@@ -352,6 +354,7 @@ class MedusaPipeline:
                 device=self.device,
                 checkpoint_path=self._checkpoint_path,
                 loras=self._base_loras,
+                quantization=QuantizationPolicy.fp8_cast(),
             )
             self._transformer = ledger.transformer()
             del ledger

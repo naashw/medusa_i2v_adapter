@@ -32,6 +32,7 @@ from PIL import Image
 from ltx_pipelines.utils.media_io import encode_video
 
 from pipeline import MedusaPipeline
+from prompts import CAMERA_PRESETS
 
 logging.basicConfig(level=logging.INFO, format="[handler] %(message)s")
 log = logging.getLogger("handler")
@@ -45,16 +46,6 @@ VOLUME_ROOT = os.environ.get("VOLUME_ROOT", "/runpod-volume")
 MODELS_DIR = os.environ.get("MODELS_DIR", "/runpod-volume/models")
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "2"))
 
-# Presets camera_motion (preset connu → description pour le prompt)
-CAMERA_PRESETS: dict[str, str] = {
-    "dolly-in": "The camera slowly moves forward into the scene",
-    "dolly-out": "The camera slowly pulls back from the scene",
-    "dolly-left": "The camera smoothly translates to the left",
-    "dolly-right": "The camera smoothly translates to the right",
-    "jib-up": "The camera rises vertically",
-    "jib-down": "The camera descends vertically",
-    "static": "Static camera, no movement",
-}
 
 # --- S3 ---
 
@@ -108,12 +99,6 @@ def upload_to_s3(filepath: str, s3_key: str) -> str | None:
         log.warning("S3 upload echoue: %s", e)
         return None
 
-
-DEFAULT_NEGATIVE_PROMPT = (
-    "blurry, out of focus, low quality, distorted, watermark, "
-    "logo, text, subtitle, banner, signature, username, "
-    "compressed artifacts, jpeg artifacts, noise, grainy"
-)
 
 
 # --- Utilitaires ---
