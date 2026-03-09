@@ -256,7 +256,6 @@ def postprocess_and_upload(
         video=iter(frames),
         fps=frame_rate,
         audio=None,
-        audio_sample_rate=None,
         output_path=output_path,
         video_chunks_number=1,
     )

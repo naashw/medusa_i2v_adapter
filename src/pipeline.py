@@ -678,7 +678,6 @@ class MedusaPipeline:
             video=iter(frames),
             fps=int(frame_rate),
             audio=None,
-            audio_sample_rate=None,
             output_path=output_path,
             video_chunks_number=1,
         )
