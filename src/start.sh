@@ -246,10 +246,10 @@ fi
 echo "[medusa] Tous les modeles sont prets."
 
 # -----------------------------------------------
-# 4b. Audit volume (dry-run, log fichiers inutilises)
+# 4b. Audit volume (dry-run, log fichiers inutilises) — desactive (lent sur NFS)
 # -----------------------------------------------
-echo "[medusa] Audit volume (dry-run)..."
-python /app/audit_volume.py --volume "$WORKSPACE" || echo "[medusa] Audit volume echoue (non bloquant)"
+# echo "[medusa] Audit volume (dry-run)..."
+# python /app/audit_volume.py --volume "$WORKSPACE" || echo "[medusa] Audit volume echoue (non bloquant)"
 
 # -----------------------------------------------
 # 5. Demarrage
