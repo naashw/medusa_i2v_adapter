@@ -153,6 +153,8 @@ mkdir -p "${MODELS_DIR}/text_encoders"
 mkdir -p "${MODELS_DIR}/loras"
 mkdir -p "${MODELS_DIR}/upscalers"
 mkdir -p "${WORKSPACE}/cache/transformer"
+mkdir -p "${WORKSPACE}/cache/triton"
+mkdir -p "${WORKSPACE}/cache/inductor"
 
 # Exporter pour handler.py
 export MODELS_DIR="$MODELS_DIR"
@@ -269,6 +271,10 @@ if [ "${SERVERLESS:-}" = "true" ] || [ -n "${RUNPOD_ENDPOINT_ID:-}" ]; then
     echo "[medusa] Warmup embeddings (process isole)..."
     LD_PRELOAD="" python /app/warmup_embeddings.py
     echo "[medusa] Warmup termine, lancement handler..."
+
+    # Cache Triton/TorchInductor persistant sur le volume (autotuning reutilise entre runs)
+    export TRITON_CACHE_DIR="${WORKSPACE}/cache/triton"
+    export TORCHINDUCTOR_CACHE_DIR="${WORKSPACE}/cache/inductor"
 
     exec env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python /app/handler.py
 

@@ -1,5 +1,33 @@
 # Changelog — Medusa I2V
 
+## 2026-03-09 — PyTorch 2.9 + SageAttention 2.2.0 + max-autotune + cache Triton
+
+### Upgrade majeur
+
+- **PyTorch `>=2.9`** — Support `torch.compile(dynamic=True)` + custom_op SA 2.2
+- **SageAttention `>=2.2.0` via pip** — Plus de build from source, plus de pin commit `d1a57a5`. `@torch.library.custom_op` natif → zero graph breaks
+- **`compiler.disable(sageattn)` supprime** — SA 2.2.0 custom_op rend ce workaround inutile
+- **`torch.compile(dynamic=True)`** sur transformer ET VAE decoder — evite les recompilations Dynamo entre stage 1 (half-res) et stage 2 (full-res)
+- **Dynamo config** : `cache_size_limit=32`, `recompile_limit=16`, `automatic_dynamic_shapes=True`
+- **`mode=max-autotune-no-cudagraphs`** quand SA actif (remplace `default`) — autotuning Triton (selection optimale des configs kernel) sans CUDA graphs (incompatibles avec kernels SA). Premiere execution lente (~5-10 min autotuning), runs suivants rapides via cache
+- **Cache Triton + TorchInductor persistant** sur volume (`TRITON_CACHE_DIR`, `TORCHINDUCTOR_CACHE_DIR` → `/runpod-volume/cache/triton/` et `/runpod-volume/cache/inductor/`)
+
+### Fichiers modifies
+
+| Fichier | Modifications |
+|---------|---------------|
+| `Dockerfile` | PyTorch >=2.9, SageAttention >=2.2.0 pip |
+| `src/pipeline.py` | dynamic=True, max-autotune-no-cudagraphs, suppression compiler.disable |
+| `src/start.sh` | mkdir cache/triton + cache/inductor, export TRITON_CACHE_DIR + TORCHINDUCTOR_CACHE_DIR |
+| `CLAUDE.md` | Mise a jour mode compile + env vars cache |
+
+### Rollback
+
+- `COMPILE_MODE=default` → retour au mode sans autotuning
+- `SAGE_ATTENTION=0` → rollback complet vers SDPA (+ `COMPILE_MODE=reduce-overhead`)
+
+---
+
 ## 2026-03-09 — Optimisations torch.compile + SageAttention + env vars
 
 ### Breaking changes

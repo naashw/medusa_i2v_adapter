@@ -37,10 +37,10 @@ ENV PATH="/opt/venv/bin:$PATH" \
     VIRTUAL_ENV="/opt/venv"
 
 # --- PyTorch stable (CUDA 12.8) ---
-# Pin >=2.7.1,<3 : support CUDA 12.8, compatible ltx-core ~=2.7
+# Pin >=2.9,<3 : support torch.compile dynamic + custom_op SA 2.2
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir \
-        "torch>=2.7.1,<3" torchvision torchaudio \
+        "torch>=2.9,<3" torchvision torchaudio \
         --index-url https://download.pytorch.org/whl/cu128 \
         --extra-index-url https://pypi.org/simple/
 
@@ -61,13 +61,8 @@ RUN rm -rf /tmp/LTX-2
 # H100 sm_90 pour kernels SageAttention CUDA/Triton
 ENV TORCH_CUDA_ARCH_LIST="9.0"
 
-# --- SageAttention 2++ from source (attention optimisee H100) ---
-# Pin au commit d1a57a5 (2026-01-17) — post-fix SM90 (issue #320), torch.compile support
-RUN git clone --filter=blob:none https://github.com/thu-ml/SageAttention /tmp/sageattention && \
-    cd /tmp/sageattention && \
-    git checkout d1a57a5 && \
-    MAX_JOBS=2 pip install --no-build-isolation -v . && \
-    rm -rf /tmp/sageattention
+# --- SageAttention 2.2.0 (torch.compile natif, zero graph breaks) ---
+RUN pip install --no-build-isolation --no-cache-dir "sageattention>=2.2.0,<3"
 
 # --- Runtime Python dependencies (runpod, requests, etc.) ---
 COPY requirements.txt /tmp/requirements.txt

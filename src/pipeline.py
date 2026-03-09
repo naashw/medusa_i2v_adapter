@@ -67,9 +67,8 @@ class SageAttentionCallable:
     def __init__(self) -> None:
         from sageattention import sageattn
 
-        # compiler.disable : empeche Dynamo de tracer les extensions pybind11 de sageattn
-        # (transpose_pad_permute_cuda, scale_fuse_quant_cuda incompatibles avec FakeTensors)
-        self._sageattn = torch.compiler.disable(sageattn)
+        # SA 2.2.0 : custom_op natif, plus besoin de compiler.disable
+        self._sageattn = sageattn
         self._fallback = PytorchAttention()
 
     def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -198,9 +197,9 @@ class MedusaPipeline:
         log.info("Chargement video decoder (persistent)...")
         self._video_decoder = self._base_ledger.video_decoder()
         if os.environ.get("VAE_COMPILE", "1") == "1":
-            log.info("torch.compile video decoder (mode=default)...")
+            log.info("torch.compile video decoder (mode=default, dynamic=True)...")
             self._video_decoder = torch.compile(
-                self._video_decoder, mode="default", fullgraph=False,
+                self._video_decoder, mode="default", fullgraph=False, dynamic=True,
             )
         self._log_vram("apres video decoder")
 
@@ -360,26 +359,29 @@ class MedusaPipeline:
             except Exception as e:
                 log.warning("SageAttention init echoue, fallback SDPA: %s", e)
 
-        # torch.compile — mode configurable via COMPILE_MODE
-        # compiler.disable(sageattn) cree des graph breaks → reduce-overhead capture
-        # des sous-graphes vides → mode=default requis quand SageAttention actif.
-        # COMPILE_MODE s'applique uniquement quand SA est desactive (SDPA, pas de graph breaks).
+        # torch.compile — dynamic=True pour eviter les recompilations entre stages
+        # SA 2.2.0 : custom_op natif (zero graph breaks), CUDA graphs incompatibles
+        # avec kernels SA → max-autotune-no-cudagraphs pour autotuning Triton sans
+        # CUDA graphs. Cache Triton/Inductor persistant sur volume pour reutiliser.
         if os.environ.get("TORCH_COMPILE", "1") == "1":
             torch._dynamo.config.automatic_dynamic_shapes = True
             torch._dynamo.config.allow_unspec_int_on_nn_module = True
+            torch._dynamo.config.cache_size_limit = 32
+            torch._dynamo.config.recompile_limit = 16
             if sage_active:
-                compile_mode = "default"
+                compile_mode = "max-autotune-no-cudagraphs"
             else:
                 compile_mode = os.environ.get("COMPILE_MODE", "reduce-overhead")
                 valid_modes = {"default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"}
                 if compile_mode not in valid_modes:
                     log.warning("COMPILE_MODE=%s invalide, fallback reduce-overhead", compile_mode)
                     compile_mode = "reduce-overhead"
-            log.info("torch.compile transformer (mode=%s, sage=%s)...", compile_mode, sage_active)
+            log.info("torch.compile transformer (mode=%s, sage=%s, dynamic=True)...", compile_mode, sage_active)
             self._transformer = torch.compile(
                 self._transformer,
                 mode=compile_mode,
                 fullgraph=False,
+                dynamic=True,
             )
 
         self._log_vram("apres base transformer")
