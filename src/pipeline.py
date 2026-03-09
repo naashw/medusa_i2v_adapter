@@ -66,14 +66,9 @@ class SageAttentionCallable:
     def __init__(self) -> None:
         from sageattention import sageattn
 
-        # Leaf node pour Dynamo : ne trace pas les ops pybind11 internes,
-        # permet aux CUDA graphs (reduce-overhead) de capturer sageattn
-        torch.compiler.allow_in_graph(sageattn)
-
-        if os.environ.get("SAGE_COMPILE_DISABLE", "0") == "1":
-            self._sageattn = torch.compiler.disable(sageattn)
-        else:
-            self._sageattn = sageattn
+        # compiler.disable : empeche Dynamo de tracer sageattn avec FakeTensors
+        # (sageattn utilise Triton/pybind11 incompatibles avec la shape inference)
+        self._sageattn = torch.compiler.disable(sageattn)
         self._fallback = PytorchAttention()
 
     def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -353,24 +348,28 @@ class MedusaPipeline:
                 self._save_transformer_cache(cache_path)
 
         # SageAttention2++ (remplace SDPA sur les modules Attention du transformer)
+        sage_active = False
         if os.environ.get("SAGE_ATTENTION", "1") == "1":
             try:
                 patched = self._patch_sage_attention(self._transformer)
                 log.info("SageAttention2++ active: %d modules patches", patched)
+                sage_active = patched > 0
             except ImportError:
                 log.warning("SageAttention non installe, fallback SDPA")
             except Exception as e:
                 log.warning("SageAttention init echoue, fallback SDPA: %s", e)
 
         # torch.compile pour acceleration inference (8 steps/job)
-        # reduce-overhead = CUDA graphs, allow_in_graph(sageattn) evite que
-        # Dynamo trace les ops pybind11 internes de SageAttention
+        # SageAttention utilise Triton/pybind11 incompatibles avec FakeTensors :
+        # compiler.disable cree des graph breaks → reduce-overhead capture des
+        # sous-graphes vides → mode=default requis quand SageAttention actif
         if os.environ.get("TORCH_COMPILE", "1") == "1":
             torch._dynamo.config.allow_unspec_int_on_nn_module = True
-            log.info("torch.compile transformer (mode=reduce-overhead)...")
+            compile_mode = "default" if sage_active else "reduce-overhead"
+            log.info("torch.compile transformer (mode=%s)...", compile_mode)
             self._transformer = torch.compile(
                 self._transformer,
-                mode="reduce-overhead",
+                mode=compile_mode,
                 fullgraph=False,
             )
 
