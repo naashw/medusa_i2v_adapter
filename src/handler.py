@@ -12,7 +12,6 @@ Reprend les fonctionnalites cles de handler_wrapper.py :
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import logging
 import math
@@ -44,7 +43,7 @@ OUTPUT_VOLUME_DIR = os.environ.get("OUTPUT_VOLUME_DIR", "/runpod-volume/output")
 CACHE_DIR = os.environ.get("CACHE_DIR", "/runpod-volume/cache")
 VOLUME_ROOT = os.environ.get("VOLUME_ROOT", "/runpod-volume")
 MODELS_DIR = os.environ.get("MODELS_DIR", "/runpod-volume/models")
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "5"))
+MAX_BATCH = int(os.environ.get("MAX_BATCH", "5"))
 
 
 # --- S3 ---
@@ -162,53 +161,6 @@ def compute_target_resolution(
     return FIXED_RESOLUTIONS[resolution]
 
 
-def compute_input_hash(job_input: dict) -> str:
-    """Hash deterministe de l'input pour dedup."""
-    raw = json.dumps(job_input, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
-
-
-def lookup_cache(input_hash: str) -> list[dict] | None:
-    """Cherche des outputs existants dans le cache volume pour ce hash."""
-    cache_path = os.path.join(CACHE_DIR, "dedup", input_hash)
-    if not os.path.isdir(cache_path):
-        return None
-
-    files = [
-        f for f in os.listdir(cache_path)
-        if os.path.isfile(os.path.join(cache_path, f))
-    ]
-    if not files:
-        return None
-
-    outputs = []
-    for filename in files:
-        filepath = os.path.join(cache_path, filename)
-        ext = os.path.splitext(filename)[1].lower()
-        file_type = "video" if ext in VIDEO_EXTENSIONS else "image"
-        size_mb = os.path.getsize(filepath) / (1024 * 1024)
-        s3_key = f"generated/videos/{filename}"
-        s3_url = upload_to_s3(filepath, s3_key)
-        entry = {
-            "filename": filename,
-            "content_type": file_type,
-            "size_mb": round(size_mb, 2),
-            "volume_path": filepath,
-            "s3_key": s3_key,
-        }
-        if s3_url:
-            entry["s3_url"] = s3_url
-        outputs.append(entry)
-    return outputs
-
-
-def save_to_cache(input_hash: str, source_file: str) -> None:
-    """Copie l'output dans le cache volume indexe par hash."""
-    cache_path = os.path.join(CACHE_DIR, "dedup", input_hash)
-    os.makedirs(cache_path, exist_ok=True)
-    filename = os.path.basename(source_file)
-    shutil.copy2(source_file, os.path.join(cache_path, filename))
-
 
 def collect_output(source_file: str, job_id: str) -> dict:
     """Copie l'output sur le volume et retourne les metadonnees."""
@@ -250,9 +202,8 @@ def postprocess_and_upload(
     output_dir: str,
     output_filename: str,
     job_id: str,
-    input_hash: str,
 ) -> dict:
-    """Encode MP4 + copie volume + S3 upload + cache dedup (thread pool worker)."""
+    """Encode MP4 + copie volume + S3 upload (thread pool worker)."""
     output_path = os.path.join(output_dir, output_filename)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -266,8 +217,6 @@ def postprocess_and_upload(
     log.info("MP4 encode: %s", output_filename)
 
     output_meta = collect_output(output_path, job_id)
-    save_to_cache(input_hash, output_path)
-    log.info("Cache sauvegarde (%s)", input_hash)
 
     # Cleanup temp dir
     shutil.rmtree(output_dir, ignore_errors=True)
@@ -369,13 +318,6 @@ def handler(job: dict) -> dict:
 
     log.info("Job %s — input: %s", job_id, json.dumps(job_input, default=str))
 
-    # --- Dedup cache EN PREMIER (filesystem only, pas besoin du pipeline) ---
-    input_hash = compute_input_hash(job_input)
-    cached = lookup_cache(input_hash)
-    if cached:
-        log.info("Cache hit (%s) - %d fichier(s), skip execution", input_hash, len(cached))
-        return {"images": cached, "cached": True}
-
     # --- Normalize input (3 formats → liste uniforme) ---
     normalized, error = normalize_items(job_input)
     if error:
@@ -447,60 +389,52 @@ def handler(job: dict) -> dict:
 
         for prompt_text, group_items in groups.items():
             sub_batches = [
-                group_items[i:i + BATCH_SIZE]
-                for i in range(0, len(group_items), BATCH_SIZE)
+                group_items[i:i + MAX_BATCH]
+                for i in range(0, len(group_items), MAX_BATCH)
             ]
 
             for batch_idx, sub_batch in enumerate(sub_batches):
                 start_time = time.time()
 
-                if len(sub_batch) == 1:
-                    # Single item → generate_frames (supporte negative_override)
-                    item = sub_batch[0]
-                    frames = pipeline.generate_frames(
-                        image_path=item["_image_path"],
-                        prompt=prompt_text,
-                        seed=item["seed"],
-                        height=height,
-                        width=width,
-                        num_frames=num_frames,
-                        frame_rate=frame_rate,
-                        image_strength=image_strength,
-                        last_image_path=item.get("_last_image_path"),
-                        last_image_strength=item.get("last_image_strength", 1.0),
-                        negative_override=negative_override,
-                        two_stage=two_stage,
-                    )
-                    batch_frames_list = [frames]
+                # Padding : toujours envoyer MAX_BATCH items au transformer pour eviter
+                # les recompilations Dynamo (shape fixe dans le compile cache)
+                real_count = len(sub_batch)
+                if real_count < MAX_BATCH:
+                    sub_batch_padded = sub_batch + [sub_batch[-1]] * (MAX_BATCH - real_count)
                 else:
-                    # Multi items → generate_batch_frames (batch homogene)
-                    pipeline_items = []
-                    for item in sub_batch:
-                        pi: dict = {"image_path": item["_image_path"], "seed": item["seed"]}
-                        if item.get("_last_image_path"):
-                            pi["last_image_path"] = item["_last_image_path"]
-                            pi["last_image_strength"] = item.get("last_image_strength", 1.0)
-                        pipeline_items.append(pi)
+                    sub_batch_padded = sub_batch
 
-                    batch_frames_list = pipeline.generate_batch_frames(
-                        items=pipeline_items,
-                        prompt=prompt_text,
-                        height=height,
-                        width=width,
-                        num_frames=num_frames,
-                        frame_rate=frame_rate,
-                        image_strength=image_strength,
-                        two_stage=two_stage,
-                    )
+                pipeline_items = []
+                for item in sub_batch_padded:
+                    pi: dict = {"image_path": item["_image_path"], "seed": item["seed"]}
+                    if item.get("_last_image_path"):
+                        pi["last_image_path"] = item["_last_image_path"]
+                        pi["last_image_strength"] = item.get("last_image_strength", 1.0)
+                    pipeline_items.append(pi)
+
+                batch_frames_list = pipeline.generate_batch_frames(
+                    items=pipeline_items,
+                    prompt=prompt_text,
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    frame_rate=frame_rate,
+                    image_strength=image_strength,
+                    two_stage=two_stage,
+                )
+
+                # Trim — garder uniquement les resultats reels (ignore les frames padding)
+                batch_frames_list = batch_frames_list[:real_count]
 
                 elapsed = time.time() - start_time
                 log.info(
-                    "Groupe '%s' sub-batch %d/%d: %.1fs (%d item(s))",
-                    prompt_text[:30], batch_idx + 1, len(sub_batches), elapsed, len(sub_batch),
+                    "Groupe '%s' sub-batch %d/%d: %.1fs (%d item(s), %d padded)",
+                    prompt_text[:30], batch_idx + 1, len(sub_batches), elapsed,
+                    real_count, MAX_BATCH - real_count,
                 )
 
                 # --- Post-processing async par item ---
-                for item, item_frames in zip(sub_batch, batch_frames_list):
+                for item, item_frames in zip(sub_batch[:real_count], batch_frames_list):
                     orig_idx = item["_original_index"]
                     output_dir = tempfile.mkdtemp(prefix="medusa_")
 
@@ -516,7 +450,7 @@ def handler(job: dict) -> dict:
                         postprocess_and_upload,
                         item_frames, int(frame_rate),
                         output_dir, output_filename,
-                        job_id, input_hash,
+                        job_id,
                     )
                     results_by_index[orig_idx] = (fut, item.get("id"))
 

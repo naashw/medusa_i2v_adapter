@@ -976,22 +976,17 @@ class MedusaPipeline:
             batched_video = vtools.clear_conditioning(batched_video)
             video_state = vtools.unpatchify(batched_video)
 
-        # VAE decode en sub-batches
+        # VAE decode sequentiel par item (vae_decode_video ne supporte pas le batching)
         torch.cuda.empty_cache()
-        vae_bs = int(os.environ.get("BATCH_SIZE", "5"))
         tiling = TilingConfig.default() if os.environ.get("VAE_TILING", "0") == "1" else None
-        log.info("Batch VAE decode (%d items, vae_batch=%d)...", batch_size, vae_bs)
+        log.info("Batch VAE decode (%d items, sequentiel)...", batch_size)
         all_frames: list[list[torch.Tensor]] = []
-        for sb_start in range(0, batch_size, vae_bs):
-            sb_end = min(sb_start + vae_bs, batch_size)
-            sb_size = sb_end - sb_start
-            sb_latent = video_state.latent[sb_start:sb_end]
-            decoded = vae_decode_video(sb_latent, self._video_decoder, tiling, generators[sb_start])
-            chunks = list(decoded)
-            for i in range(sb_size):
-                item_frames = [chunk[i:i+1].cpu() for chunk in chunks]
-                all_frames.append(item_frames)
-            if sb_end < batch_size:
+        for i in range(batch_size):
+            item_latent = video_state.latent[i:i+1]
+            decoded = vae_decode_video(item_latent, self._video_decoder, tiling, generators[i])
+            item_frames = [chunk.cpu() for chunk in decoded]
+            all_frames.append(item_frames)
+            if i < batch_size - 1:
                 torch.cuda.empty_cache()
 
         log.info("Batch frames generees: %d items", len(all_frames))
