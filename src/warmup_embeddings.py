@@ -157,9 +157,9 @@ def build_encoder_and_processor(checkpoint_path: str, gemma_root: str) -> tuple:
         len(unexpected),
     )
 
-    # 8. Deplacer embeddings processor vers device
+    # 8. Deplacer embeddings processor vers device (bfloat16 pour matcher Gemma)
+    emb_proc = emb_proc.to(device=device, dtype=torch.bfloat16)
     if device == "cuda":
-        emb_proc = emb_proc.to(device)
         log.info("Embeddings processor deplace vers %s. VRAM: %s", device, vram_gb())
 
     return te, emb_proc
