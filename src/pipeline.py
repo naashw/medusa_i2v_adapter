@@ -67,7 +67,6 @@ class SageAttentionCallable:
     def __init__(self) -> None:
         from sageattention import sageattn
 
-        # SA 2.2.0 : custom_op natif, plus besoin de compiler.disable
         self._sageattn = sageattn
         self._fallback = PytorchAttention()
 
@@ -360,15 +359,14 @@ class MedusaPipeline:
                 log.warning("SageAttention init echoue, fallback SDPA: %s", e)
 
         # torch.compile — dynamic=True pour eviter les recompilations entre stages
-        # SA 2.2.0 : custom_op natif (zero graph breaks), CUDA graphs incompatibles
-        # avec kernels SA → mode=default (compile rapide, pas de CUDA graphs).
+        # SA incompatible CUDA graphs → max-autotune-no-cudagraphs (autotuning Triton sans CUDA graphs).
         if os.environ.get("TORCH_COMPILE", "1") == "1":
             torch._dynamo.config.automatic_dynamic_shapes = True
             torch._dynamo.config.allow_unspec_int_on_nn_module = True
             torch._dynamo.config.cache_size_limit = 32
             torch._dynamo.config.recompile_limit = 16
             if sage_active:
-                compile_mode = "default"
+                compile_mode = "max-autotune-no-cudagraphs"
             else:
                 compile_mode = os.environ.get("COMPILE_MODE", "reduce-overhead")
                 valid_modes = {"default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"}

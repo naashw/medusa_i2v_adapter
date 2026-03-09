@@ -43,7 +43,7 @@ OUTPUT_VOLUME_DIR = os.environ.get("OUTPUT_VOLUME_DIR", "/runpod-volume/output")
 CACHE_DIR = os.environ.get("CACHE_DIR", "/runpod-volume/cache")
 VOLUME_ROOT = os.environ.get("VOLUME_ROOT", "/runpod-volume")
 MODELS_DIR = os.environ.get("MODELS_DIR", "/runpod-volume/models")
-MAX_BATCH = int(os.environ.get("MAX_BATCH", "5"))
+MAX_BATCH = int(os.environ.get("MAX_BATCH", "3"))
 
 
 # --- S3 ---
