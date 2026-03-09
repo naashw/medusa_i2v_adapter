@@ -274,20 +274,76 @@ def postprocess_and_upload(
     return output_meta
 
 
-# --- Prefetch pool (download images pendant que le GPU travaille) ---
-
-prefetch_pool = ThreadPoolExecutor(max_workers=max(BATCH_SIZE, 2))
+# --- Normalisation input ---
 
 
-def resolve_and_preprocess(
-    image_data: str,
-    resolution: str = "720p",
-    dynamic: bool = False,
-) -> tuple[str, int, int]:
-    """Download + resolve image + compute target resolution (thread prefetch)."""
-    tmp_path = resolve_image(image_data)
-    height, width = compute_target_resolution(resolution=resolution, image_path=tmp_path, dynamic=dynamic)
-    return tmp_path, height, width
+def normalize_items(job_input: dict) -> tuple[list[dict], str | None]:
+    """Normalize 3 formats d'input (items[], images[], image) en liste uniforme.
+
+    Returns (items, error_message). error_message is None on success.
+    Chaque item normalise: id, image, camera_motion, seed, last_image,
+    last_image_strength, _original_index.
+    """
+    raw_items = job_input.get("items")
+    raw_images = job_input.get("images")
+    raw_image = job_input.get("image")
+
+    shared_camera = job_input.get("camera_motion", job_input.get("camera", "static"))
+    shared_seed = job_input.get("seed")
+    shared_last_image = job_input.get("last_image")
+    shared_last_image_strength = job_input.get("last_image_strength", 1.0)
+
+    if raw_items:
+        # Format items[] — per-item params
+        items = []
+        for i, raw in enumerate(raw_items):
+            if not isinstance(raw, dict):
+                return [], f"items[{i}] doit etre un objet"
+            image = raw.get("image")
+            if not image:
+                return [], f"items[{i}].image est requis"
+            items.append({
+                "id": raw.get("id"),
+                "image": image,
+                "camera_motion": raw.get("camera_motion", raw.get("camera", shared_camera)),
+                "seed": raw.get("seed", random.randint(0, 2**32 - 1)),
+                "last_image": raw.get("last_image"),
+                "last_image_strength": raw.get("last_image_strength", shared_last_image_strength),
+                "_original_index": i,
+            })
+        return items, None
+
+    elif raw_images:
+        # Format images[] — params partages du top-level
+        base_seed = shared_seed if shared_seed is not None else random.randint(0, 2**32 - 1)
+        items = []
+        for i, img in enumerate(raw_images):
+            items.append({
+                "id": None,
+                "image": img,
+                "camera_motion": shared_camera,
+                "seed": base_seed + i,
+                "last_image": shared_last_image,
+                "last_image_strength": shared_last_image_strength,
+                "_original_index": i,
+            })
+        return items, None
+
+    elif raw_image:
+        # Format image — single item
+        seed = shared_seed if shared_seed is not None else random.randint(0, 2**32 - 1)
+        return [{
+            "id": None,
+            "image": raw_image,
+            "camera_motion": shared_camera,
+            "seed": seed,
+            "last_image": shared_last_image,
+            "last_image_strength": shared_last_image_strength,
+            "_original_index": 0,
+        }], None
+
+    else:
+        return [], "Le champ 'image', 'images' ou 'items' est requis (URL https ou base64)"
 
 
 # --- Handler ---
@@ -298,9 +354,13 @@ pipeline: MedusaPipeline | None = None
 def handler(job: dict) -> dict:
     """Handler RunPod pour generation I2V.
 
-    Supporte:
-      - image (singulier) : generation single item (retro-compatible)
-      - images (liste) : generation batch avec overlapping
+    Supporte 3 formats d'input:
+      - items[] : batch multi-client (per-item camera_motion, seed, last_image)
+      - images[] : batch avec params partages (retro-compatible)
+      - image : single item (retro-compatible)
+
+    Les items sont regroupes par camera_motion (= meme prompt = memes embeddings).
+    Chaque groupe est traite via generate_batch_frames() ou generate_frames().
     """
     global pipeline
 
@@ -314,198 +374,141 @@ def handler(job: dict) -> dict:
         log.info("Cache hit (%s) - %d fichier(s), skip execution", input_hash, len(cached))
         return {"images": cached, "cached": True}
 
-    # --- Parse input : support image (singulier) et images (pluriel) ---
-    image_data_list = job_input.get("images")
-    single_image = job_input.get("image")
-    if image_data_list:
-        is_batch = len(image_data_list) > 1
-    elif single_image:
-        image_data_list = [single_image]
-        is_batch = False
-    else:
-        return {"error": "Le champ 'image' ou 'images' est requis (URL https ou base64)"}
+    # --- Normalize input (3 formats → liste uniforme) ---
+    normalized, error = normalize_items(job_input)
+    if error:
+        return {"error": error}
 
-    # --- camera_motion : preset connu → description, sinon texte libre ---
-    camera_motion = job_input.get("camera_motion", job_input.get("camera", "static"))
-    camera_motion_text = CAMERA_PRESETS.get(camera_motion, camera_motion)
-
-    base_seed = job_input.get("seed", random.randint(0, 2**32 - 1))
-    num_frames = job_input.get("num_frames", 25)
-    frame_rate = job_input.get("frame_rate", 24)
-    image_strength = job_input.get("image_strength", 1.0)
-    last_image_data = job_input.get("last_image")
-    last_image_strength = job_input.get("last_image_strength", 1.0)
-    negative_override = job_input.get("negative_prompt")
-
+    # --- Params partages (top-level) ---
     resolution = job_input.get("resolution", "720p")
     if resolution not in FIXED_RESOLUTIONS:
         return {"error": f"Resolution inconnue: {resolution}. Choix: {list(FIXED_RESOLUTIONS.keys())}"}
     dynamic_resolution = job_input.get("dynamic_resolution", False)
+    num_frames = job_input.get("num_frames", 25)
+    frame_rate = job_input.get("frame_rate", 24)
+    image_strength = job_input.get("image_strength", 1.0)
+    negative_override = job_input.get("negative_prompt")
+    two_stage = resolution == "1080p"
 
     # --- Pipeline deja init au startup (eager init) ---
     if pipeline is None:
         raise RuntimeError("Pipeline non initialise — le worker doit etre lance via __main__")
 
     disk_before = get_disk_usage_mb()
-    total_images = len(image_data_list)
-    log.info("Job %s - %d image(s), camera_motion=%s, disque avant: %.0f MB", job_id, total_images, camera_motion, disk_before)
+    total_items = len(normalized)
+    log.info("Job %s - %d item(s), disque avant: %.0f MB", job_id, total_items, disk_before)
 
-    two_stage = resolution == "1080p"
-
-    # Seeds uniques par item
-    seeds = [base_seed + i for i in range(total_images)]
-
-    tmp_images: list[str] = []
-    tmp_last_image: str | None = None
-    all_futures: list = []
+    tmp_files: list[str] = []
 
     try:
-        # Resolve last_image une seule fois (partage par tous les items)
-        if last_image_data:
-            tmp_last_image = resolve_image(last_image_data)
+        # --- Download ALL images en parallele (image + last_image) ---
+        all_urls: list[str] = []
+        url_map: list[tuple[int, str]] = []  # (item_index, field_name)
+        for i, item in enumerate(normalized):
+            all_urls.append(item["image"])
+            url_map.append((i, "_image_path"))
+            if item.get("last_image"):
+                all_urls.append(item["last_image"])
+                url_map.append((i, "_last_image_path"))
 
-        if not is_batch:
-            # ===== SINGLE IMAGE (retro-compatible) =====
-            tmp_img = resolve_image(image_data_list[0])
-            tmp_images.append(tmp_img)
+        with ThreadPoolExecutor(max_workers=min(len(all_urls), 8)) as dl_pool:
+            paths = list(dl_pool.map(resolve_image, all_urls))
 
-            height, width = compute_target_resolution(resolution=resolution, image_path=tmp_img, dynamic=dynamic_resolution)
-            log.info(
-                "Resolution cible: %dx%d (%s, %s%s)",
-                width, height, resolution, "2-stage" if two_stage else "1-stage",
-                ", dynamic" if dynamic_resolution else "",
-            )
+        for (item_idx, field), path in zip(url_map, paths):
+            normalized[item_idx][field] = path
+            tmp_files.append(path)
 
-            start_time = time.time()
-            frames = pipeline.generate_frames(
-                image_path=tmp_img,
-                prompt=camera_motion_text,
-                seed=base_seed,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                frame_rate=frame_rate,
-                image_strength=image_strength,
-                last_image_path=tmp_last_image,
-                last_image_strength=last_image_strength,
-                negative_override=negative_override,
-                two_stage=two_stage,
-            )
-            elapsed = time.time() - start_time
-            log.info("Generation frames terminee: %.1fs", elapsed)
+        # --- Resolution cible (une seule fois, premiere image) ---
+        height, width = compute_target_resolution(
+            resolution=resolution, image_path=normalized[0]["_image_path"], dynamic=dynamic_resolution,
+        )
+        log.info(
+            "Resolution cible: %dx%d (%s, %s%s)",
+            width, height, resolution, "2-stage" if two_stage else "1-stage",
+            ", dynamic" if dynamic_resolution else "",
+        )
 
-            output_dir = tempfile.mkdtemp(prefix="medusa_")
-            output_filename = f"medusa_i2v_{job_id}.mp4"
-            future = postprocess_pool.submit(
-                postprocess_and_upload,
-                frames, int(frame_rate),
-                output_dir, output_filename,
-                job_id, input_hash,
-            )
-            output_meta = future.result()
+        # --- Groupement par prompt (camera_motion → texte) ---
+        groups: dict[str, list[dict]] = {}
+        for item in normalized:
+            prompt_text = CAMERA_PRESETS.get(item["camera_motion"], item["camera_motion"])
+            item["_prompt_text"] = prompt_text
+            groups.setdefault(prompt_text, []).append(item)
 
-            disk_after = get_disk_usage_mb()
-            log.info("Disque apres: %.0f MB (libere: %.0f MB)", disk_after, disk_before - disk_after)
-            return {"images": [output_meta]}
+        log.info(
+            "Groupes par prompt: %d groupe(s) — %s",
+            len(groups), {k[:30]: len(v) for k, v in groups.items()},
+        )
 
-        else:
-            # ===== BATCH MODE (overlapping + prefetch) =====
-            log.info("Batch mode: %d images, BATCH_SIZE=%d", total_images, BATCH_SIZE)
+        # --- Generation par groupe ---
+        results_by_index: dict[int, tuple] = {}  # index → (future, id)
 
-            # Split en sub-batches
+        for prompt_text, group_items in groups.items():
             sub_batches = [
-                image_data_list[i:i + BATCH_SIZE]
-                for i in range(0, total_images, BATCH_SIZE)
-            ]
-            sub_seeds = [
-                seeds[i:i + BATCH_SIZE]
-                for i in range(0, total_images, BATCH_SIZE)
+                group_items[i:i + BATCH_SIZE]
+                for i in range(0, len(group_items), BATCH_SIZE)
             ]
 
-            next_batch_futures = None
-            height: int | None = None
-            width: int | None = None
-
-            for batch_idx, (batch_urls, batch_seeds) in enumerate(zip(sub_batches, sub_seeds)):
-                batch_size = len(batch_urls)
-
-                # --- Recuperer images (prefetchees ou resolve maintenant) ---
-                if next_batch_futures is not None:
-                    current_images = [f.result() for f in next_batch_futures]
-                else:
-                    # Premier batch — resolve en parallele
-                    with ThreadPoolExecutor(max_workers=batch_size) as pool:
-                        current_images = list(pool.map(resolve_image, batch_urls))
-                tmp_images.extend(current_images)
-
-                # Resolution depuis la premiere image du premier batch
-                if height is None:
-                    height, width = compute_target_resolution(resolution=resolution, image_path=current_images[0], dynamic=dynamic_resolution)
-                    log.info(
-                        "Resolution cible: %dx%d (%s, %s%s)",
-                        width, height, resolution, "2-stage" if two_stage else "1-stage",
-                        ", dynamic" if dynamic_resolution else "",
-                    )
-
-                # --- Prefetch du batch suivant AVANT le denoising GPU ---
-                if batch_idx + 1 < len(sub_batches):
-                    next_batch_futures = [
-                        prefetch_pool.submit(resolve_image, url)
-                        for url in sub_batches[batch_idx + 1]
-                    ]
-                else:
-                    next_batch_futures = None
-
-                # --- Generation batch (GPU) ---
+            for batch_idx, sub_batch in enumerate(sub_batches):
                 start_time = time.time()
 
-                if batch_size > 1:
-                    items = []
-                    for img_path, seed_i in zip(current_images, batch_seeds):
-                        item: dict = {"image_path": img_path, "seed": seed_i}
-                        if tmp_last_image:
-                            item["last_image_path"] = tmp_last_image
-                            item["last_image_strength"] = last_image_strength
-                        items.append(item)
-
-                    batch_frames = pipeline.generate_batch_frames(
-                        items=items,
-                        prompt=camera_motion_text,
-                        height=height,
-                        width=width,
-                        num_frames=num_frames,
-                        frame_rate=frame_rate,
-                        image_strength=image_strength,
-                        two_stage=two_stage,
-                    )
-                else:
-                    # Sub-batch de 1 — utiliser generate_frames (single item)
+                if len(sub_batch) == 1:
+                    # Single item → generate_frames (supporte negative_override)
+                    item = sub_batch[0]
                     frames = pipeline.generate_frames(
-                        image_path=current_images[0],
-                        prompt=camera_motion_text,
-                        seed=batch_seeds[0],
+                        image_path=item["_image_path"],
+                        prompt=prompt_text,
+                        seed=item["seed"],
                         height=height,
                         width=width,
                         num_frames=num_frames,
                         frame_rate=frame_rate,
                         image_strength=image_strength,
-                        last_image_path=tmp_last_image,
-                        last_image_strength=last_image_strength,
+                        last_image_path=item.get("_last_image_path"),
+                        last_image_strength=item.get("last_image_strength", 1.0),
+                        negative_override=negative_override,
                         two_stage=two_stage,
                     )
-                    batch_frames = [frames]
+                    batch_frames_list = [frames]
+                else:
+                    # Multi items → generate_batch_frames (batch homogene)
+                    pipeline_items = []
+                    for item in sub_batch:
+                        pi: dict = {"image_path": item["_image_path"], "seed": item["seed"]}
+                        if item.get("_last_image_path"):
+                            pi["last_image_path"] = item["_last_image_path"]
+                            pi["last_image_strength"] = item.get("last_image_strength", 1.0)
+                        pipeline_items.append(pi)
+
+                    batch_frames_list = pipeline.generate_batch_frames(
+                        items=pipeline_items,
+                        prompt=prompt_text,
+                        height=height,
+                        width=width,
+                        num_frames=num_frames,
+                        frame_rate=frame_rate,
+                        image_strength=image_strength,
+                        two_stage=two_stage,
+                    )
 
                 elapsed = time.time() - start_time
                 log.info(
-                    "Sub-batch %d/%d: %.1fs (%d items)",
-                    batch_idx + 1, len(sub_batches), elapsed, batch_size,
+                    "Groupe '%s' sub-batch %d/%d: %.1fs (%d item(s))",
+                    prompt_text[:30], batch_idx + 1, len(sub_batches), elapsed, len(sub_batch),
                 )
 
-                # --- Post-processing async (Opt 4) ---
-                for item_idx, item_frames in enumerate(batch_frames):
-                    global_idx = batch_idx * BATCH_SIZE + item_idx
+                # --- Post-processing async par item ---
+                for item, item_frames in zip(sub_batch, batch_frames_list):
+                    orig_idx = item["_original_index"]
                     output_dir = tempfile.mkdtemp(prefix="medusa_")
-                    output_filename = f"medusa_i2v_{job_id}_{global_idx}.mp4"
+
+                    # Filename : id si fourni, sinon job_id_index
+                    if item.get("id"):
+                        output_filename = f"medusa_i2v_{item['id']}.mp4"
+                    elif total_items > 1:
+                        output_filename = f"medusa_i2v_{job_id}_{orig_idx}.mp4"
+                    else:
+                        output_filename = f"medusa_i2v_{job_id}.mp4"
 
                     fut = postprocess_pool.submit(
                         postprocess_and_upload,
@@ -513,26 +516,30 @@ def handler(job: dict) -> dict:
                         output_dir, output_filename,
                         job_id, input_hash,
                     )
-                    all_futures.append(fut)
+                    results_by_index[orig_idx] = (fut, item.get("id"))
 
-            # --- Attendre tous les post-processing avant return ---
-            results = [f.result() for f in all_futures]
+        # --- Reordonner les resultats par _original_index ---
+        ordered_results = []
+        for idx in range(total_items):
+            fut, item_id = results_by_index[idx]
+            result = fut.result()
+            if item_id is not None:
+                result["id"] = item_id
+            ordered_results.append(result)
 
-            disk_after = get_disk_usage_mb()
-            log.info("Disque apres: %.0f MB (libere: %.0f MB)", disk_after, disk_before - disk_after)
-            return {"images": results}
+        disk_after = get_disk_usage_mb()
+        log.info("Disque apres: %.0f MB (libere: %.0f MB)", disk_after, disk_before - disk_after)
+        return {"images": ordered_results}
 
     except Exception as e:
         log.error("Erreur generation: %s", e, exc_info=True)
         return {"error": str(e)}
 
     finally:
-        # Cleanup images temporaires
-        for tmp_img in tmp_images:
-            if os.path.isfile(tmp_img):
-                os.unlink(tmp_img)
-        if tmp_last_image and os.path.isfile(tmp_last_image):
-            os.unlink(tmp_last_image)
+        # Cleanup toutes les images temporaires
+        for tmp in tmp_files:
+            if os.path.isfile(tmp):
+                os.unlink(tmp)
 
 
 # --- Init & Start ---

@@ -64,7 +64,7 @@ Objectif : generation rapide de videos a partir d'images, qualite correcte.
 }
 ```
 
-### Batch (multi-images)
+### Batch (multi-images, retro-compatible)
 ```json
 {
   "input": {
@@ -76,13 +76,40 @@ Objectif : generation rapide de videos a partir d'images, qualite correcte.
 }
 ```
 
-`last_image` et `last_image_strength` sont optionnels. Si `last_image` est fourni, la video est guidee vers cette image cible en derniere frame.
+### Batch multi-client (items[])
+```json
+{
+  "input": {
+    "items": [
+      {
+        "id": "job-abc-user1",
+        "image": "https://example.com/photo1.jpg",
+        "camera_motion": "dolly-in",
+        "seed": 111
+      },
+      {
+        "id": "job-def-user2",
+        "image": "https://example.com/photo2.jpg",
+        "camera_motion": "dolly-out",
+        "seed": 222,
+        "last_image": "https://example.com/target.jpg",
+        "last_image_strength": 0.8
+      }
+    ],
+    "resolution": "720p"
+  }
+}
+```
+
+`items[]` : batch multi-client. Chaque item a ses propres `id`, `image`, `camera_motion`, `seed`, `last_image`, `last_image_strength`. Les items sont regroupes par `camera_motion` (= meme prompt = memes embeddings) pour le batching GPU. L'ordre des resultats correspond a l'ordre des items en input.
+
+`last_image` et `last_image_strength` sont optionnels (per-item dans `items[]`, top-level dans `image`/`images`). Si `last_image` est fourni, la video est guidee vers cette image cible en derniere frame.
 
 `resolution` : `"720p"` (defaut) ou `"1080p"`. 720p = pipeline 1-stage (~0.92M px). 1080p = pipeline 2-stage (540p → upscale x2 → refine, ~2M px).
 
 `images` (pluriel) : liste d'URLs/base64 pour generation batch. Chaque image recoit un seed unique (`seed + index`). Le denoising tourne en batch=N sur un seul forward transformer. Retro-compatible avec `image` (singulier).
 
-`camera_motion` : preset connu (`dolly-in`, `dolly-out`, `dolly-left`, `dolly-right`, `jib-up`, `jib-down`, `static`) ou texte libre. Retro-compatible via `camera` (alias).
+`camera_motion` : preset connu (`dolly-in`, `dolly-out`, `dolly-left`, `dolly-right`, `jib-up`, `jib-down`, `static`) ou texte libre. Retro-compatible via `camera` (alias). Per-item dans `items[]`, top-level dans `image`/`images`.
 
 ## Modeles
 
@@ -111,11 +138,11 @@ Objectif : generation rapide de videos a partir d'images, qualite correcte.
   - Stage 2 : refine a ~1080p (full-res), 3 steps distilled, `simple_denoising_func`
   - Meme transformer pour les 2 stages
 - **Eager init** : pipeline init complet AVANT `runpod.serverless.start()` — premier job sans cold start
-- **Download parallele** : `image` et `last_image` telecharges en parallele via ThreadPoolExecutor
+- **Download parallele** : toutes les images (image + last_image) de tous les items telecharges en parallele via ThreadPoolExecutor au debut du job
 - **torch.compile** : `torch.compile` sur le transformer ET le video decoder (desactivable via `TORCH_COMPILE=0` et `VAE_COMPILE=0`). `mode=default` quand SageAttention actif (graph breaks pybind11 → CUDA graphs vides), `COMPILE_MODE` configurable sinon. `automatic_dynamic_shapes` active pour reduire les recompilations Dynamo.
-- **Batching** : `generate_batch_frames()` traite N images en un seul forward transformer (batch=N). Per-item noise (seeds differents), image encoding individuel, VAE decode sequentiel. Configurable via `BATCH_SIZE` (defaut 2).
+- **Batching multi-client** : items regroupes par `camera_motion` (= meme prompt). Chaque groupe traite via `generate_batch_frames()` (batch homogene) ou `generate_frames()` (single). Resultats reordonnes par `_original_index`.
+- **Batching GPU** : `generate_batch_frames()` traite N images en un seul forward transformer (batch=N). Per-item noise (seeds differents), image encoding individuel, VAE decode sequentiel. Configurable via `BATCH_SIZE` (defaut 2).
 - **Async post-processing** : MP4 encode + S3 upload en parallele du GPU via ThreadPoolExecutor(3)
-- **Pipeline overlapping** : prefetch des images du batch suivant pendant le denoising GPU
 - **SageAttention2++** : patch runtime `attention_function` sur les modules `Attention` du transformer uniquement (pas VAE, pas encoder, pas upsampler). Fallback SDPA si mask present. Desactivable via `SAGE_ATTENTION=0`.
 - **Ordre d'init** : warmup embeddings (process isole) → transformer distilled (FP8 cast) → patch SageAttention → torch.compile → video encoder → video decoder → spatial upsampler
 - **warmup_embeddings.py** : charge les cles TE via safe_open + Gemma sur GPU (device_map) si dispo. Encoding ~5-10s GPU vs ~30-40s CPU. Cleanup VRAM complet apres.
@@ -144,37 +171,24 @@ Objectif : generation rapide de videos a partir d'images, qualite correcte.
 
 ## Flow d'Inference (par job)
 
-### Single image
 1. Hash input SHA256 → check dedup cache → return si hit
-2. Parse input + download images en parallele (ThreadPoolExecutor)
-3. Calcul resolution cible (aspect ratio preserve) : 720p align 32px (1-stage), 1080p align 64px (2-stage)
-4. `pipeline.generate_frames()` :
-   - Embeddings depuis cache (preset) ou Gemma on-demand (custom)
-   - Setup : GaussianNoiser + stepper (Euler ou Res2s via `SAMPLER`), CFG=1.0, STG=0.0, audio disabled
-   - Image → latent via video_encoder
-   - **720p** : denoise 8 steps (DISTILLED_SIGMA_VALUES)
-   - **1080p** : Stage 1 denoise ~540p 8 steps → upsample_video() x2 latent → Stage 2 refine ~1080p 3 steps (simple_denoising)
-   - VAE decode (tiling optionnel via `VAE_TILING`) → frames CPU
-5. Post-processing async (thread pool) : encode_video() → H264 MP4 + sauvegarde volume + upload S3 + dedup cache
-
-### Batch multi-images
-1. Hash input SHA256 → check dedup cache → return si hit
-2. Split `images[]` en sub-batches de `BATCH_SIZE`
-3. Pour chaque sub-batch :
-   - Recuperer images prefetchees (ou resolve si premier batch)
-   - Lancer prefetch du batch suivant AVANT denoising
-   - `pipeline.generate_batch_frames()` : N items en un forward transformer
-     - Per-item : image encoding, GaussianNoiser(seed_i), LatentState batch=1
-     - Concatenation LatentState le long de batch dim → batch=N
-     - Denoising loop : un seul forward transformer pour N items
-     - VAE decode sequentiel par item (limitation vae_decode_video)
-   - Post-processing async pour chaque item (MP4 encode + S3 upload)
-4. Attendre tous les post-processing → return
+2. Normaliser input (3 formats : `items[]`, `images[]`, `image`) → liste uniforme d'items
+3. Download ALL images en parallele (image + last_image de chaque item) via ThreadPoolExecutor
+4. Calcul resolution cible (premiere image, une seule fois) : 720p align 32px (1-stage), 1080p align 64px (2-stage)
+5. Grouper items par `camera_motion` (= meme prompt = memes embeddings)
+6. Pour chaque groupe de prompt :
+   - Decouper en sub-batches de `BATCH_SIZE`
+   - Pour chaque sub-batch :
+     - Si 1 item → `pipeline.generate_frames()` (supporte `negative_override`)
+     - Si N items → `pipeline.generate_batch_frames()` (batch homogene, N items en un forward)
+   - Post-processing async par item (MP4 encode + S3 upload)
+7. Reordonner resultats par `_original_index`, ajouter `id` si fourni
+8. Return `{"images": [...]}`
 
 ## Conventions
 
 - Prefixe output : `medusa_i2v`
-- Reponse API : `images[]` avec `s3_key` + `volume_path` + `s3_url` (si S3 active)
+- Reponse API : `images[]` avec `s3_key` + `volume_path` + `s3_url` (si S3 active) + `id` (si fourni dans l'input `items[]`)
 - Input images : supporte URL https OU base64
 - Output videos : sauvegardees dans `/runpod-volume/output/{job_id}/`
 - S3 upload : `generated/videos/{filename}` (OVH S3, optionnel via `S3_BUCKET`)

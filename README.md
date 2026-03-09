@@ -123,32 +123,23 @@ MedusaPipeline(models_dir)
 handler(job)
   │
   ├─ 1. Hash input (SHA256) → check dedup cache → return si hit
-  ├─ 2. Parse input (image/images, camera_motion, seed, resolution...)
-  ├─ 3. Download images en parallele (ThreadPoolExecutor)
-  ├─ 4. Calcul resolution cible (aspect ratio preserve)
+  ├─ 2. Normalize input (items[] / images[] / image → liste uniforme)
+  ├─ 3. Download ALL images en parallele (image + last_image)
+  ├─ 4. Calcul resolution cible (premiere image, une seule fois)
   │     ├─ 720p: ~0.92M px, align 32px → 1-stage
   │     └─ 1080p: ~2M px, align 64px → 2-stage
   │
-  ├─ 5. pipeline.generate_frames()
-  │     ├─ Embeddings depuis cache (preset) ou Gemma on-demand (custom)
-  │     ├─ Setup: GaussianNoiser + EulerDiffusionStep
-  │     │   CFG=1.0, STG=0.0, audio disabled
-  │     ├─ Image → latent via video_encoder
-  │     │
-  │     ├── 720p (1-stage) ────────────────────────
-  │     │   denoise 8 steps (DISTILLED_SIGMA_VALUES)
-  │     │
-  │     ├── 1080p (2-stage) ───────────────────────
-  │     │   Stage 1: denoise ~540p, 8 steps
-  │     │   Upscale: upsample_video() x2 en latent
-  │     │   Stage 2: refine ~1080p, 3 steps (simple_denoising)
-  │     │
-  │     └─ VAE decode (sans tiling) → frames CPU
+  ├─ 5. Grouper items par camera_motion (= meme prompt)
   │
-  ├─ 6. Post-processing async (MP4 encode + S3 upload)
-  ├─ 7. Sauvegarde /runpod-volume/output/{job_id}/
-  ├─ 8. Sauvegarde dedup cache
-  └─ 9. Return metadata
+  ├─ 6. Pour chaque groupe de prompt:
+  │     ├─ Decouper en sub-batches de BATCH_SIZE
+  │     ├─ 1 item  → pipeline.generate_frames()
+  │     ├─ N items → pipeline.generate_batch_frames()
+  │     └─ Post-processing async par item
+  │
+  ├─ 7. Reordonner resultats par index original
+  ├─ 8. Ajouter "id" dans chaque result (si fourni)
+  └─ 9. Return {"images": [...]}
 ```
 
 ## API
@@ -171,7 +162,7 @@ handler(job)
 }
 ```
 
-### Batch (multi-images)
+### Batch (multi-images, retro-compatible)
 
 ```json
 {
@@ -184,15 +175,46 @@ handler(job)
 }
 ```
 
+### Batch multi-client (items[])
+
+```json
+{
+  "input": {
+    "items": [
+      {
+        "id": "job-abc-user1",
+        "image": "https://example.com/photo1.jpg",
+        "camera_motion": "dolly-in",
+        "seed": 111
+      },
+      {
+        "id": "job-def-user2",
+        "image": "https://example.com/photo2.jpg",
+        "camera_motion": "dolly-out",
+        "seed": 222,
+        "last_image": "https://example.com/target.jpg",
+        "last_image_strength": 0.8
+      }
+    ],
+    "resolution": "720p"
+  }
+}
+```
+
+Les items sont regroupes par `camera_motion` (= meme prompt) pour le batching GPU. L'ordre des resultats correspond a l'ordre des items en input.
+
 ### Parametres
+
+**Top-level (partages)**
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
-| `image` | string | **requis** | URL https ou base64 (single) |
-| `images` | string[] | - | Liste d'URLs/base64 (batch, prioritaire sur `image`) |
-| `camera_motion` | string | `static` | Preset (`dolly-in`, `dolly-out`, `dolly-left`, `dolly-right`, `jib-up`, `jib-down`, `static`) ou texte libre |
+| `image` | string | - | URL https ou base64 (format single) |
+| `images` | string[] | - | Liste d'URLs/base64 (format batch, prioritaire sur `image`) |
+| `items` | object[] | - | Liste d'items multi-client (prioritaire sur `images` et `image`) |
+| `camera_motion` | string | `static` | Preset (`dolly-in`, `dolly-out`, etc.) ou texte libre |
 | `camera` | string | - | Alias retro-compatible pour `camera_motion` |
-| `seed` | int | random | Seed generation (batch: `seed + index` par item) |
+| `seed` | int | random | Seed generation (batch `images[]`: `seed + index` par item) |
 | `num_frames` | int | `25` | Nombre de frames (doit etre k*8+1) |
 | `frame_rate` | float | `24` | FPS |
 | `image_strength` | float | `1.0` | Force conditioning image |
@@ -201,18 +223,31 @@ handler(job)
 | `resolution` | string | `720p` | `720p` (1-stage) ou `1080p` (2-stage) |
 | `negative_prompt` | string | default | Override negative prompt |
 
+**Per-item (dans `items[]`)**
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `id` | string | - | Identifiant client (inclus dans la response) |
+| `image` | string | **requis** | URL https ou base64 |
+| `camera_motion` | string | top-level | Preset ou texte libre |
+| `camera` | string | - | Alias pour `camera_motion` |
+| `seed` | int | random | Seed generation |
+| `last_image` | string | - | URL/base64 image cible (last frame) |
+| `last_image_strength` | float | `1.0` | Force conditioning last image |
+
 ### Output
 
 ```json
 {
   "images": [
     {
-      "filename": "medusa_i2v_job-123.mp4",
+      "id": "job-abc-user1",
+      "filename": "medusa_i2v_job-abc-user1.mp4",
       "content_type": "video",
       "size_mb": 1.5,
-      "volume_path": "/runpod-volume/output/job-123/medusa_i2v_job-123.mp4",
-      "s3_key": "generated/videos/medusa_i2v_job-123.mp4",
-      "s3_url": "https://s3.sbg.io.cloud.ovh.net/bucket/generated/videos/medusa_i2v_job-123.mp4"
+      "volume_path": "/runpod-volume/output/job-123/medusa_i2v_job-abc-user1.mp4",
+      "s3_key": "generated/videos/medusa_i2v_job-abc-user1.mp4",
+      "s3_url": "https://s3.sbg.io.cloud.ovh.net/bucket/generated/videos/medusa_i2v_job-abc-user1.mp4"
     }
   ],
   "cached": false
