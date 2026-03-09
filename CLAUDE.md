@@ -1,11 +1,10 @@
 # CLAUDE.md - Medusa I2V (ltx-pipelines)
-<!-- last-mirror-test: 2026-02-23 -->
 
 ## Projet
 
-Pipeline Image-to-Video utilisant LTX-2 19B avec effet camera dolly.
+Pipeline Image-to-Video utilisant LTX-2.3 22B Distilled avec effets camera.
 Inference directe via ltx-pipelines (sans ComfyUI).
-Objectif : generation rapide de videos dolly a partir d'images, qualite correcte.
+Objectif : generation rapide de videos a partir d'images, qualite correcte.
 
 ## Stack Technique
 
@@ -14,7 +13,7 @@ Objectif : generation rapide de videos dolly a partir d'images, qualite correcte
 | CUDA | 12.8.1 + cuDNN |
 | Python | 3.12 (Ubuntu 24.04 natif) |
 | PyTorch | >=2.7.1 (wheel cu128) |
-| ltx-core + ltx-pipelines | Lightricks/LTX-2 commit `28c3c73` |
+| ltx-core + ltx-pipelines | Lightricks/LTX-2 commit `9e8a28e` |
 | transformers | >=4.52, <5.0 (v5 casse Gemma3TextConfig) |
 | huggingface-hub | >=0.28 (avec HF XET) |
 | runpod | >=1.7, <2.0 |
@@ -25,9 +24,9 @@ Objectif : generation rapide de videos dolly a partir d'images, qualite correcte
 ## Contexte Technique
 
 - **Runtime** : ltx-pipelines (Python direct) sur RunPod Serverless (H100 80GB, HBM3)
-- **Modele principal** : LTX-2 19B AV model (BF16, ~35GB VRAM base + camera LoRA fuse dynamique)
-- **Text encoder** : Gemma 3 12B IT (BF16, GPU si dispo sinon CPU, format HuggingFace)
-- **Approche** : Pipeline 1-stage (720p) ou 2-stage (540p → upscale x2 → refine 1080p), Euler distilled, audio skip
+- **Modele principal** : LTX-2.3 22B Distilled (checkpoint BF16 + `QuantizationPolicy.fp8_cast()` → stockage FP8 ~19-20GB VRAM, compute BF16)
+- **Text encoder** : Gemma 3 12B IT (BF16, GPU on-demand, format HuggingFace)
+- **Approche** : Pipeline 1-stage (720p) ou 2-stage (540p → upscale x2 → refine 1080p), 8 steps distilled, audio disabled
 - **Output** : H264 MP4, 24fps, ~1 seconde (25 frames), 720p ou 1080p
 - **S3** : Upload OVH S3 optionnel (boto3, active via `S3_BUCKET` env var)
 
@@ -35,10 +34,12 @@ Objectif : generation rapide de videos dolly a partir d'images, qualite correcte
 
 - `Dockerfile` — image Docker multi-stage (devel builder -> runtime), sans ComfyUI
 - `docker-compose.yml` — lancement local avec GPU
-- `src/start.sh` — script de demarrage (telecharge modeles via hf_xet + valide safetensors + lance handler)
-- `src/warmup_embeddings.py` — warmup embeddings low-RAM (safe_open direct, sans ModelLedger)
-- `src/pipeline.py` — classe MedusaPipeline (inference ltx-pipelines)
+- `src/start.sh` — script de demarrage (migration volume + telecharge modeles via hf_xet + valide safetensors + lance handler)
+- `src/warmup_embeddings.py` — warmup embeddings (safe_open direct + Gemma GPU)
+- `src/pipeline.py` — classe MedusaPipeline (inference ltx-pipelines, FP8 cast)
 - `src/handler.py` — handler RunPod serverless (API simplifiee, eager init, download images parallele)
+- `src/prompts.py` — presets camera_motion + negative prompt
+- `src/audit_volume.py` — audit fichiers inutiles sur volume
 - `workflows/` — reference ComfyUI (plus utilises en production)
 - `scripts/` — scripts utilitaires (test, envoi, conversion)
 - `docs/` — documentation et exemples
@@ -51,7 +52,7 @@ Objectif : generation rapide de videos dolly a partir d'images, qualite correcte
 {
   "input": {
     "image": "https://example.com/photo.jpg",
-    "camera": "dolly-in",
+    "camera_motion": "dolly-in",
     "seed": 12345,
     "num_frames": 25,
     "frame_rate": 24,
@@ -68,7 +69,7 @@ Objectif : generation rapide de videos dolly a partir d'images, qualite correcte
 {
   "input": {
     "images": ["https://example.com/photo1.jpg", "https://example.com/photo2.jpg"],
-    "camera": "dolly-in",
+    "camera_motion": "dolly-in",
     "seed": 12345,
     "resolution": "720p"
   }
@@ -81,66 +82,62 @@ Objectif : generation rapide de videos dolly a partir d'images, qualite correcte
 
 `images` (pluriel) : liste d'URLs/base64 pour generation batch. Chaque image recoit un seed unique (`seed + index`). Le denoising tourne en batch=N sur un seul forward transformer. Retro-compatible avec `image` (singulier).
 
-Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib-up, static.
+`camera_motion` : preset connu (`dolly-in`, `dolly-out`, `dolly-left`, `dolly-right`, `jib-up`, `jib-down`, `static`) ou texte libre. Retro-compatible via `camera` (alias).
 
 ## Modeles
 
 | Modele | Taille | VRAM | Role |
 |--------|--------|------|------|
-| LTX-2 19B (BF16) | ~38GB | ~35GB | Transformer principal (velocity model) |
-| Gemma 3 12B IT (BF16) | ~24GB | CPU only | Text encoder (warmup, puis libere) |
-| Distilled LoRA (strength 0.7) | ~50MB | fuse dans transformer | Acceleration inference (8 steps) |
-| I2V Adapter (strength 0.8) | ~100MB | fuse dans transformer | Conditioning image |
-| Camera LoRAs x7 (strength 1.0) | ~100MB chaque | fuse/unfuse dynamique | Mouvement camera |
+| LTX-2.3 22B Distilled (BF16 + fp8_cast) | ~46GB | ~19-20GB | Transformer distilled (stockage FP8, compute BF16) |
+| Gemma 3 12B IT (BF16) | ~24GB | GPU on-demand | Text encoder (warmup presets, custom prompts) |
 | Spatial Upscaler x2 | ~1GB | ~1GB | Upscale latent (pipeline 2-stage) |
+| Temporal Upscaler x2 | ~262MB | - | Reporte (aucun pipeline officiel) |
 | Video Encoder | inclus checkpoint | ~1GB | Image -> latent |
 | Video Decoder | inclus checkpoint | ~2GB | Latent -> pixels |
 
 ## Architecture Pipeline
 
 - **MedusaPipeline** : encapsule ltx-pipelines avec gestion lifecycle modeles
-  - Video encoder persistent en VRAM (~1.3GB)
+  - Video encoder persistent en VRAM (~1GB)
   - Video decoder persistent en VRAM (~2GB)
   - Spatial upsampler x2 persistent en VRAM (~1GB)
-  - Transformer base (distilled + I2V) permanent en VRAM (~35GB), compile une seule fois
+  - Transformer distilled permanent en VRAM (~19-20GB via FP8 cast), compile une seule fois
   - SageAttention2++ patch runtime sur ~288 modules Attention du transformer (INT8-QK/FP8-PV, kernel sm_90 auto-selectionne), fallback SDPA si mask present ou non installe
-  - Camera LoRA fuse/unfuse dynamiquement in-place (delta = lora_up @ lora_down, ~0.1s de switch)
-  - Deltas camera precalcules et caches sur CPU, transferes vers GPU a la demande
   - Embeddings pre-caches sur disque (generes par warmup_embeddings.py)
-  - Cache transformer pre-fusionne dans `/runpod-volume/cache/transformer/` (checkpoint safetensors avec distilled + I2V deja fusionnes, elimine ~1-2 min de LoRA fusion aux cold starts suivants, invalidation auto par hash checkpoint + LoRAs + strengths, desactivable via `TRANSFORMER_CACHE=0`)
+  - Cache transformer dans `/runpod-volume/cache/transformer/` (checkpoint safetensors, invalidation auto par hash checkpoint, desactivable via `TRANSFORMER_CACHE=0`)
 - **Pipeline 2-stage** :
-  - Stage 1 : denoise a ~540p (half-res), 8 steps distilled, guiders (CFG=1, STG=0, audio skip)
-  - Upscale : `upsample_video()` x2 en espace latent (un-normalize → upsampler → normalize)
-  - Stage 2 : refine a ~1080p (full-res), 3 steps distilled, `simple_denoising_func` (1 forward/step)
-  - Meme transformer pour les 2 stages (pas de rebuild), camera LoRA reste fuse
+  - Stage 1 : denoise a ~540p (half-res), 8 steps distilled
+  - Upscale : `upsample_video()` x2 en espace latent
+  - Stage 2 : refine a ~1080p (full-res), 3 steps distilled, `simple_denoising_func`
+  - Meme transformer pour les 2 stages
 - **Eager init** : pipeline init complet AVANT `runpod.serverless.start()` — premier job sans cold start
 - **Download parallele** : `image` et `last_image` telecharges en parallele via ThreadPoolExecutor
-- **torch.compile** : `torch.compile(mode="reduce-overhead")` sur le transformer base ET le video decoder (desactivable via `TORCH_COMPILE=0` et `VAE_COMPILE=0`). 2 shapes (540p + 1080p) → 2 CUDA graph captures au premier job, cachees ensuite.
+- **torch.compile** : `torch.compile(mode="reduce-overhead")` sur le transformer ET le video decoder (desactivable via `TORCH_COMPILE=0` et `VAE_COMPILE=0`)
 - **Batching** : `generate_batch_frames()` traite N images en un seul forward transformer (batch=N). Per-item noise (seeds differents), image encoding individuel, VAE decode sequentiel. Configurable via `BATCH_SIZE` (defaut 2).
-- **Async post-processing** : MP4 encode + S3 upload en parallele du GPU via ThreadPoolExecutor(3). `generate_frames()` retourne frames CPU, post-processing dans thread pool.
-- **Pipeline overlapping** : prefetch des images du batch suivant pendant le denoising GPU. Double buffer via prefetch_pool.
-- **SageAttention2++** : patch runtime `attention_function` sur les modules `Attention` du transformer uniquement (pas VAE, pas encoder, pas upsampler). Kernel INT8-QK/FP8-PV auto-selectionne sur H100 sm_90. Fallback `PytorchAttention` (SDPA) si mask present. Desactivable via `SAGE_ATTENTION=0`.
-- **Ordre d'init** : warmup embeddings (process isole) → base transformer (distilled + I2V) → patch SageAttention → torch.compile → fuse camera dolly-in → video encoder → video decoder → spatial upsampler
-- **warmup_embeddings.py** : charge les 59 cles TE via safe_open (2.7GB) + Gemma sur GPU (device_map) si dispo. Encoding ~5-10s GPU vs ~30-40s CPU. Cleanup VRAM complet apres. Peak ~35GB RAM.
-- **Audio skip** : `skip_step=99` sur audio guider → audio compute seulement au step 0/8
+- **Async post-processing** : MP4 encode + S3 upload en parallele du GPU via ThreadPoolExecutor(3)
+- **Pipeline overlapping** : prefetch des images du batch suivant pendant le denoising GPU
+- **SageAttention2++** : patch runtime `attention_function` sur les modules `Attention` du transformer uniquement (pas VAE, pas encoder, pas upsampler). Fallback SDPA si mask present. Desactivable via `SAGE_ATTENTION=0`.
+- **Ordre d'init** : warmup embeddings (process isole) → transformer distilled (FP8 cast) → patch SageAttention → torch.compile → video encoder → video decoder → spatial upsampler
+- **warmup_embeddings.py** : charge les cles TE via safe_open + Gemma sur GPU (device_map) si dispo. Encoding ~5-10s GPU vs ~30-40s CPU. Cleanup VRAM complet apres.
 - **CFG desactive** : `cfg_scale=1.0, stg_scale=0.0` → 1 seul forward par step
+- **Audio disabled** : audio modality `enabled=False` dans le forward transformer
 - **Sigmas distilled** : stage 1 = 8 steps (DISTILLED_SIGMA_VALUES), stage 2 = 3 steps (STAGE_2_DISTILLED_SIGMA_VALUES)
-- **Resolution** : ~2M px cible, alignement 64px (half-res doit etre multiple de 32)
-- **Budget VRAM** : ~50-55 GB sur H100 80GB (marge ~25-30 GB)
+- **Resolution** : ~2M px cible pour 1080p, ~0.92M px pour 720p, alignement 64/32px
+- **Budget VRAM** : ~35-40 GB sur H100 80GB (marge ~40-45 GB)
 
 ## Flow de Demarrage (start.sh)
 
 1. Signal handlers (SIGTERM/SIGINT/SIGQUIT)
 2. tcmalloc (LD_PRELOAD) pour optimisation memoire
-3. Creation arborescence `/runpod-volume/models/`
+3. Migration volume (cleanup anciens modeles LTX-2, download LTX-2.3)
 4. Download modeles (hf_xet) + validation safetensors via `safe_open()`
 5. Audit volume (dry-run)
 6. Mode detection : SERVERLESS → warmup + handler.py | GPU POD → JupyterLab :8888
 
 ## Flow d'Init Pipeline (eager, 1 seule fois)
 
-1. `warmup_embeddings()` — cache .pt ou Gemma 3 12B GPU (device_map, ~24GB VRAM) → encode 7 prompts camera + 1 negative → cleanup VRAM complet
-2. `get_transformer(dolly-in)` — cache pre-fusionne ou ModelLedger(checkpoint + distilled + I2V) → patch SageAttention2++ → torch.compile(reduce-overhead) → fuse camera delta
+1. `warmup_embeddings()` — cache .pt ou Gemma 3 12B GPU (device_map) → encode 7 presets camera_motion + 1 negative → cleanup VRAM complet
+2. `get_transformer()` — cache pre-fusionne ou ModelLedger(checkpoint distilled BF16, quantization=fp8_cast) → patch SageAttention2++ → torch.compile(reduce-overhead)
 3. `load_video_encoder()` → VRAM (~1GB, persistent)
 4. `load_video_decoder()` → VRAM (~2GB, persistent) + torch.compile(reduce-overhead)
 5. `load_spatial_upsampler()` → VRAM (~1GB, persistent)
@@ -152,11 +149,10 @@ Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib
 2. Parse input + download images en parallele (ThreadPoolExecutor)
 3. Calcul resolution cible (aspect ratio preserve) : 720p align 32px (1-stage), 1080p align 64px (2-stage)
 4. `pipeline.generate_frames()` :
-   - Embeddings depuis cache (ou encode CPU si override)
-   - Camera LoRA switch si differente (~0.1s, delta = lora_B @ lora_A * alpha/rank * strength)
-   - Setup : GaussianNoiser + EulerDiffusionStep, CFG=1.0, STG=0.0, audio skip_step=99
+   - Embeddings depuis cache (preset) ou Gemma on-demand (custom)
+   - Setup : GaussianNoiser + EulerDiffusionStep, CFG=1.0, STG=0.0, audio disabled
    - Image → latent via video_encoder
-   - **720p** : denoise 8 steps (DISTILLED_SIGMA_VALUES) avec guiders
+   - **720p** : denoise 8 steps (DISTILLED_SIGMA_VALUES)
    - **1080p** : Stage 1 denoise ~540p 8 steps → upsample_video() x2 latent → Stage 2 refine ~1080p 3 steps (simple_denoising)
    - VAE decode (sans tiling) → frames CPU
 5. Post-processing async (thread pool) : encode_video() → H264 MP4 + sauvegarde volume + upload S3 + dedup cache
@@ -197,7 +193,8 @@ Cameras supportees : dolly-in, dolly-out, dolly-left, dolly-right, jib-down, jib
 - S3 env vars : `S3_BUCKET`, `S3_ENDPOINT_URL` (defaut OVH SBG), `S3_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
 - `SAGE_ATTENTION=1` (defaut) : active SageAttention2++ sur le transformer. `0` pour rollback complet vers SDPA
 - `SAGE_COMPILE_DISABLE=0` (defaut) : `1` wrappe sageattn dans `torch.compiler.disable` si CUDA graphs posent probleme
-- `TORCH_COMPILE=0` pour desactiver torch.compile (debug ou compatibilite)
+- `TORCH_COMPILE=1` (defaut) : torch.compile(reduce-overhead) sur le transformer. `0` pour desactiver
 - `VAE_COMPILE=1` (defaut) : torch.compile(reduce-overhead) sur le video decoder. `0` pour desactiver
-- `TRANSFORMER_CACHE=0` pour desactiver le cache transformer pre-fusionne (force rebuild a chaque cold start)
+- `TRANSFORMER_CACHE=1` (defaut) : cache transformer pre-fusionne. `0` pour desactiver
 - `BATCH_SIZE=2` (defaut) : taille max du sous-batch pour le denoising transformer en batch mode
+- Le checkpoint FP8 scaled (`ltx-2.3-22b-dev-fp8.safetensors`) est INCOMPATIBLE avec la fusion LoRA dans ltx-core — utiliser le checkpoint distilled BF16 avec `fp8_cast()` a la place
