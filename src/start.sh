@@ -24,7 +24,7 @@ trap 'cleanup SIGINT' SIGINT
 trap 'cleanup SIGQUIT' SIGQUIT
 
 echo "============================================"
-echo "  Medusa I2V - ltx-pipelines + LTX-2.3 22B FP8"
+echo "  Medusa I2V - ltx-pipelines + LTX-2.3 22B Distilled"
 echo "============================================"
 
 # -----------------------------------------------
@@ -75,8 +75,10 @@ migrate_volume() {
     # Supprimer anciens fichiers LTX-2
     local old_files=(
         "models/checkpoints/ltx-2-19b-dev.safetensors"
+        "models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors"
         "models/loras/ltx-2-19b-distilled-lora-384.safetensors"
         "models/loras/LTX-2-Image2Vid-Adapter.safetensors"
+        "models/loras/ltx-2.3-22b-distilled-lora-384.safetensors"
         "models/upscalers/ltx-2-spatial-upscaler-x2-1.0.safetensors"
     )
     for f in "${old_files[@]}"; do
@@ -196,11 +198,8 @@ hf_hub_download(
 # -----------------------------------------------
 echo "[medusa] Demarrage des telechargements (sequentiel, hf_xet)..."
 
-# --- Checkpoint FP8 (~29GB) — le plus gros, echouer tot ---
-download_model "Lightricks/LTX-2.3-fp8" "ltx-2.3-22b-dev-fp8.safetensors" "${MODELS_DIR}/checkpoints"
-
-# --- Distilled LoRA (~7.6GB) ---
-download_model "Lightricks/LTX-2.3" "ltx-2.3-22b-distilled-lora-384.safetensors" "${MODELS_DIR}/loras"
+# --- Checkpoint distilled BF16 (~46GB) — le plus gros, echouer tot ---
+download_model "Lightricks/LTX-2.3" "ltx-2.3-22b-distilled.safetensors" "${MODELS_DIR}/checkpoints"
 
 # --- Spatial upscaler x2 (~1GB) ---
 download_model "Lightricks/LTX-2.3" "ltx-2.3-spatial-upscaler-x2-1.0.safetensors" "${MODELS_DIR}/upscalers"

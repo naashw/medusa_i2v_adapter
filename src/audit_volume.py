@@ -44,12 +44,9 @@ def audit_volume(volume_root: str) -> tuple[list[dict], list[dict], list[dict], 
 
     # --- Fichiers REQUIS (pipeline les utilise directement) ---
     required_files: dict[str, str] = {
-        # Checkpoint principal
-        os.path.join(models_dir, "checkpoints", "ltx-2.3-22b-dev-fp8.safetensors"):
-            "Checkpoint LTX-2.3 22B FP8 (pipeline.py)",
-        # Distilled LoRA
-        os.path.join(models_dir, "loras", "ltx-2.3-22b-distilled-lora-384.safetensors"):
-            "Distilled LoRA (pipeline.py _base_loras)",
+        # Checkpoint principal (distilled BF16, fp8_cast au runtime)
+        os.path.join(models_dir, "checkpoints", "ltx-2.3-22b-distilled.safetensors"):
+            "Checkpoint LTX-2.3 22B Distilled BF16 (pipeline.py)",
         # Spatial upscaler
         os.path.join(models_dir, "upscalers", "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"):
             "Spatial upscaler x2 (pipeline.py)",

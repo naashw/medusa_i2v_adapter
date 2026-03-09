@@ -540,7 +540,7 @@ def init_pipeline() -> MedusaPipeline:
     os.makedirs(embeddings_cache_dir, exist_ok=True)
     p.warmup_embeddings(embeddings_cache_dir)
 
-    # 2. Build transformer (distilled LoRA fusionnee)
+    # 2. Build transformer distilled (FP8 cast)
     p.get_transformer()
 
     # 3. Charger video encoder + video decoder + spatial upsampler (persistent)

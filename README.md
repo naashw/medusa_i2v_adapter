@@ -43,9 +43,8 @@ Telecharges automatiquement au runtime sur le network volume via HF XET.
 
 | Modele | Taille | VRAM | Role |
 |--------|--------|------|------|
-| LTX-2.3 22B FP8 | ~22GB | ~19-20GB | Transformer principal (FP8 cast, compute BF16) |
+| LTX-2.3 22B Distilled (BF16 + fp8_cast) | ~46GB | ~19-20GB | Transformer distilled (stockage FP8, compute BF16) |
 | Gemma 3 12B IT (BF16) | ~24GB | GPU on-demand | Text encoder (warmup presets, custom prompts) |
-| Distilled LoRA (strength 0.7) | ~50MB | fuse dans transformer | Acceleration inference (8 steps) |
 | Spatial Upscaler x2 | ~1GB | ~1GB | Upscale latent (pipeline 2-stage) |
 | Temporal Upscaler x2 | ~1GB | - | Reporte (aucun pipeline officiel) |
 | Video Encoder | inclus checkpoint | ~1GB | Image -> latent |
@@ -109,7 +108,7 @@ MedusaPipeline(models_dir)
   │
   ├─ 2. get_transformer()
   │     └─ Cache transformer pre-fusionne (fingerprint OK) → charger
-  │     └─ Sinon → ModelLedger(checkpoint FP8 + distilled LoRA, quantization=fp8_cast)
+  │     └─ Sinon → ModelLedger(checkpoint distilled BF16, quantization=fp8_cast)
   │     └─ Patch SageAttention2++ (~288 modules Attention)
   │     └─ torch.compile(mode="reduce-overhead")
   │

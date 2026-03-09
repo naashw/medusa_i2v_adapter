@@ -181,7 +181,7 @@ def main() -> int:
         log.info("VRAM avant warmup: %s", vram_gb())
 
     checkpoint_path = os.path.join(
-        models_dir, "checkpoints", "ltx-2.3-22b-dev-fp8.safetensors"
+        models_dir, "checkpoints", "ltx-2.3-22b-distilled.safetensors"
     )
     gemma_root = os.path.join(models_dir, "text_encoders", "gemma-3-12b-it")
 

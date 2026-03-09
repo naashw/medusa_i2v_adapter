@@ -1,11 +1,12 @@
 """
-MedusaPipeline — ltx-pipelines direct inference for LTX-2.3 22B FP8.
+MedusaPipeline — ltx-pipelines direct inference for LTX-2.3 22B Distilled.
 
 Remplace ComfyUI par un appel Python direct a ltx-core / ltx-pipelines.
+Checkpoint distilled BF16 + QuantizationPolicy.fp8_cast() → stockage FP8, compute BF16.
 Gestion du lifecycle des modeles entre jobs :
   - Video encoder  : persistent en VRAM (~1GB)
   - Video decoder  : persistent en VRAM (~2GB)
-  - Transformer    : base (distilled) persistante, FP8 cast (stockage FP8, compute BF16)
+  - Transformer    : distilled persistante, FP8 cast (~19-20GB VRAM)
   - Text encoder   : charge sur GPU a la demande, embeddings caches sur disque
 """
 
@@ -31,7 +32,6 @@ from safetensors.torch import save_file as save_safetensors
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
-from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
 from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import decode_video as vae_decode_video
 
@@ -86,15 +86,12 @@ class SageAttentionCallable:
         return out
 
 
-# LoRA strength
-DISTILLED_LORA_STRENGTH = 0.7
-
 # Version du cache transformer (incrementer pour invalider tous les caches existants)
-CACHE_VERSION = "v3"
+CACHE_VERSION = "v4"
 
 
 class MedusaPipeline:
-    """Pipeline I2V utilisant ltx-pipelines avec LTX-2.3 22B FP8 Cast."""
+    """Pipeline I2V utilisant ltx-pipelines avec LTX-2.3 22B Distilled + FP8 Cast."""
 
     def __init__(self, models_dir: str, device: torch.device | None = None) -> None:
         self.device = device or (
@@ -104,21 +101,15 @@ class MedusaPipeline:
         self.models_dir = models_dir
 
         # Paths modeles LTX-2.3
-        self._checkpoint_path = os.path.join(models_dir, "checkpoints", "ltx-2.3-22b-dev-fp8.safetensors")
+        self._checkpoint_path = os.path.join(models_dir, "checkpoints", "ltx-2.3-22b-distilled.safetensors")
         self._gemma_root = os.path.join(models_dir, "text_encoders", "gemma-3-12b-it")
-        self._distilled_lora = os.path.join(models_dir, "loras", "ltx-2.3-22b-distilled-lora-384.safetensors")
         self._upsampler_path = os.path.join(models_dir, "upscalers", "ltx-2.3-spatial-upscaler-x2-1.0.safetensors")
         self._temporal_upsampler_path = os.path.join(models_dir, "upscalers", "ltx-2.3-temporal-upscaler-x2-1.0.safetensors")
 
         # Pipeline components (patchifiers + scale factors)
         self._components = PipelineComponents(dtype=self.dtype, device=self.device)
 
-        # Base LoRAs (distilled seulement — I2V natif LTX-2.3)
-        self._base_loras = [
-            LoraPathStrengthAndSDOps(self._distilled_lora, DISTILLED_LORA_STRENGTH, LTXV_LORA_COMFY_RENAMING_MAP),
-        ]
-
-        # Base ModelLedger SANS LoRAs — pour video_encoder, video_decoder (VAE) et spatial upsampler
+        # Base ModelLedger SANS quantization — pour video_encoder, video_decoder (VAE) et spatial upsampler
         self._base_ledger = ModelLedger(
             dtype=self.dtype,
             device=self.device,
@@ -135,7 +126,7 @@ class MedusaPipeline:
         # Spatial upsampler x2 (persistent en VRAM, ~1GB)
         self._spatial_upsampler: torch.nn.Module | None = None
 
-        # Transformer base en VRAM (distilled fusionnee, FP8 cast)
+        # Transformer distilled en VRAM (FP8 cast via QuantizationPolicy)
         self._transformer: torch.nn.Module | None = None
 
         # Embeddings cache (prompt/key -> (video_ctx, audio_ctx))
@@ -257,16 +248,11 @@ class MedusaPipeline:
     def _cache_fingerprint(self) -> str:
         """Hash d'invalidation pour le cache transformer pre-fusionne.
 
-        Combine CACHE_VERSION, taille du checkpoint, et basename/taille/strength
-        de chaque LoRA de base. Retourne un hash court (16 chars).
+        Combine CACHE_VERSION et taille du checkpoint. Retourne un hash court (16 chars).
         """
         h = hashlib.sha256()
         h.update(CACHE_VERSION.encode())
         h.update(str(os.path.getsize(self._checkpoint_path)).encode())
-        for lora in self._base_loras:
-            h.update(os.path.basename(lora.path).encode())
-            h.update(str(os.path.getsize(lora.path)).encode())
-            h.update(str(lora.strength).encode())
         return h.hexdigest()[:16]
 
     def _save_transformer_cache(self, cache_path: str) -> None:
@@ -323,10 +309,10 @@ class MedusaPipeline:
         return transformer
 
     def get_transformer(self) -> torch.nn.Module:
-        """Retourne le transformer FP8 avec distilled LoRA fusionnee.
+        """Retourne le transformer distilled avec FP8 Cast.
 
-        Base (distilled) construite une seule fois via ModelLedger.
-        FP8 Cast : stockage FP8, compute BF16 — compatible torch.compile + SageAttention.
+        Checkpoint distilled BF16 + QuantizationPolicy.fp8_cast() → stockage FP8, compute BF16.
+        Compatible torch.compile + SageAttention.
         """
         if self._transformer is not None:
             return self._transformer
@@ -348,12 +334,11 @@ class MedusaPipeline:
                     pass
 
         if self._transformer is None:
-            log.info("Build base transformer (distilled LoRA)...")
+            log.info("Build transformer distilled (FP8 cast)...")
             ledger = ModelLedger(
                 dtype=self.dtype,
                 device=self.device,
                 checkpoint_path=self._checkpoint_path,
-                loras=self._base_loras,
                 quantization=QuantizationPolicy.fp8_cast(),
             )
             self._transformer = ledger.transformer()
