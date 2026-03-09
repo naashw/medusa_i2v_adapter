@@ -12,6 +12,7 @@ Gestion du lifecycle des modeles entre jobs :
 
 from __future__ import annotations
 
+import dataclasses
 import gc
 import hashlib
 import logging
@@ -860,6 +861,11 @@ class MedusaPipeline:
                 aud_mod = modality_from_latent_state(
                     audio_state, a_ctx_batch, sigma, enabled=False,
                 )
+                # Fix: expand scalar sigma to (batch_size,) for prompt_adaln
+                # in transformer._prepare_timestep (needs batch dim, not scalar)
+                sigma_b = sigma.unsqueeze(0).expand(batch_size)
+                vid_mod = dataclasses.replace(vid_mod, sigma=sigma_b)
+                aud_mod = dataclasses.replace(aud_mod, sigma=sigma_b)
                 denoised_video, denoised_audio = transformer(
                     video=vid_mod, audio=aud_mod, perturbations=None,
                 )
@@ -930,6 +936,10 @@ class MedusaPipeline:
                     sigma = sigmas[step_index]
                     vid_mod = modality_from_latent_state(video_state, v_ctx_batch, sigma)
                     aud_mod = modality_from_latent_state(audio_state, a_ctx_batch, sigma)
+                    # Fix: expand scalar sigma to (batch_size,) for prompt_adaln
+                    sigma_b = sigma.unsqueeze(0).expand(batch_size)
+                    vid_mod = dataclasses.replace(vid_mod, sigma=sigma_b)
+                    aud_mod = dataclasses.replace(aud_mod, sigma=sigma_b)
                     return transformer(video=vid_mod, audio=aud_mod, perturbations=None)
 
                 return euler_denoising_loop(
