@@ -42,13 +42,13 @@ from ltx_pipelines.utils.helpers import (
     cleanup_memory,
     denoise_audio_video,
     encode_prompts,
-    euler_denoising_loop,
     image_conditionings_by_replacing_latent,
     modality_from_latent_state,
     noise_audio_state,
     noise_video_state,
     simple_denoising_func,
 )
+from ltx_pipelines.utils.samplers import euler_denoising_loop
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.types import PipelineComponents
 from ltx_core.model.transformer.attention import Attention, PytorchAttention
