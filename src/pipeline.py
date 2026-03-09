@@ -361,15 +361,14 @@ class MedusaPipeline:
 
         # torch.compile — dynamic=True pour eviter les recompilations entre stages
         # SA 2.2.0 : custom_op natif (zero graph breaks), CUDA graphs incompatibles
-        # avec kernels SA → max-autotune-no-cudagraphs pour autotuning Triton sans
-        # CUDA graphs. Cache Triton/Inductor persistant sur volume pour reutiliser.
+        # avec kernels SA → mode=default (compile rapide, pas de CUDA graphs).
         if os.environ.get("TORCH_COMPILE", "1") == "1":
             torch._dynamo.config.automatic_dynamic_shapes = True
             torch._dynamo.config.allow_unspec_int_on_nn_module = True
             torch._dynamo.config.cache_size_limit = 32
             torch._dynamo.config.recompile_limit = 16
             if sage_active:
-                compile_mode = "max-autotune-no-cudagraphs"
+                compile_mode = "default"
             else:
                 compile_mode = os.environ.get("COMPILE_MODE", "reduce-overhead")
                 valid_modes = {"default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"}
