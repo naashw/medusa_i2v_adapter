@@ -66,6 +66,10 @@ class SageAttentionCallable:
     def __init__(self) -> None:
         from sageattention import sageattn
 
+        # Leaf node pour Dynamo : ne trace pas les ops pybind11 internes,
+        # permet aux CUDA graphs (reduce-overhead) de capturer sageattn
+        torch.compiler.allow_in_graph(sageattn)
+
         if os.environ.get("SAGE_COMPILE_DISABLE", "0") == "1":
             self._sageattn = torch.compiler.disable(sageattn)
         else:
@@ -349,27 +353,24 @@ class MedusaPipeline:
                 self._save_transformer_cache(cache_path)
 
         # SageAttention2++ (remplace SDPA sur les modules Attention du transformer)
-        sage_active = False
         if os.environ.get("SAGE_ATTENTION", "1") == "1":
             try:
                 patched = self._patch_sage_attention(self._transformer)
                 log.info("SageAttention2++ active: %d modules patches", patched)
-                sage_active = patched > 0
             except ImportError:
                 log.warning("SageAttention non installe, fallback SDPA")
             except Exception as e:
                 log.warning("SageAttention init echoue, fallback SDPA: %s", e)
 
         # torch.compile pour acceleration inference (8 steps/job)
-        # reduce-overhead utilise CUDA graphs, incompatible avec les kernels
-        # pybind11 de SageAttention (graphs captures vides → output noise)
+        # reduce-overhead = CUDA graphs, allow_in_graph(sageattn) evite que
+        # Dynamo trace les ops pybind11 internes de SageAttention
         if os.environ.get("TORCH_COMPILE", "1") == "1":
             torch._dynamo.config.allow_unspec_int_on_nn_module = True
-            compile_mode = "default" if sage_active else "reduce-overhead"
-            log.info("torch.compile transformer (mode=%s)...", compile_mode)
+            log.info("torch.compile transformer (mode=reduce-overhead)...")
             self._transformer = torch.compile(
                 self._transformer,
-                mode=compile_mode,
+                mode="reduce-overhead",
                 fullgraph=False,
             )
 
