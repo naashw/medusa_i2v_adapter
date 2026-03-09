@@ -141,7 +141,7 @@ Objectif : generation rapide de videos a partir d'images, qualite correcte.
 - **Download parallele** : toutes les images (image + last_image) de tous les items telecharges en parallele via ThreadPoolExecutor au debut du job
 - **torch.compile** : `torch.compile` sur le transformer ET le video decoder (desactivable via `TORCH_COMPILE=0` et `VAE_COMPILE=0`). `mode=default` quand SageAttention actif (graph breaks pybind11 → CUDA graphs vides), `COMPILE_MODE` configurable sinon. `automatic_dynamic_shapes` active pour reduire les recompilations Dynamo.
 - **Batching multi-client** : items regroupes par `camera_motion` (= meme prompt). Chaque groupe traite via `generate_batch_frames()` (batch homogene) ou `generate_frames()` (single). Resultats reordonnes par `_original_index`.
-- **Batching GPU** : `generate_batch_frames()` traite N images en un seul forward transformer (batch=N). Per-item noise (seeds differents), image encoding individuel, VAE decode sequentiel. Configurable via `BATCH_SIZE` (defaut 2).
+- **Batching GPU** : `generate_batch_frames()` traite N images en un seul forward transformer (batch=N). Per-item noise (seeds differents), image encoding individuel. Spatial upscaler et VAE decode en sub-batches de `BATCH_SIZE`. `torch.cuda.empty_cache()` entre chaque stage (transformer → upscaler → stage 2 → VAE). Configurable via `BATCH_SIZE` (defaut 5).
 - **Async post-processing** : MP4 encode + S3 upload en parallele du GPU via ThreadPoolExecutor(3)
 - **SageAttention2++** : patch runtime `attention_function` sur les modules `Attention` du transformer uniquement (pas VAE, pas encoder, pas upsampler). Fallback SDPA si mask present. Desactivable via `SAGE_ATTENTION=0`.
 - **Ordre d'init** : warmup embeddings (process isole) → transformer distilled (FP8 cast) → patch SageAttention → torch.compile → video encoder → video decoder → spatial upsampler
@@ -212,5 +212,5 @@ Objectif : generation rapide de videos a partir d'images, qualite correcte.
 - `TRANSFORMER_CACHE=1` (defaut) : cache transformer pre-fusionne. `0` pour desactiver
 - `SAMPLER=euler` (defaut) : stepper de denoising. `res2s` pour Res2sDiffusionStep (second ordre)
 - `VAE_TILING=0` (defaut) : `1` pour activer le tiled VAE decode (reduit VRAM en 1080p, risque ghosting temporal)
-- `BATCH_SIZE=2` (defaut) : taille max du sous-batch pour le denoising transformer en batch mode
+- `BATCH_SIZE=5` (defaut) : taille max du sous-batch pour le denoising transformer en batch mode
 - Le checkpoint FP8 scaled (`ltx-2.3-22b-dev-fp8.safetensors`) est INCOMPATIBLE avec la fusion LoRA dans ltx-core — utiliser le checkpoint distilled BF16 avec `fp8_cast()` a la place

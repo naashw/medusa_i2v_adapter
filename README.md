@@ -278,7 +278,7 @@ curl -X POST "https://api.runpod.ai/v2/${ENDPOINT_ID}/runsync" \
 | `TORCH_COMPILE` | `1` | Active torch.compile reduce-overhead sur le transformer |
 | `VAE_COMPILE` | `1` | Active torch.compile reduce-overhead sur le video decoder |
 | `TRANSFORMER_CACHE` | `1` | Cache transformer pre-fusionne (skip cold start LoRA fusion) |
-| `BATCH_SIZE` | `2` | Taille max du sous-batch pour le denoising transformer |
+| `BATCH_SIZE` | `5` | Taille max du sous-batch pour le denoising transformer |
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | Allocation VRAM dynamique |
 | `S3_BUCKET` | - | Active upload S3 OVH |
 | `S3_ENDPOINT_URL` | `https://s3.sbg.io.cloud.ovh.net` | Endpoint S3 |

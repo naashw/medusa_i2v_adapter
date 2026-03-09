@@ -550,6 +550,7 @@ class MedusaPipeline:
                 device=self.device,
             )
             self._log_vram("apres stage 1")
+            torch.cuda.empty_cache()
 
             # Spatial upscale x2 in latent space
             log.info("Upscale latent x2...")
@@ -559,6 +560,7 @@ class MedusaPipeline:
                 upsampler=self._spatial_upsampler,
             )
             self._log_vram("apres upscale")
+            torch.cuda.empty_cache()
 
             # Stage 2 — refine at full-res (3 steps)
             log.info("Stage 2: refine %dx%d (full-res, 3 steps)...", width, height)
@@ -636,6 +638,8 @@ class MedusaPipeline:
                 dtype=self.dtype,
                 device=self.device,
             )
+
+        torch.cuda.empty_cache()
 
         # 7. VAE decode (tiling optionnel pour 1080p)
         tiling = TilingConfig.default() if os.environ.get("VAE_TILING", "0") == "1" else None
@@ -896,19 +900,17 @@ class MedusaPipeline:
             ba_s1 = atools_s1.clear_conditioning(ba_s1)
             ba_s1 = atools_s1.unpatchify(ba_s1)
             self._log_vram("apres batch stage 1")
+            torch.cuda.empty_cache()
 
-            # Upscale per item (sequentiel)
-            log.info("Batch upscale latent x2...")
-            upscaled_latents = []
-            for i in range(batch_size):
-                up_i = upsample_video(
-                    latent=bv_s1.latent[i:i+1],
-                    video_encoder=self._video_encoder,
-                    upsampler=self._spatial_upsampler,
-                )
-                upscaled_latents.append(up_i)
-            upscaled_batch = torch.cat(upscaled_latents, dim=0)
+            # Upscale batch
+            log.info("Batch upscale latent x2 (%d items)...", batch_size)
+            upscaled_batch = upsample_video(
+                latent=bv_s1.latent,
+                video_encoder=self._video_encoder,
+                upsampler=self._spatial_upsampler,
+            )
             self._log_vram("apres batch upscale")
+            torch.cuda.empty_cache()
 
             # Stage 2 — full-res batch refine
             log.info("Batch Stage 2: refine %dx%d (full-res, 3 steps)...", width, height)
@@ -950,6 +952,8 @@ class MedusaPipeline:
             video_state = vtools_s2.unpatchify(bv_s2)
             self._log_vram("apres batch stage 2")
 
+            torch.cuda.empty_cache()
+
         else:
             # --- 1-stage batch pipeline ---
             log.info("Batch 1-stage: denoise %dx%d (8 steps)...", width, height)
@@ -961,15 +965,23 @@ class MedusaPipeline:
             batched_video = vtools.clear_conditioning(batched_video)
             video_state = vtools.unpatchify(batched_video)
 
-        # VAE decode sequentiel par item (vae_decode_video ne supporte que batch=1)
-        log.info("Batch VAE decode (%d items)...", batch_size)
+        # VAE decode en sub-batches
+        torch.cuda.empty_cache()
+        vae_bs = int(os.environ.get("BATCH_SIZE", "5"))
+        tiling = TilingConfig.default() if os.environ.get("VAE_TILING", "0") == "1" else None
+        log.info("Batch VAE decode (%d items, vae_batch=%d)...", batch_size, vae_bs)
         all_frames: list[list[torch.Tensor]] = []
-        for i in range(batch_size):
-            latent_i = video_state.latent[i:i+1]
-            tiling = TilingConfig.default() if os.environ.get("VAE_TILING", "0") == "1" else None
-            decoded = vae_decode_video(latent_i, self._video_decoder, tiling, generators[i])
-            frames = [chunk.cpu() for chunk in decoded]
-            all_frames.append(frames)
+        for sb_start in range(0, batch_size, vae_bs):
+            sb_end = min(sb_start + vae_bs, batch_size)
+            sb_size = sb_end - sb_start
+            sb_latent = video_state.latent[sb_start:sb_end]
+            decoded = vae_decode_video(sb_latent, self._video_decoder, tiling, generators[sb_start])
+            chunks = list(decoded)
+            for i in range(sb_size):
+                item_frames = [chunk[i:i+1].cpu() for chunk in chunks]
+                all_frames.append(item_frames)
+            if sb_end < batch_size:
+                torch.cuda.empty_cache()
 
         log.info("Batch frames generees: %d items", len(all_frames))
         return all_frames
