@@ -197,9 +197,9 @@ class MedusaPipeline:
         log.info("Chargement video decoder (persistent)...")
         self._video_decoder = self._base_ledger.video_decoder()
         if os.environ.get("VAE_COMPILE", "1") == "1":
-            log.info("torch.compile video decoder (mode=reduce-overhead)...")
+            log.info("torch.compile video decoder (mode=default)...")
             self._video_decoder = torch.compile(
-                self._video_decoder, mode="reduce-overhead", fullgraph=False,
+                self._video_decoder, mode="default", fullgraph=False,
             )
         self._log_vram("apres video decoder")
 
