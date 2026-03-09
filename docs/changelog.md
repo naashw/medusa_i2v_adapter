@@ -8,9 +8,9 @@ Aucun. Tous les defauts sont retro-compatibles.
 
 ### Corrections
 
-- **SageAttention pin commit `d1a57a5`** — Dockerfile utilise `--filter=blob:none` + `git checkout d1a57a5` au lieu de `--depth 1`. Ce commit inclut le fix SM90 (issue #320) et le support `custom_op + register_fake` pour torch.compile natif.
-- **`torch.compiler.disable(sageattn)` conserve** — Les extensions pybind11 de SA (`transpose_pad_permute_cuda`, `scale_fuse_quant_cuda`) restent opaques a Dynamo. `compiler.disable` est requis pour eviter les FakeTensors crashes. `mode=default` quand SA actif (graph breaks → CUDA graphs vides avec `reduce-overhead`).
-- **`COMPILE_MODE` env var** — Configurable quand SA desactive (`SAGE_ATTENTION=0`). Quand SA actif, force `mode=default`.
+- **SageAttention pin commit `d1a57a5`** — Dockerfile utilise `--filter=blob:none` + `git checkout d1a57a5` au lieu de `--depth 1`. Ce commit inclut le fix SM90 (issue #320).
+- **`torch.compiler.disable(sageattn)` conserve** (commit `99721dc`) — Le plan initial supposait que SA 2.2.0 (`d1a57a5`) supportait `custom_op + register_fake` pour torch.compile natif. En production, les extensions pybind11 (`transpose_pad_permute_cuda`, `scale_fuse_quant_cuda`) restent opaques a Dynamo → graph breaks → CUDA graphs vides avec `reduce-overhead` → output noise. Fix : `compiler.disable(sageattn)` restaure, `mode=default` force quand SA actif.
+- **`COMPILE_MODE` env var** — Configurable uniquement quand SA desactive (`SAGE_ATTENTION=0`). Quand SA actif, force `mode=default` (graph breaks incompatibles avec CUDA graphs).
 
 ### Ajouts
 
@@ -30,14 +30,14 @@ Aucun. Tous les defauts sont retro-compatibles.
 |---------|---------------|
 | `Dockerfile` | Pin SageAttention commit `d1a57a5`, `--filter=blob:none` |
 | `requirements.txt` | `runpod>=1.8,<2.0` |
-| `src/pipeline.py` | Imports (Res2sDiffusionStep, TilingConfig), suppression compiler.disable, automatic_dynamic_shapes, COMPILE_MODE, SAMPLER, VAE_TILING |
+| `src/pipeline.py` | Imports (Res2sDiffusionStep, TilingConfig), compiler.disable conserve, automatic_dynamic_shapes, COMPILE_MODE (conditionnel SA), SAMPLER, VAE_TILING |
 | `CLAUDE.md` | Suppression SAGE_COMPILE_DISABLE, ajout COMPILE_MODE + SAMPLER + VAE_TILING, mise a jour torch.compile |
 
 ### Tests requis (deploiement H100)
 
 1. Build Docker — SageAttention SM90 compile OK
 2. 2 jobs consecutifs meme resolution → step 0 du Job 2 < 5s (pas de recompilation Dynamo)
-3. SA 2.2.0 + reduce-overhead — batch de 10 images de reference avec PSNR/SSIM avant/apres
+3. SA + mode=default — batch de 10 images de reference avec PSNR/SSIM vs baseline
 4. Single 720p — output non-bruit, qualite identique baseline
 5. 2-stage 1080p — qualite identique baseline
 6. Batch 2 items — denoising batche OK
