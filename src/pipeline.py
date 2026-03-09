@@ -66,6 +66,10 @@ class SageAttentionCallable:
     def __init__(self) -> None:
         from sageattention import sageattn
 
+        # Marquer sageattn comme leaf node pour Dynamo : evite de tracer les ops
+        # pybind11 internes, ce qui cassait les CUDA graphs (reduce-overhead)
+        torch.compiler.allow_in_graph(sageattn)
+
         if os.environ.get("SAGE_COMPILE_DISABLE", "0") == "1":
             self._sageattn = torch.compiler.disable(sageattn)
         else:
