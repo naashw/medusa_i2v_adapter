@@ -128,34 +128,38 @@ def resolve_image(image_data: str) -> str:
     return tmp.name
 
 
-RESOLUTION_CONFIGS: dict[str, tuple[float, int]] = {
+FIXED_RESOLUTIONS: dict[str, tuple[int, int]] = {
+    "720p": (704, 1280),
+    "1080p": (1088, 1920),
+}
+
+DYNAMIC_CONFIGS: dict[str, tuple[float, int]] = {
     "720p": (0.92, 32),
     "1080p": (2.0, 64),
 }
 
 
 def compute_target_resolution(
-    image_path: str,
     resolution: str = "720p",
+    image_path: str | None = None,
+    dynamic: bool = False,
 ) -> tuple[int, int]:
-    """Calcule la resolution cible en preservant l'aspect ratio.
+    """Retourne la resolution cible (height, width).
 
-    720p : ~0.92M px, align 32px (1-stage).
-    1080p : ~2M px, align 64px (2-stage, half-res doit etre multiple de 32).
-
-    Returns:
-        (height, width) alignes sur le step d'alignement.
+    Par defaut : resolution fixe (720p=1280x704, 1080p=1920x1088).
+    Si dynamic=True et image_path fourni : calcul par aspect ratio.
     """
-    target_megapixels, align = RESOLUTION_CONFIGS[resolution]
-    img = Image.open(image_path)
-    w, h = img.size
-    scale = math.sqrt(target_megapixels * 1_000_000 / (w * h))
-    target_w = round(w * scale / align) * align
-    target_h = round(h * scale / align) * align
-    # Clamp minimum
-    target_w = max(target_w, align)
-    target_h = max(target_h, align)
-    return target_h, target_w
+    if dynamic and image_path:
+        target_megapixels, align = DYNAMIC_CONFIGS[resolution]
+        img = Image.open(image_path)
+        w, h = img.size
+        scale = math.sqrt(target_megapixels * 1_000_000 / (w * h))
+        target_w = round(w * scale / align) * align
+        target_h = round(h * scale / align) * align
+        target_w = max(target_w, align)
+        target_h = max(target_h, align)
+        return target_h, target_w
+    return FIXED_RESOLUTIONS[resolution]
 
 
 def compute_input_hash(job_input: dict) -> str:
@@ -278,10 +282,11 @@ prefetch_pool = ThreadPoolExecutor(max_workers=max(BATCH_SIZE, 2))
 def resolve_and_preprocess(
     image_data: str,
     resolution: str = "720p",
+    dynamic: bool = False,
 ) -> tuple[str, int, int]:
     """Download + resolve image + compute target resolution (thread prefetch)."""
     tmp_path = resolve_image(image_data)
-    height, width = compute_target_resolution(tmp_path, resolution=resolution)
+    height, width = compute_target_resolution(resolution=resolution, image_path=tmp_path, dynamic=dynamic)
     return tmp_path, height, width
 
 
@@ -333,8 +338,9 @@ def handler(job: dict) -> dict:
     negative_override = job_input.get("negative_prompt")
 
     resolution = job_input.get("resolution", "720p")
-    if resolution not in RESOLUTION_CONFIGS:
-        return {"error": f"Resolution inconnue: {resolution}. Choix: {list(RESOLUTION_CONFIGS.keys())}"}
+    if resolution not in FIXED_RESOLUTIONS:
+        return {"error": f"Resolution inconnue: {resolution}. Choix: {list(FIXED_RESOLUTIONS.keys())}"}
+    dynamic_resolution = job_input.get("dynamic_resolution", False)
 
     # --- Pipeline deja init au startup (eager init) ---
     if pipeline is None:
@@ -363,10 +369,11 @@ def handler(job: dict) -> dict:
             tmp_img = resolve_image(image_data_list[0])
             tmp_images.append(tmp_img)
 
-            height, width = compute_target_resolution(tmp_img, resolution=resolution)
+            height, width = compute_target_resolution(resolution=resolution, image_path=tmp_img, dynamic=dynamic_resolution)
             log.info(
-                "Resolution cible: %dx%d (%s, %s)",
+                "Resolution cible: %dx%d (%s, %s%s)",
                 width, height, resolution, "2-stage" if two_stage else "1-stage",
+                ", dynamic" if dynamic_resolution else "",
             )
 
             start_time = time.time()
@@ -433,10 +440,11 @@ def handler(job: dict) -> dict:
 
                 # Resolution depuis la premiere image du premier batch
                 if height is None:
-                    height, width = compute_target_resolution(current_images[0], resolution=resolution)
+                    height, width = compute_target_resolution(resolution=resolution, image_path=current_images[0], dynamic=dynamic_resolution)
                     log.info(
-                        "Resolution cible: %dx%d (%s, %s)",
+                        "Resolution cible: %dx%d (%s, %s%s)",
                         width, height, resolution, "2-stage" if two_stage else "1-stage",
+                        ", dynamic" if dynamic_resolution else "",
                     )
 
                 # --- Prefetch du batch suivant AVANT le denoising GPU ---
