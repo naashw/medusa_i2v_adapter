@@ -35,13 +35,13 @@ from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDO
 from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import decode_video as vae_decode_video
 
-from ltx_core.text_encoders.gemma import encode_text
 from ltx_core.types import LatentState, VideoPixelShape
 from ltx_pipelines.utils import ModelLedger
 from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
 from ltx_pipelines.utils.helpers import (
     cleanup_memory,
     denoise_audio_video,
+    encode_prompts,
     euler_denoising_loop,
     image_conditionings_by_replacing_latent,
     modality_from_latent_state,
@@ -171,18 +171,18 @@ class MedusaPipeline:
             checkpoint_path=self._checkpoint_path,
             gemma_root_path=self._gemma_root,
         )
-        text_encoder = cpu_ledger.text_encoder()
 
         # Encoder tous les prompts : 7 presets camera + 1 negative
         all_prompts = list(CAMERA_PRESETS.values()) + [DEFAULT_NEGATIVE_PROMPT]
         all_keys = list(CAMERA_PRESETS.keys()) + ["_negative"]
 
         log.info("Encoding %d prompts...", len(all_prompts))
-        results = encode_text(text_encoder, prompts=all_prompts)
+        results = encode_prompts(all_prompts, cpu_ledger)
 
         # Construire le cache
         cache_data: dict[str, dict[str, torch.Tensor]] = {}
-        for key, (v_ctx, a_ctx) in zip(all_keys, results):
+        for key, output in zip(all_keys, results):
+            v_ctx, a_ctx = output.video_encoding, output.audio_encoding
             cache_data[key] = {"video": v_ctx.cpu(), "audio": a_ctx.cpu()}
             self._embeddings_cache[key] = (v_ctx.to(self.device), a_ctx.to(self.device))
 
@@ -191,8 +191,6 @@ class MedusaPipeline:
         torch.save(cache_data, cache_path)
         log.info("Embeddings sauvegardes: %s (%d prompts)", cache_path, len(cache_data))
 
-        # Liberer le text encoder
-        del text_encoder
         del cpu_ledger
         cleanup_memory()
 
@@ -408,16 +406,15 @@ class MedusaPipeline:
             checkpoint_path=self._checkpoint_path,
             gemma_root_path=self._gemma_root,
         )
-        text_encoder = te_ledger.text_encoder()
 
         prompts_to_encode = [prompt]
         if negative and negative != DEFAULT_NEGATIVE_PROMPT:
             prompts_to_encode.append(negative)
 
-        results = encode_text(text_encoder, prompts=prompts_to_encode)
-        v_ctx, a_ctx = results[0]
+        results = encode_prompts(prompts_to_encode, te_ledger)
+        v_ctx, a_ctx = results[0].video_encoding, results[0].audio_encoding
 
-        del text_encoder, te_ledger
+        del te_ledger
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

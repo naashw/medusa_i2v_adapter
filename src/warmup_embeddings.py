@@ -50,15 +50,19 @@ def vram_gb() -> str:
     return "N/A"
 
 
-def build_text_encoder(checkpoint_path: str, gemma_root: str) -> torch.nn.Module:
-    """Construit le AVGemmaTextEncoderModel sans ModelLedger.
+def build_encoder_and_processor(checkpoint_path: str, gemma_root: str) -> tuple:
+    """Construit GemmaTextEncoder + EmbeddingsProcessor sans ModelLedger.
 
-    Charge seulement les 59 cles text encoder (2.7 GB) du checkpoint,
+    Charge seulement les cles embeddings processor du checkpoint,
     puis Gemma depuis HuggingFace. Utilise le GPU si disponible.
     Peak RAM ~35 GB au lieu de ~106 GB.
+
+    Returns:
+        (GemmaTextEncoder, EmbeddingsProcessor) prets a l'emploi sur GPU.
     """
-    from ltx_core.text_encoders.gemma.encoders.av_encoder import (
-        AVGemmaTextEncoderModelConfigurator,
+    from ltx_core.text_encoders.gemma.encoders.encoder_configurator import (
+        EmbeddingsProcessorConfigurator,
+        GemmaTextEncoderConfigurator,
         create_and_populate,
     )
     from ltx_core.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
@@ -67,40 +71,40 @@ def build_text_encoder(checkpoint_path: str, gemma_root: str) -> torch.nn.Module
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log.info("Text encoder device: %s", device)
 
-    # 1. Extraire seulement les 59 cles text encoder du checkpoint
-    log.info("Extraction des cles text encoder du checkpoint...")
+    # 1. Extraire les cles embeddings processor du checkpoint
+    log.info("Extraction des cles embeddings processor du checkpoint...")
     f = safe_open(checkpoint_path, framework="pt")
     metadata = f.metadata()
     config = json.loads(metadata["config"])
 
-    te_prefixes = (
+    ep_prefixes = (
         "text_embedding_projection",
         "model.diffusion_model.video_embeddings_connector",
         "model.diffusion_model.audio_embeddings_connector",
     )
     remapped: dict[str, torch.Tensor] = {}
     for key in f.keys():
-        if key.startswith(te_prefixes):
+        if key.startswith(ep_prefixes):
             new_key = key
             new_key = new_key.replace(
-                "text_embedding_projection.", "feature_extractor_linear."
+                "text_embedding_projection.", "feature_extractor."
             )
             new_key = new_key.replace(
                 "model.diffusion_model.video_embeddings_connector.",
-                "embeddings_connector.",
+                "video_connector.",
             )
             new_key = new_key.replace(
                 "model.diffusion_model.audio_embeddings_connector.",
-                "audio_embeddings_connector.",
+                "audio_connector.",
             )
             remapped[new_key] = f.get_tensor(key).to(torch.bfloat16)
     del f
     gc.collect()
-    log.info("59 cles TE extraites (2.7 GB). RAM: %d MB", ram_mb())
+    log.info("Cles embeddings processor extraites (%d). RAM: %d MB", len(remapped), ram_mb())
 
-    # 2. Creer le modele shell sur meta device
-    te_model = AVGemmaTextEncoderModelConfigurator.from_config(config["transformer"])
-    log.info("Modele shell cree. RAM: %d MB", ram_mb())
+    # 2. Creer le text encoder shell sur meta device
+    te = GemmaTextEncoderConfigurator.from_config(config["transformer"])
+    log.info("Text encoder shell cree. RAM: %d MB", ram_mb())
 
     # 3. Charger Gemma depuis HuggingFace (GPU direct si disponible)
     log.info("Chargement Gemma 3 12B (device=%s)...", device)
@@ -126,34 +130,39 @@ def build_text_encoder(checkpoint_path: str, gemma_root: str) -> torch.nn.Module
             gemma = gemma.to(device)
         log.info("Gemma charge (fallback). RAM: %d MB, VRAM: %s", ram_mb(), vram_gb())
 
-    te_model.model = gemma
+    te.model = gemma
     log.info("Gemma assigne. RAM: %d MB", ram_mb())
 
-    # 4. Charger les connectors/projection
-    missing, unexpected = te_model.load_state_dict(remapped, strict=False)
+    # 4. Tokenizer
+    te.tokenizer = LTXVGemmaTokenizer(gemma_root)
+
+    # 5. RoPE setup
+    te = create_and_populate(te)
+
+    # 6. Deplacer text encoder vers device
+    if device == "cuda":
+        te = te.to(device)
+        log.info("Text encoder deplace vers %s. VRAM: %s", device, vram_gb())
+
+    log.info("Text encoder pret. RAM: %d MB, VRAM: %s", ram_mb(), vram_gb())
+
+    # 7. Creer l'embeddings processor (connectors + feature extractor)
+    emb_proc = EmbeddingsProcessorConfigurator.from_config(config)
+    missing, unexpected = emb_proc.load_state_dict(remapped, strict=False)
     del remapped
     gc.collect()
     log.info(
-        "Connectors charges. Missing: %d (Gemma keys — attendu), Unexpected: %d",
+        "Embeddings processor charge. Missing: %d, Unexpected: %d",
         len(missing),
         len(unexpected),
     )
 
-    # 5. Tokenizer
-    te_model.tokenizer = LTXVGemmaTokenizer(gemma_root)
-
-    # 6. RoPE setup
-    te_model = create_and_populate(te_model)
-
-    # 7. Deplacer les connectors/projection vers device (Gemma deja sur device)
+    # 8. Deplacer embeddings processor vers device
     if device == "cuda":
-        for name, child in te_model.named_children():
-            if name != "model":
-                child.to(device)
-        log.info("Connectors deplaces vers %s. VRAM: %s", device, vram_gb())
+        emb_proc = emb_proc.to(device)
+        log.info("Embeddings processor deplace vers %s. VRAM: %s", device, vram_gb())
 
-    log.info("Text encoder pret. RAM: %d MB, VRAM: %s", ram_mb(), vram_gb())
-    return te_model
+    return te, emb_proc
 
 
 def main() -> int:
@@ -183,30 +192,28 @@ def main() -> int:
         log.error("Gemma introuvable: %s", gemma_root)
         return 1
 
-    # Construire le text encoder (GPU si disponible)
-    te_model = build_text_encoder(checkpoint_path, gemma_root)
+    # Construire text encoder + embeddings processor (GPU si disponible)
+    te, emb_proc = build_encoder_and_processor(checkpoint_path, gemma_root)
 
     # Encoder tous les prompts : 7 cameras + 1 negative
-    from ltx_core.text_encoders.gemma import encode_text
-
     all_prompts = list(CAMERA_PRESETS.values()) + [DEFAULT_NEGATIVE_PROMPT]
     all_keys = list(CAMERA_PRESETS.keys()) + ["_negative"]
     log.info("Encoding %d prompts...", len(all_prompts))
 
-    results = encode_text(te_model, prompts=all_prompts)
-    log.info("Encoding termine. RAM: %d MB, VRAM: %s", ram_mb(), vram_gb())
-
-    # Construire et sauvegarder le cache
     cache_data: dict[str, dict[str, torch.Tensor]] = {}
-    for key, (v_ctx, a_ctx) in zip(all_keys, results):
-        cache_data[key] = {"video": v_ctx.cpu(), "audio": a_ctx.cpu()}
+    for key, prompt in zip(all_keys, all_prompts):
+        hidden_states, mask = te.encode(prompt)
+        output = emb_proc.process_hidden_states(hidden_states, mask)
+        cache_data[key] = {"video": output.video_encoding.cpu(), "audio": output.audio_encoding.cpu()}
+
+    log.info("Encoding termine. RAM: %d MB, VRAM: %s", ram_mb(), vram_gb())
 
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     torch.save(cache_data, cache_path)
     log.info("Cache sauvegarde: %s (%d prompts)", cache_path, len(cache_data))
 
     # Cleanup complet (CPU + GPU)
-    del te_model, results, cache_data
+    del te, emb_proc, cache_data
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
