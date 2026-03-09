@@ -62,6 +62,32 @@ echo "[medusa] ==========================="
 migrate_volume() {
     echo "[medusa] === Migration volume LTX-2 → LTX-2.3 ==="
 
+    # Anciens fichiers a supprimer
+    local old_files=(
+        "models/checkpoints/ltx-2-19b-dev.safetensors"
+        "models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors"
+        "models/loras/ltx-2-19b-distilled-lora-384.safetensors"
+        "models/loras/LTX-2-Image2Vid-Adapter.safetensors"
+        "models/loras/ltx-2.3-22b-distilled-lora-384.safetensors"
+        "models/upscalers/ltx-2-spatial-upscaler-x2-1.0.safetensors"
+    )
+
+    # Detecter si une migration est necessaire (au moins un ancien fichier present)
+    local needs_migration=false
+    for f in "${old_files[@]}"; do
+        if [[ -f "${WORKSPACE}/${f}" ]]; then
+            needs_migration=true
+            break
+        fi
+    done
+
+    if [[ "$needs_migration" == "false" ]]; then
+        echo "[medusa] Pas de migration necessaire (aucun ancien fichier detecte)"
+        return
+    fi
+
+    echo "[medusa] Anciens fichiers detectes — migration en cours..."
+
     # Supprimer anciens caches (invalides avec nouveau modele)
     local cache_dirs=("cache/transformer" "cache/embeddings" "cache/dedup" "output")
     for d in "${cache_dirs[@]}"; do
@@ -72,15 +98,7 @@ migrate_volume() {
         fi
     done
 
-    # Supprimer anciens fichiers LTX-2
-    local old_files=(
-        "models/checkpoints/ltx-2-19b-dev.safetensors"
-        "models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors"
-        "models/loras/ltx-2-19b-distilled-lora-384.safetensors"
-        "models/loras/LTX-2-Image2Vid-Adapter.safetensors"
-        "models/loras/ltx-2.3-22b-distilled-lora-384.safetensors"
-        "models/upscalers/ltx-2-spatial-upscaler-x2-1.0.safetensors"
-    )
+    # Supprimer anciens fichiers
     for f in "${old_files[@]}"; do
         local target="${WORKSPACE}/${f}"
         if [[ -f "$target" ]]; then
