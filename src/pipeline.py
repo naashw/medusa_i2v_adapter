@@ -38,6 +38,7 @@ from ltx_core.model.video_vae import decode_video as vae_decode_video
 from ltx_core.types import LatentState, VideoPixelShape
 from ltx_pipelines.utils import ModelLedger
 from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
+from ltx_pipelines.utils.args import ImageConditioningInput
 from ltx_pipelines.utils.helpers import (
     cleanup_memory,
     denoise_audio_video,
@@ -450,10 +451,10 @@ class MedusaPipeline:
         stepper = EulerDiffusionStep()
 
         # 4. Image list
-        images = [(image_path, 0, image_strength)]
+        images = [ImageConditioningInput(path=image_path, frame_idx=0, strength=image_strength)]
         if last_image_path is not None:
             last_latent_idx = (num_frames - 1) // 8
-            images.append((last_image_path, last_latent_idx, last_image_strength))
+            images.append(ImageConditioningInput(path=last_image_path, frame_idx=last_latent_idx, strength=last_image_strength))
 
         # 5. Denoising loop — audio disabled (single CUDA graph, no guidance)
         # CFG=1.0, STG=0.0 → guiders are no-ops, audio not used for video generation.
@@ -754,12 +755,12 @@ class MedusaPipeline:
                 noiser_i = GaussianNoiser(generator=generators[i])
 
                 # Conditionings per item (batch=1)
-                images_i = [(item["image_path"], 0, image_strength)]
+                images_i = [ImageConditioningInput(path=item["image_path"], frame_idx=0, strength=image_strength)]
                 last_img = item.get("last_image_path")
                 if last_img:
                     last_idx = (num_frames - 1) // 8
                     last_str = item.get("last_image_strength", 1.0)
-                    images_i.append((last_img, last_idx, last_str))
+                    images_i.append(ImageConditioningInput(path=last_img, frame_idx=last_idx, strength=last_str))
 
                 conds_i = image_conditionings_by_replacing_latent(
                     images=images_i,
