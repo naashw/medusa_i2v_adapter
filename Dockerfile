@@ -61,8 +61,9 @@ RUN rm -rf /tmp/LTX-2
 # H100 sm_90 pour kernels SageAttention CUDA/Triton
 ENV TORCH_CUDA_ARCH_LIST="9.0"
 
-# --- SageAttention 2.2.0 (torch.compile natif, zero graph breaks) ---
-RUN pip install --no-build-isolation --no-cache-dir "sageattention>=2.2.0,<3"
+# --- SageAttention 2.2.0 from source (custom_op natif, zero graph breaks) ---
+# Pas sur PyPI (max 1.0.6), install depuis GitHub main branch
+RUN pip install --no-build-isolation --no-cache-dir "sageattention @ git+https://github.com/thu-ml/SageAttention.git"
 
 # --- Runtime Python dependencies (runpod, requests, etc.) ---
 COPY requirements.txt /tmp/requirements.txt
