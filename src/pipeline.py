@@ -986,8 +986,7 @@ class MedusaPipeline:
             decoded = vae_decode_video(item_latent, self._video_decoder, tiling, generators[i])
             item_frames = [chunk.cpu() for chunk in decoded]
             all_frames.append(item_frames)
-            if i < batch_size - 1:
-                torch.cuda.empty_cache()
 
+        torch.cuda.empty_cache()
         log.info("Batch frames generees: %d items", len(all_frames))
         return all_frames
