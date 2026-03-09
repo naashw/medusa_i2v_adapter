@@ -367,6 +367,8 @@ def handler(job: dict) -> dict:
     job_id = job.get("id", f"unknown-{int(time.time())}")
     job_input = job.get("input", {})
 
+    log.info("Job %s — input: %s", job_id, json.dumps(job_input, default=str))
+
     # --- Dedup cache EN PREMIER (filesystem only, pas besoin du pipeline) ---
     input_hash = compute_input_hash(job_input)
     cached = lookup_cache(input_hash)
