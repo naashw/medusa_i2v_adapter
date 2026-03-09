@@ -93,7 +93,7 @@ RUN apt-get update && \
         curl ffmpeg \
         libgl1 libglib2.0-0 \
         google-perftools tini \
-        gcc libc6-dev && \
+        gcc g++ libc6-dev && \
     ln -sf /usr/bin/python3 /usr/bin/python && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
