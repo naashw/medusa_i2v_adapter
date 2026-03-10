@@ -155,10 +155,14 @@ mkdir -p "${MODELS_DIR}/upscalers"
 mkdir -p "${WORKSPACE}/cache/transformer"
 mkdir -p "${WORKSPACE}/cache/triton"
 mkdir -p "${WORKSPACE}/cache/inductor"
+mkdir -p "${WORKSPACE}/output"
 
-# Exporter pour handler.py
 export MODELS_DIR="$MODELS_DIR"
 export VOLUME_ROOT="$WORKSPACE"
+export CACHE_DIR="${WORKSPACE}/cache"
+export OUTPUT_VOLUME_DIR="${WORKSPACE}/output"
+export TRITON_CACHE_DIR="${WORKSPACE}/cache/triton"
+export TORCHINDUCTOR_CACHE_DIR="${WORKSPACE}/cache/inductor"
 
 # -----------------------------------------------
 # 3. Fonction de telechargement
@@ -258,23 +262,13 @@ if [ "${SERVERLESS:-}" = "true" ] || [ -n "${RUNPOD_ENDPOINT_ID:-}" ]; then
     # ===== MODE SERVERLESS =====
     echo "[medusa] Mode: SERVERLESS (RunPod API)"
 
-    # Dossiers persistants sur le network volume
-    OUTPUT_DIR="${WORKSPACE}/output"
-    CACHE_DIR="${WORKSPACE}/cache"
-    mkdir -p "$OUTPUT_DIR" "$CACHE_DIR"
-    export OUTPUT_VOLUME_DIR="$OUTPUT_DIR"
-    export CACHE_DIR="$CACHE_DIR"
-    echo "[medusa] Output dir: $OUTPUT_DIR"
+    echo "[medusa] Output dir: $OUTPUT_VOLUME_DIR"
     echo "[medusa] Cache dir: $CACHE_DIR"
 
     # Warmup embeddings dans un process isole (l'OS recupere 100% RAM a la fin)
     echo "[medusa] Warmup embeddings (process isole)..."
     LD_PRELOAD="" python /app/warmup_embeddings.py
     echo "[medusa] Warmup termine, lancement handler..."
-
-    # Cache Triton/TorchInductor persistant sur le volume (autotuning reutilise entre runs)
-    export TRITON_CACHE_DIR="${WORKSPACE}/cache/triton"
-    export TORCHINDUCTOR_CACHE_DIR="${WORKSPACE}/cache/inductor"
 
     exec env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python /app/handler.py
 
