@@ -51,10 +51,6 @@ MODELS_DIR="${WORKSPACE}/models"
 echo "[medusa] Workspace: $WORKSPACE"
 echo "[medusa] Models dir: $MODELS_DIR"
 
-# Audit espace disque au demarrage
-echo "[medusa] === Espace disque volume ==="
-du -sh "$WORKSPACE"/* 2>/dev/null | sort -rh | head -20 || echo "[medusa] Volume vide ou inaccessible"
-echo "[medusa] ==========================="
 
 # -----------------------------------------------
 # 2b. Migration volume LTX-2 → LTX-2.3 (idempotent)
