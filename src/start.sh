@@ -159,6 +159,7 @@ export CACHE_DIR="${WORKSPACE}/cache"
 export OUTPUT_VOLUME_DIR="${WORKSPACE}/output"
 export TRITON_CACHE_DIR="${WORKSPACE}/cache/triton"
 export TORCHINDUCTOR_CACHE_DIR="${WORKSPACE}/cache/inductor"
+export TORCHINDUCTOR_FX_GRAPH_CACHE=1
 
 # -----------------------------------------------
 # 3. Fonction de telechargement

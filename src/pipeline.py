@@ -361,6 +361,7 @@ class MedusaPipeline:
         # torch.compile — dynamic=True pour eviter les recompilations entre stages
         # SA incompatible CUDA graphs → max-autotune-no-cudagraphs (autotuning Triton sans CUDA graphs).
         if os.environ.get("TORCH_COMPILE", "1") == "1":
+            torch._inductor.config.fx_graph_cache = True
             torch._dynamo.config.automatic_dynamic_shapes = True
             torch._dynamo.config.allow_unspec_int_on_nn_module = True
             torch._dynamo.config.cache_size_limit = 32
