@@ -160,6 +160,8 @@ export OUTPUT_VOLUME_DIR="${WORKSPACE}/output"
 export TRITON_CACHE_DIR="${WORKSPACE}/cache/triton"
 export TORCHINDUCTOR_CACHE_DIR="${WORKSPACE}/cache/inductor"
 export TORCHINDUCTOR_FX_GRAPH_CACHE=1
+export PYTHONHASHSEED="${PYTHONHASHSEED:-0}"
+echo "[medusa] Inductor cache: $TORCHINDUCTOR_CACHE_DIR (FX_GRAPH=$TORCHINDUCTOR_FX_GRAPH_CACHE, PYTHONHASHSEED=$PYTHONHASHSEED)"
 
 # -----------------------------------------------
 # 3. Fonction de telechargement

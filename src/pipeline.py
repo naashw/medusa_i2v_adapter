@@ -362,6 +362,12 @@ class MedusaPipeline:
         # SA incompatible CUDA graphs → max-autotune-no-cudagraphs (autotuning Triton sans CUDA graphs).
         if os.environ.get("TORCH_COMPILE", "1") == "1":
             torch._inductor.config.fx_graph_cache = True
+            log.info(
+                "Inductor config: fx_graph_cache=%s, cache_dir=%s, PYTHONHASHSEED=%s",
+                torch._inductor.config.fx_graph_cache,
+                os.environ.get("TORCHINDUCTOR_CACHE_DIR", "(default)"),
+                os.environ.get("PYTHONHASHSEED", "NOT SET"),
+            )
             torch._dynamo.config.automatic_dynamic_shapes = True
             torch._dynamo.config.allow_unspec_int_on_nn_module = True
             torch._dynamo.config.cache_size_limit = 32

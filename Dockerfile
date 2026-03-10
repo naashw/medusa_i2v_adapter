@@ -82,6 +82,7 @@ FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
+    PYTHONHASHSEED=0 \
     PATH="/opt/venv/bin:$PATH" \
     RUNPOD_INIT_TIMEOUT=600 \
     HF_XET_HIGH_PERFORMANCE=1
