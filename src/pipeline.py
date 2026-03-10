@@ -367,6 +367,13 @@ class MedusaPipeline:
             torch._dynamo.config.recompile_limit = 16
             if sage_active:
                 compile_mode = "max-autotune-no-cudagraphs"
+                try:
+                    import sageattention._fused as _sa_fused
+                    torch.compiler.allow_in_graph(_sa_fused.transpose_pad_permute_cuda)
+                    torch.compiler.allow_in_graph(_sa_fused.scale_fuse_quant_cuda)
+                    log.info("SageAttention _fused ops: allow_in_graph active")
+                except Exception as e:
+                    log.warning("allow_in_graph SageAttention echoue: %s", e)
             else:
                 compile_mode = os.environ.get("COMPILE_MODE", "reduce-overhead")
                 valid_modes = {"default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"}
