@@ -302,19 +302,6 @@ class MedusaPipeline:
             rsvd = torch.cuda.memory_reserved() / 2**30
             log.info("VRAM [%s]: %.2fGB alloc, %.2fGB reserved", label, alloc, rsvd)
 
-    @staticmethod
-    def _log_cache_stats(label: str) -> None:
-        """Log le nombre de fichiers dans les caches Inductor et Triton."""
-        for name, env_key in [("inductor", "TORCHINDUCTOR_CACHE_DIR"), ("triton", "TRITON_CACHE_DIR")]:
-            cache_dir = os.environ.get(env_key)
-            if not cache_dir or not os.path.isdir(cache_dir):
-                continue
-            try:
-                count = sum(len(files) for _, _, files in os.walk(cache_dir))
-                log.info("Cache %s [%s]: %d fichiers (%s)", name, label, count, cache_dir)
-            except Exception as e:
-                log.debug("Cache %s [%s]: erreur comptage: %s", name, label, e)
-
     def _get_orig_module(self) -> torch.nn.Module:
         """Unwrap torch.compile OptimizedModule si besoin."""
         mod = self._transformer
@@ -602,7 +589,6 @@ class MedusaPipeline:
                     rsvd = torch.cuda.memory_reserved() / 2**30
                     log.info("step %d: %.2fs (sigma=%.4f) VRAM %.2fGB alloc %.2fGB rsvd",
                              step_index, dt, sigma.item(), alloc, rsvd)
-                    self._log_cache_stats("apres step 0")
                 else:
                     log.debug("step %d: %.2fs (sigma=%.4f)", step_index, dt, sigma.item())
                 if dt > 10.0:
@@ -976,7 +962,6 @@ class MedusaPipeline:
                         "batch step %d: %.2fs (sigma=%.4f) VRAM %.2fGB alloc %.2fGB rsvd",
                         step_index, dt, sigma.item(), alloc, rsvd,
                     )
-                    self._log_cache_stats("apres batch step 0")
                 else:
                     log.debug("batch step %d: %.2fs (sigma=%.4f)", step_index, dt, sigma.item())
                 if dt > 10.0:
