@@ -160,8 +160,14 @@ export OUTPUT_VOLUME_DIR="${WORKSPACE}/output"
 export TRITON_CACHE_DIR="${WORKSPACE}/cache/triton"
 export TORCHINDUCTOR_CACHE_DIR="${WORKSPACE}/cache/inductor"
 export TORCHINDUCTOR_FX_GRAPH_CACHE=1
+export TORCHINDUCTOR_AUTOGRAD_CACHE=1
 export PYTHONHASHSEED="${PYTHONHASHSEED:-0}"
-echo "[medusa] Inductor cache: $TORCHINDUCTOR_CACHE_DIR (FX_GRAPH=$TORCHINDUCTOR_FX_GRAPH_CACHE, PYTHONHASHSEED=$PYTHONHASHSEED)"
+
+# Diagnostic caches persistants
+INDUCTOR_FILES=$(find "$TORCHINDUCTOR_CACHE_DIR" -type f 2>/dev/null | wc -l)
+TRITON_FILES=$(find "$TRITON_CACHE_DIR" -type f 2>/dev/null | wc -l)
+echo "[medusa] Inductor cache: $TORCHINDUCTOR_CACHE_DIR ($INDUCTOR_FILES fichiers, FX_GRAPH=$TORCHINDUCTOR_FX_GRAPH_CACHE, AUTOGRAD=$TORCHINDUCTOR_AUTOGRAD_CACHE)"
+echo "[medusa] Triton cache: $TRITON_CACHE_DIR ($TRITON_FILES fichiers)"
 
 # -----------------------------------------------
 # 3. Fonction de telechargement

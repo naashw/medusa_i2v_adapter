@@ -226,6 +226,21 @@ class MedusaPipeline:
             rsvd = torch.cuda.memory_reserved() / 2**30
             log.info("VRAM [%s]: %.2fGB alloc, %.2fGB reserved", label, alloc, rsvd)
 
+    @staticmethod
+    def _log_cache_stats(label: str) -> None:
+        """Log le nombre de fichiers dans les caches Inductor et Triton."""
+        import subprocess
+        for name, env_key in [("inductor", "TORCHINDUCTOR_CACHE_DIR"), ("triton", "TRITON_CACHE_DIR")]:
+            cache_dir = os.environ.get(env_key)
+            if not cache_dir:
+                continue
+            result = subprocess.run(
+                ["find", cache_dir, "-type", "f"],
+                capture_output=True, text=True, timeout=5,
+            )
+            count = len(result.stdout.strip().split("\n")) if result.stdout.strip() else 0
+            log.info("Cache %s [%s]: %d fichiers (%s)", name, label, count, cache_dir)
+
     def _get_orig_module(self) -> torch.nn.Module:
         """Unwrap torch.compile OptimizedModule si besoin."""
         mod = self._transformer
@@ -363,10 +378,10 @@ class MedusaPipeline:
         if os.environ.get("TORCH_COMPILE", "1") == "1":
             torch._inductor.config.fx_graph_cache = True
             log.info(
-                "Inductor config: fx_graph_cache=%s, cache_dir=%s, PYTHONHASHSEED=%s",
+                "Inductor config: fx_graph_cache=%s, autograd_cache=%s, cache_dir=%s",
                 torch._inductor.config.fx_graph_cache,
+                os.environ.get("TORCHINDUCTOR_AUTOGRAD_CACHE", "0"),
                 os.environ.get("TORCHINDUCTOR_CACHE_DIR", "(default)"),
-                os.environ.get("PYTHONHASHSEED", "NOT SET"),
             )
             torch._dynamo.config.automatic_dynamic_shapes = True
             torch._dynamo.config.allow_unspec_int_on_nn_module = True
@@ -511,6 +526,7 @@ class MedusaPipeline:
                     rsvd = torch.cuda.memory_reserved() / 2**30
                     log.info("step %d: %.2fs (sigma=%.4f) VRAM %.2fGB alloc %.2fGB rsvd",
                              step_index, dt, sigma.item(), alloc, rsvd)
+                    self._log_cache_stats("apres step 0")
                 else:
                     log.debug("step %d: %.2fs (sigma=%.4f)", step_index, dt, sigma.item())
                 if dt > 10.0:
@@ -884,6 +900,7 @@ class MedusaPipeline:
                         "batch step %d: %.2fs (sigma=%.4f) VRAM %.2fGB alloc %.2fGB rsvd",
                         step_index, dt, sigma.item(), alloc, rsvd,
                     )
+                    self._log_cache_stats("apres batch step 0")
                 else:
                     log.debug("batch step %d: %.2fs (sigma=%.4f)", step_index, dt, sigma.item())
                 if dt > 10.0:
