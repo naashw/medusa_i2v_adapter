@@ -323,6 +323,8 @@ class MedusaPipeline:
             ic = torch._inductor.config
             log.info("  config.cache_dir=%s", getattr(ic, "cache_dir", "(attr missing)"))
             log.info("  config.fx_graph_cache=%s", getattr(ic, "fx_graph_cache", "(attr missing)"))
+            log.info("  config.compile_threads=%s", getattr(ic, "compile_threads", "(attr missing)"))
+            log.info("  os.cpu_count()=%s", os.cpu_count())
         except Exception as e:
             log.warning("  config read failed: %s", e)
 
@@ -355,10 +357,10 @@ class MedusaPipeline:
             cfg_str = json.dumps(cfg, sort_keys=True, default=str)
             cfg_hash = hashlib.sha256(cfg_str.encode()).hexdigest()[:16]
             log.info("  inductor_config hash=%s (%d keys)", cfg_hash, len(cfg))
-            # Log les valeurs non-default pour identifier les différences
+            # Log les valeurs non-default pour identifier les differences entre containers
             for k, v in sorted(cfg.items()):
                 if v is not None and v != "" and v is not False and v != 0:
-                    log.debug("  inductor_config %s=%s", k, v)
+                    log.info("  inductor_config %s=%s", k, v)
         except Exception as e:
             log.warning("  inductor_config hash failed: %s", e)
 
@@ -525,6 +527,14 @@ class MedusaPipeline:
         # SA incompatible CUDA graphs → max-autotune-no-cudagraphs (autotuning Triton sans CUDA graphs).
         if os.environ.get("TORCH_COMPILE", "1") == "1":
             torch._inductor.config.fx_graph_cache = True
+            # compile_threads DOIT etre fixe — sinon varie selon cpu_count() du worker
+            # RunPod et change le hash du cache key (save_config_portable inclut cette valeur)
+            torch._inductor.config.compile_threads = 1
+            # Forcer cache_dir depuis env var (si config importe avant que env var soit lue,
+            # la valeur par defaut /tmp/torchinductor_root/ serait utilisee)
+            cache_dir_val = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+            if cache_dir_val:
+                torch._inductor.config.cache_dir = cache_dir_val
 
             # === DIAGNOSTIC CACHE INDUCTOR ===
             self._log_inductor_cache_diagnostic()
