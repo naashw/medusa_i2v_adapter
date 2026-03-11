@@ -60,6 +60,9 @@ from prompts import CAMERA_PRESETS, DEFAULT_NEGATIVE_PROMPT
 
 log = logging.getLogger("medusa")
 
+# Cache module-level pour eviter double-registration du custom_op
+_cached_sageattn_op: callable | None = None
+
 
 def _build_patched_sageattn_sm90():
     """Build torch.compile-friendly sageattn_qk_int8_pv_fp8_cuda_sm90.
@@ -79,12 +82,12 @@ def _build_patched_sageattn_sm90():
         src = inspect.getsource(orig_fn)
     except (OSError, TypeError):
         log.warning("Cannot inspect sageattn sm90 source, using unpatched")
-        return orig_fn
+        return lambda q, k, v: orig_fn(q, k, v, tensor_layout="HND", is_causal=False)
 
     target = "torch.cuda.set_device(v.device)"
     if target not in src:
         log.info("sageattn sm90: set_device absent — deja patche ou API changee")
-        return orig_fn
+        return lambda q, k, v: orig_fn(q, k, v, tensor_layout="HND", is_causal=False)
 
     patched_src = src.replace(
         f"    {target}",
@@ -97,15 +100,39 @@ def _build_patched_sageattn_sm90():
         exec(compile(patched_src, f"<patched {orig_fn.__qualname__}>", "exec"), ns)
     except Exception as e:
         log.warning("Failed to compile patched sageattn sm90: %s", e)
-        return orig_fn
+        return lambda q, k, v: orig_fn(q, k, v, tensor_layout="HND", is_causal=False)
 
     patched_fn = ns.get(orig_fn.__name__)
     if not callable(patched_fn):
         log.warning("Patched sageattn sm90 not found in namespace")
-        return orig_fn
+        return lambda q, k, v: orig_fn(q, k, v, tensor_layout="HND", is_causal=False)
 
     log.info("sageattn sm90 patched: torch.cuda.set_device removed (graph break fix)")
-    return patched_fn
+
+    # Step 3: Wrapper custom_op — Dynamo voit un seul noeud opaque, zero graph breaks
+    # Les kernels internes (Triton quant, CUTLASS sm90) tournent normalement au runtime
+    global _cached_sageattn_op
+    if _cached_sageattn_op is not None:
+        log.info("sageattn sm90: custom_op deja enregistre, reutilisation cache")
+        return _cached_sageattn_op
+
+    try:
+        @torch.library.custom_op("medusa::sageattn_sm90", mutates_args=(), device_types="cuda")
+        def sageattn_sm90(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+            return patched_fn(q, k, v, tensor_layout="HND", is_causal=False)
+
+        @sageattn_sm90.register_fake
+        def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+            return torch.empty_like(q)
+
+        _cached_sageattn_op = sageattn_sm90
+        log.info("sageattn sm90: custom_op registered (zero graph breaks)")
+        return sageattn_sm90
+    except Exception as e:
+        log.warning("sageattn sm90: custom_op failed (%s), using patched fn directly", e)
+        wrapped = lambda q, k, v: patched_fn(q, k, v, tensor_layout="HND", is_causal=False)
+        _cached_sageattn_op = wrapped
+        return wrapped
 
 
 class SageAttentionCallable:
@@ -129,7 +156,7 @@ class SageAttentionCallable:
         k = k.to(torch.bfloat16)
         v = v.to(torch.bfloat16)
         q, k, v = (t.view(b, -1, heads, dim_head).transpose(1, 2) for t in (q, k, v))
-        out = self._sageattn(q, k, v, tensor_layout="HND", is_causal=False)
+        out = self._sageattn(q, k, v)
         out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
         return out
 
