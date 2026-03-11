@@ -229,17 +229,15 @@ class MedusaPipeline:
     @staticmethod
     def _log_cache_stats(label: str) -> None:
         """Log le nombre de fichiers dans les caches Inductor et Triton."""
-        import subprocess
         for name, env_key in [("inductor", "TORCHINDUCTOR_CACHE_DIR"), ("triton", "TRITON_CACHE_DIR")]:
             cache_dir = os.environ.get(env_key)
-            if not cache_dir:
+            if not cache_dir or not os.path.isdir(cache_dir):
                 continue
-            result = subprocess.run(
-                ["find", cache_dir, "-type", "f"],
-                capture_output=True, text=True, timeout=5,
-            )
-            count = len(result.stdout.strip().split("\n")) if result.stdout.strip() else 0
-            log.info("Cache %s [%s]: %d fichiers (%s)", name, label, count, cache_dir)
+            try:
+                count = sum(len(files) for _, _, files in os.walk(cache_dir))
+                log.info("Cache %s [%s]: %d fichiers (%s)", name, label, count, cache_dir)
+            except Exception as e:
+                log.debug("Cache %s [%s]: erreur comptage: %s", name, label, e)
 
     def _get_orig_module(self) -> torch.nn.Module:
         """Unwrap torch.compile OptimizedModule si besoin."""
