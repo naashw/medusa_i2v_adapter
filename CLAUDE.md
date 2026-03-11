@@ -139,8 +139,8 @@ Objectif : generation rapide de videos a partir d'images, qualite correcte.
   - Meme transformer pour les 2 stages
 - **Eager init** : pipeline init complet AVANT `runpod.serverless.start()` — premier job sans cold start
 - **Download parallele** : toutes les images (image + last_image) de tous les items telecharges en parallele via ThreadPoolExecutor au debut du job
-- **torch.compile** : `torch.compile(dynamic=True)` sur le transformer ET le video decoder (desactivable via `TORCH_COMPILE=0` et `VAE_COMPILE=0`). `mode=max-autotune-no-cudagraphs` quand SageAttention actif (autotuning Triton sans CUDA graphs, incompatibles avec kernels SA), `COMPILE_MODE` configurable sinon. Cache Triton + TorchInductor persistant sur volume (`TRITON_CACHE_DIR`, `TORCHINDUCTOR_CACHE_DIR`). `cache_size_limit=32`, `recompile_limit=16`, `automatic_dynamic_shapes=True` pour eviter les recompilations entre stages 1/2.
-- **Batching multi-client** : items regroupes par `camera_motion` (= meme prompt). Chaque groupe traite via `generate_batch_frames()` (batch homogene) ou `generate_frames()` (single). Resultats reordonnes par `_original_index`.
+- **torch.compile** : `torch.compile(dynamic=True)` sur le transformer ET le video decoder (desactivable via `TORCH_COMPILE=0` et `VAE_COMPILE=0`). `mode=max-autotune-no-cudagraphs` quand SageAttention actif (autotuning Triton sans CUDA graphs, incompatibles avec kernels SA), `COMPILE_MODE` configurable sinon. Cache Triton + TorchInductor persistant sur volume (`TRITON_CACHE_DIR`, `TORCHINDUCTOR_CACHE_DIR`). Cache Inductor versionne par build hash (`/app/.build_hash` = md5 source + pip freeze) → invalidation auto a chaque nouveau build Docker. `cache_size_limit=32`, `recompile_limit=16`, `automatic_dynamic_shapes=True` pour eviter les recompilations entre stages 1/2.
+- **Batching multi-client** : items regroupes par `camera_motion` (= meme prompt). Toujours traite via `generate_batch_frames()` avec padding a `MAX_BATCH` (defaut 3) pour shape fixe dans le compile cache. Resultats reordonnes par `_original_index`.
 - **Batching GPU** : `generate_batch_frames()` traite N images en un seul forward transformer (batch=N). Per-item noise (seeds differents), image encoding individuel. Spatial upscaler et VAE decode en sub-batches de `BATCH_SIZE`. `torch.cuda.empty_cache()` entre chaque stage (transformer → upscaler → stage 2 → VAE). Configurable via `BATCH_SIZE` (defaut 5).
 - **Async post-processing** : MP4 encode + S3 upload en parallele du GPU via ThreadPoolExecutor(3)
 - **SageAttention 2.2.0** : patch runtime `attention_function` sur les modules `Attention` du transformer uniquement (pas VAE, pas encoder, pas upsampler). `@torch.library.custom_op` natif (zero graph breaks, compatible torch.compile). Fallback SDPA si mask present. Desactivable via `SAGE_ATTENTION=0`.
@@ -157,8 +157,8 @@ Objectif : generation rapide de videos a partir d'images, qualite correcte.
 1. Signal handlers (SIGTERM/SIGINT/SIGQUIT)
 2. tcmalloc (LD_PRELOAD) pour optimisation memoire
 3. Migration volume (cleanup anciens modeles LTX-2, download LTX-2.3)
-4. Download modeles (hf_xet) + validation safetensors via `safe_open()`
-5. Audit volume (dry-run)
+4. Setup caches (Inductor versionne par build hash `/app/.build_hash`, Triton)
+5. Download modeles (hf_xet) + validation safetensors via `safe_open()`
 6. Mode detection : SERVERLESS → warmup + handler.py | GPU POD → JupyterLab :8888
 
 ## Flow d'Init Pipeline (eager, 1 seule fois)
@@ -209,10 +209,11 @@ Objectif : generation rapide de videos a partir d'images, qualite correcte.
 - `TORCH_COMPILE=1` (defaut) : torch.compile sur le transformer. `0` pour desactiver
 - `COMPILE_MODE=reduce-overhead` (defaut, applique uniquement quand SAGE_ATTENTION=0) : mode torch.compile. Valeurs : `default`, `reduce-overhead`, `max-autotune`, `max-autotune-no-cudagraphs`. Quand SageAttention actif, force `max-autotune-no-cudagraphs` (autotuning Triton sans CUDA graphs, incompatibles avec kernels SA)
 - `TRITON_CACHE_DIR` : repertoire cache Triton persistant (defaut `/runpod-volume/cache/triton/`). Autotuning sauvegarde les configs kernel optimales
-- `TORCHINDUCTOR_CACHE_DIR` : repertoire cache TorchInductor persistant (defaut `/runpod-volume/cache/inductor/`). Graphes compiles sauvegardes
+- `TORCHINDUCTOR_CACHE_DIR` : repertoire cache TorchInductor persistant (defaut `/runpod-volume/cache/inductor/{build_hash}/`). Versionne automatiquement par build hash Docker — invalide auto a chaque rebuild
 - `VAE_COMPILE=1` (defaut) : torch.compile(dynamic=True) sur le video decoder. `0` pour desactiver
 - `TRANSFORMER_CACHE=1` (defaut) : cache transformer pre-fusionne. `0` pour desactiver
 - `SAMPLER=euler` (defaut) : stepper de denoising. `res2s` pour Res2sDiffusionStep (second ordre)
 - `VAE_TILING=0` (defaut) : `1` pour activer le tiled VAE decode (reduit VRAM en 1080p, risque ghosting temporal)
 - `BATCH_SIZE=5` (defaut) : taille max du sous-batch pour le denoising transformer en batch mode
+- `MAX_BATCH=3` (defaut) : handler pad toujours le sub-batch a cette taille pour shape fixe dans le compile cache Dynamo (evite recompilations)
 - Le checkpoint FP8 scaled (`ltx-2.3-22b-dev-fp8.safetensors`) est INCOMPATIBLE avec la fusion LoRA dans ltx-core — utiliser le checkpoint distilled BF16 avec `fp8_cast()` a la place
