@@ -150,7 +150,9 @@ mkdir -p "${MODELS_DIR}/loras"
 mkdir -p "${MODELS_DIR}/upscalers"
 mkdir -p "${WORKSPACE}/cache/transformer"
 mkdir -p "${WORKSPACE}/cache/triton"
-mkdir -p "${WORKSPACE}/cache/inductor"
+# Inductor cache versione par build hash (source + packages) — invalide auto
+INDUCTOR_CACHE_V=$(cat /app/.build_hash 2>/dev/null || echo "unknown")
+mkdir -p "${WORKSPACE}/cache/inductor/${INDUCTOR_CACHE_V}"
 mkdir -p "${WORKSPACE}/output"
 
 export MODELS_DIR="$MODELS_DIR"
@@ -158,7 +160,7 @@ export VOLUME_ROOT="$WORKSPACE"
 export CACHE_DIR="${WORKSPACE}/cache"
 export OUTPUT_VOLUME_DIR="${WORKSPACE}/output"
 export TRITON_CACHE_DIR="${WORKSPACE}/cache/triton"
-export TORCHINDUCTOR_CACHE_DIR="${WORKSPACE}/cache/inductor"
+export TORCHINDUCTOR_CACHE_DIR="${WORKSPACE}/cache/inductor/${INDUCTOR_CACHE_V}"
 export TORCHINDUCTOR_FX_GRAPH_CACHE=1
 export TORCHINDUCTOR_AUTOGRAD_CACHE=1
 export PYTHONHASHSEED="${PYTHONHASHSEED:-0}"
