@@ -61,13 +61,62 @@ from prompts import CAMERA_PRESETS, DEFAULT_NEGATIVE_PROMPT
 log = logging.getLogger("medusa")
 
 
+def _build_patched_sageattn_sm90():
+    """Build torch.compile-friendly sageattn_qk_int8_pv_fp8_cuda_sm90.
+
+    Bypass deux sources de graph breaks (ref: woct0rdho/SageAttention 358a705):
+    1. sageattn() dispatcher @functools.cache → importe sm90 directement
+    2. torch.cuda.set_device(v.device) → supprime via source patching
+
+    Sur H100 single-GPU, set_device(cuda:0) est toujours un no-op.
+    Fallback: retourne la fonction originale si le patch echoue.
+    """
+    import inspect
+    import textwrap
+    from sageattention import sageattn_qk_int8_pv_fp8_cuda_sm90 as orig_fn
+
+    try:
+        src = inspect.getsource(orig_fn)
+    except (OSError, TypeError):
+        log.warning("Cannot inspect sageattn sm90 source, using unpatched")
+        return orig_fn
+
+    target = "torch.cuda.set_device(v.device)"
+    if target not in src:
+        log.info("sageattn sm90: set_device absent — deja patche ou API changee")
+        return orig_fn
+
+    patched_src = src.replace(
+        f"    {target}",
+        f"    # [medusa] {target}  # removed: graph break, no-op single GPU",
+    )
+    patched_src = textwrap.dedent(patched_src)
+
+    ns = orig_fn.__globals__.copy()
+    try:
+        exec(compile(patched_src, f"<patched {orig_fn.__qualname__}>", "exec"), ns)
+    except Exception as e:
+        log.warning("Failed to compile patched sageattn sm90: %s", e)
+        return orig_fn
+
+    patched_fn = ns.get(orig_fn.__name__)
+    if not callable(patched_fn):
+        log.warning("Patched sageattn sm90 not found in namespace")
+        return orig_fn
+
+    log.info("sageattn sm90 patched: torch.cuda.set_device removed (graph break fix)")
+    return patched_fn
+
+
 class SageAttentionCallable:
-    """SageAttention2++ (H100 sm_90), fallback SDPA si mask present."""
+    """SageAttention2++ (H100 sm_90), fallback SDPA si mask present.
+
+    Appelle sageattn_qk_int8_pv_fp8_cuda_sm90 directement (bypass dispatcher)
+    avec patch set_device pour reduire les graph breaks torch.compile.
+    """
 
     def __init__(self) -> None:
-        from sageattention import sageattn
-
-        self._sageattn = sageattn
+        self._sageattn = _build_patched_sageattn_sm90()
         self._fallback = PytorchAttention()
 
     def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: torch.Tensor | None = None) -> torch.Tensor:
