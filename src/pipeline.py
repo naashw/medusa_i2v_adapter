@@ -123,7 +123,7 @@ def _build_patched_sageattn_sm90():
 
         @sageattn_sm90.register_fake
         def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-            return torch.empty_like(q)
+            return q.new_empty(q.shape)
 
         _cached_sageattn_op = sageattn_sm90
         log.info("sageattn sm90: custom_op registered (zero graph breaks)")
