@@ -395,13 +395,15 @@ class MedusaPipeline:
                 if compile_mode not in valid_modes:
                     log.warning("COMPILE_MODE=%s invalide, fallback reduce-overhead", compile_mode)
                     compile_mode = "reduce-overhead"
-            log.info("torch.compile transformer (mode=%s, sage=%s, dynamic=True)...", compile_mode, sage_active)
-            self._transformer = torch.compile(
-                self._transformer,
-                mode=compile_mode,
-                fullgraph=False,
-                dynamic=True,
-            )
+            blocks = self._transformer.velocity_model.transformer_blocks
+            log.info("torch.compile regional: %d blocs (mode=%s, sage=%s, dynamic=True)...", len(blocks), compile_mode, sage_active)
+            for i, block in enumerate(blocks):
+                blocks[i] = torch.compile(
+                    block,
+                    mode=compile_mode,
+                    fullgraph=False,
+                    dynamic=True,
+                )
 
         self._log_vram("apres base transformer")
         return self._transformer
