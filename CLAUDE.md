@@ -139,10 +139,10 @@ Objectif : generation rapide de videos a partir d'images, qualite correcte.
 - **Eager init** : pipeline init complet AVANT `runpod.serverless.start()` — premier job sans cold start
 - **Download parallele** : toutes les images (image + last_image) de tous les items telecharges en parallele via ThreadPoolExecutor au debut du job
 - **torch.compile** : `torch.compile(dynamic=True)` sur le transformer ET le video decoder (desactivable via `TORCH_COMPILE=0` et `VAE_COMPILE=0`). `mode=max-autotune` par defaut (CUDA graphs + autotuning Triton), configurable via `COMPILE_MODE`. Cache Triton + TorchInductor persistant sur volume (`TRITON_CACHE_DIR`, `TORCHINDUCTOR_CACHE_DIR`). Cache Inductor versionne par build hash (`/app/.build_hash` = md5 source + pip freeze) → invalidation auto a chaque nouveau build Docker. `cache_size_limit=32`, `recompile_limit=16`, `automatic_dynamic_shapes=True` pour eviter les recompilations entre stages 1/2.
-- **Batching multi-client** : items regroupes par `camera_motion` (= meme prompt). Toujours traite via `generate_batch_frames()` avec padding a `MAX_BATCH` (defaut 3) pour shape fixe dans le compile cache. Resultats reordonnes par `_original_index`.
+- **Batching multi-client** : items regroupes par `camera_motion` (= meme prompt). Toujours traite via `generate_batch_frames()` avec padding a `MAX_BATCH` (defaut 9) pour shape fixe dans le compile cache. Resultats reordonnes par `_original_index`.
 - **Batching GPU** : `generate_batch_frames()` traite N images en un seul forward transformer (batch=N). Per-item noise (seeds differents), image encoding individuel. Spatial upscaler et VAE decode en sub-batches de `BATCH_SIZE`. `torch.cuda.empty_cache()` entre chaque stage (transformer → upscaler → stage 2 → VAE). Configurable via `BATCH_SIZE` (defaut 5).
 - **Async post-processing pipeline** : callback `on_item_decoded` dans `generate_batch_frames()` soumet le MP4 encode + S3 upload dans ThreadPoolExecutor(3) pendant que le VAE decode les items suivants (overlap VAE decode / MP4 encode)
-- **Ordre d'init** : warmup embeddings (process isole) → transformer distilled (FP8 cast) → torch.compile → video encoder → video decoder → spatial upsampler
+- **Ordre d'init** : warmup embeddings (process isole, skip si cache existe) → transformer distilled (FP8 cast) → torch.compile → video encoder + video decoder + spatial upsampler (parallele via ThreadPoolExecutor)
 - **warmup_embeddings.py** : charge les cles TE via safe_open + Gemma sur GPU (device_map) si dispo. Encoding ~5-10s GPU vs ~30-40s CPU. Cleanup VRAM complet apres.
 - **CFG desactive** : `cfg_scale=1.0, stg_scale=0.0` → 1 seul forward par step
 - **Audio disabled** : audio modality `enabled=False` dans le forward transformer
@@ -212,5 +212,5 @@ Objectif : generation rapide de videos a partir d'images, qualite correcte.
 - `SAMPLER=euler` (defaut) : stepper de denoising. `res2s` pour Res2sDiffusionStep (second ordre)
 - `VAE_TILING=0` (defaut) : `1` pour activer le tiled VAE decode (reduit VRAM en 1080p, risque ghosting temporal)
 - `BATCH_SIZE=5` (defaut) : taille max du sous-batch pour le denoising transformer en batch mode
-- `MAX_BATCH=3` (defaut) : handler pad toujours le sub-batch a cette taille pour shape fixe dans le compile cache Dynamo (evite recompilations)
+- `MAX_BATCH=9` (defaut) : handler pad toujours le sub-batch a cette taille pour shape fixe dans le compile cache Dynamo (evite recompilations)
 - Le checkpoint FP8 scaled (`ltx-2.3-22b-dev-fp8.safetensors`) est INCOMPATIBLE avec la fusion LoRA dans ltx-core — utiliser le checkpoint distilled BF16 avec `fp8_cast()` a la place

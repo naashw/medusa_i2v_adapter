@@ -180,16 +180,16 @@ download_model() {
     local filepath="${dest_dir}/${filename}"
 
     if [ -f "$filepath" ]; then
-        # Valider les fichiers safetensors (detecte les telechargements partiels)
         if [[ "$filename" == *.safetensors ]]; then
-            if ! python -c "from safetensors import safe_open; f = safe_open('${filepath}', framework='pt'); del f" 2>/dev/null; then
+            # Utilise le cache de pre-validation (single Python process)
+            if echo "$_VALID_FILES" | grep -qF "$filepath"; then
+                echo "[medusa] Deja present (valide): $filename"
+                return 0
+            else
                 local file_size
                 file_size=$(stat -c%s "$filepath" 2>/dev/null || echo "?")
                 echo "[medusa] CORROMPU: $filename (${file_size} bytes) — suppression et re-telechargement"
                 trash-put "$filepath"
-            else
-                echo "[medusa] Deja present (valide): $filename"
-                return 0
             fi
         else
             echo "[medusa] Deja present: $filename"
@@ -227,6 +227,24 @@ hf_hub_download(
 # 4. Telechargement des modeles (sequentiel)
 # -----------------------------------------------
 echo "[medusa] Demarrage des telechargements (sequentiel, hf_xet)..."
+
+# Pre-validate all safetensors in a single Python process (~2s vs ~6s sequential)
+_VALID_FILES=$(python -c "
+from safetensors import safe_open
+import sys, os
+for p in sys.argv[1:]:
+    if os.path.isfile(p):
+        try:
+            f = safe_open(p, framework='pt')
+            del f
+            print(p)
+        except Exception:
+            pass
+" \
+    "${MODELS_DIR}/checkpoints/ltx-2.3-22b-distilled.safetensors" \
+    "${MODELS_DIR}/upscalers/ltx-2.3-spatial-upscaler-x2-1.0.safetensors" \
+    "${MODELS_DIR}/upscalers/ltx-2.3-temporal-upscaler-x2-1.0.safetensors" \
+    2>/dev/null || true)
 
 # --- Checkpoint distilled BF16 (~46GB) — le plus gros, echouer tot ---
 download_model "Lightricks/LTX-2.3" "ltx-2.3-22b-distilled.safetensors" "${MODELS_DIR}/checkpoints"
@@ -271,10 +289,15 @@ if [ "${SERVERLESS:-}" = "true" ] || [ -n "${RUNPOD_ENDPOINT_ID:-}" ]; then
     echo "[medusa] Output dir: $OUTPUT_VOLUME_DIR"
     echo "[medusa] Cache dir: $CACHE_DIR"
 
-    # Warmup embeddings dans un process isole (l'OS recupere 100% RAM a la fin)
-    echo "[medusa] Warmup embeddings (process isole)..."
-    LD_PRELOAD="" python /app/warmup_embeddings.py
-    echo "[medusa] Warmup termine, lancement handler..."
+    # Warmup embeddings : skip si cache existe (economise ~3-5s de startup Python)
+    EMBEDDINGS_CACHE="${WORKSPACE}/cache/embeddings/embeddings_cache.pt"
+    if [[ -f "$EMBEDDINGS_CACHE" ]]; then
+        echo "[medusa] Embeddings cache existant — skip warmup subprocess"
+    else
+        echo "[medusa] Warmup embeddings (process isole)..."
+        LD_PRELOAD="" python /app/warmup_embeddings.py
+    fi
+    echo "[medusa] Lancement handler..."
 
     exec env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python /app/handler.py
 

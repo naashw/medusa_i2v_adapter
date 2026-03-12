@@ -430,7 +430,7 @@ class MedusaPipeline:
             torch._dynamo.config.automatic_dynamic_shapes = True
             torch._dynamo.config.allow_unspec_int_on_nn_module = True
             torch._dynamo.config.cache_size_limit = 32
-            torch._dynamo.config.recompile_limit = 16
+            torch._dynamo.config.recompile_limit = 48
             compile_mode = os.environ.get("COMPILE_MODE", "default")
             valid_modes = {"default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"}
             if compile_mode not in valid_modes:

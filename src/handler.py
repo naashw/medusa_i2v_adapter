@@ -494,10 +494,15 @@ def init_pipeline() -> MedusaPipeline:
     # 2. Build transformer distilled (FP8 cast)
     p.get_transformer()
 
-    # 3. Charger video encoder + video decoder + spatial upsampler (persistent)
-    p.load_video_encoder()
-    p.load_video_decoder()
-    p.load_spatial_upsampler()
+    # 3. Charger video encoder + video decoder + spatial upsampler en parallele
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futs = [
+            pool.submit(p.load_video_encoder),
+            pool.submit(p.load_video_decoder),
+            pool.submit(p.load_spatial_upsampler),
+        ]
+        for f in futs:
+            f.result()
 
     log.info("Pipeline pret.")
     return p
