@@ -43,7 +43,7 @@ OUTPUT_VOLUME_DIR = os.environ.get("OUTPUT_VOLUME_DIR", "/runpod-volume/output")
 CACHE_DIR = os.environ.get("CACHE_DIR", "/runpod-volume/cache")
 VOLUME_ROOT = os.environ.get("VOLUME_ROOT", "/runpod-volume")
 MODELS_DIR = os.environ.get("MODELS_DIR", "/runpod-volume/models")
-MAX_BATCH = int(os.environ.get("MAX_BATCH", "3"))
+MAX_BATCH = int(os.environ.get("MAX_BATCH", "9"))
 
 
 # --- S3 ---
@@ -412,33 +412,15 @@ def handler(job: dict) -> dict:
                         pi["last_image_strength"] = item.get("last_image_strength", 1.0)
                     pipeline_items.append(pi)
 
-                batch_frames_list = pipeline.generate_batch_frames(
-                    items=pipeline_items,
-                    prompt=prompt_text,
-                    height=height,
-                    width=width,
-                    num_frames=num_frames,
-                    frame_rate=frame_rate,
-                    image_strength=image_strength,
-                    two_stage=two_stage,
-                )
-
-                # Trim — garder uniquement les resultats reels (ignore les frames padding)
-                batch_frames_list = batch_frames_list[:real_count]
-
-                elapsed = time.time() - start_time
-                log.info(
-                    "Groupe '%s' sub-batch %d/%d: %.1fs (%d item(s), %d padded)",
-                    prompt_text[:30], batch_idx + 1, len(sub_batches), elapsed,
-                    real_count, MAX_BATCH - real_count,
-                )
-
-                # --- Post-processing async par item ---
-                for item, item_frames in zip(sub_batch[:real_count], batch_frames_list):
+                # Callback : soumettre le MP4 encode + S3 upload des que
+                # le VAE decode un item, pendant que le VAE decode les suivants
+                def on_decoded(batch_idx: int, frames: list) -> None:
+                    if batch_idx >= real_count:
+                        return  # Ignorer items padding
+                    item = sub_batch[batch_idx]
                     orig_idx = item["_original_index"]
                     output_dir = tempfile.mkdtemp(prefix="medusa_")
 
-                    # Filename : id si fourni, sinon job_id_index
                     if item.get("id"):
                         output_filename = f"medusa_i2v_{item['id']}.mp4"
                     elif total_items > 1:
@@ -448,11 +430,30 @@ def handler(job: dict) -> dict:
 
                     fut = postprocess_pool.submit(
                         postprocess_and_upload,
-                        item_frames, int(frame_rate),
+                        frames, int(frame_rate),
                         output_dir, output_filename,
                         job_id,
                     )
                     results_by_index[orig_idx] = (fut, item.get("id"))
+
+                pipeline.generate_batch_frames(
+                    items=pipeline_items,
+                    prompt=prompt_text,
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    frame_rate=frame_rate,
+                    image_strength=image_strength,
+                    two_stage=two_stage,
+                    on_item_decoded=on_decoded,
+                )
+
+                elapsed = time.time() - start_time
+                log.info(
+                    "Groupe '%s' sub-batch %d/%d: %.1fs (%d item(s), %d padded)",
+                    prompt_text[:30], batch_idx + 1, len(sub_batches), elapsed,
+                    real_count, MAX_BATCH - real_count,
+                )
 
         # --- Reordonner les resultats par _original_index ---
         ordered_results = []

@@ -19,7 +19,7 @@ import logging
 import os
 import time
 import warnings
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import json
 
@@ -779,6 +779,7 @@ class MedusaPipeline:
         frame_rate: float,
         image_strength: float = 1.0,
         two_stage: bool = False,
+        on_item_decoded: Callable[[int, list[torch.Tensor]], None] | None = None,
     ) -> list[list[torch.Tensor]]:
         """Genere les frames pour un batch d'items (meme prompt, images/seeds differents).
 
@@ -1062,6 +1063,8 @@ class MedusaPipeline:
             decoded = vae_decode_video(item_latent, self._video_decoder, tiling, generators[i])
             item_frames = [chunk.cpu() for chunk in decoded]
             all_frames.append(item_frames)
+            if on_item_decoded is not None:
+                on_item_decoded(i, item_frames)
 
         torch.cuda.empty_cache()
         log.info("Batch frames generees: %d items", len(all_frames))
