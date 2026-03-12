@@ -241,6 +241,7 @@ def normalize_items(job_input: dict) -> tuple[list[dict], str | None]:
     shared_seed = job_input.get("seed")
     shared_last_image = job_input.get("last_image")
     shared_last_image_strength = job_input.get("last_image_strength", 1.0)
+    shared_prompt = job_input.get("prompt")
 
     if raw_items:
         # Format items[] — per-item params
@@ -258,6 +259,7 @@ def normalize_items(job_input: dict) -> tuple[list[dict], str | None]:
                 "seed": raw.get("seed", random.randint(0, 2**32 - 1)),
                 "last_image": raw.get("last_image"),
                 "last_image_strength": raw.get("last_image_strength", shared_last_image_strength),
+                "prompt": raw.get("prompt"),
                 "_original_index": i,
             })
         return items, None
@@ -274,6 +276,7 @@ def normalize_items(job_input: dict) -> tuple[list[dict], str | None]:
                 "seed": base_seed + i,
                 "last_image": shared_last_image,
                 "last_image_strength": shared_last_image_strength,
+                "prompt": shared_prompt,
                 "_original_index": i,
             })
         return items, None
@@ -288,6 +291,7 @@ def normalize_items(job_input: dict) -> tuple[list[dict], str | None]:
             "seed": seed,
             "last_image": shared_last_image,
             "last_image_strength": shared_last_image_strength,
+            "prompt": shared_prompt,
             "_original_index": 0,
         }], None
 
@@ -375,7 +379,8 @@ def handler(job: dict) -> dict:
         # --- Groupement par prompt (camera_motion → texte) ---
         groups: dict[str, list[dict]] = {}
         for item in normalized:
-            prompt_text = CAMERA_PRESETS.get(item["camera_motion"], item["camera_motion"])
+            custom = item.get("prompt")
+            prompt_text = custom if custom else CAMERA_PRESETS.get(item["camera_motion"], item["camera_motion"])
             item["_prompt_text"] = prompt_text
             groups.setdefault(prompt_text, []).append(item)
 
