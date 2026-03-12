@@ -55,113 +55,11 @@ from ltx_pipelines.utils.helpers import (
 from ltx_pipelines.utils.samplers import euler_denoising_loop
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.types import PipelineComponents
-from ltx_core.model.transformer.attention import Attention, PytorchAttention
 from ltx_core.quantization import QuantizationPolicy
 
 from prompts import CAMERA_PRESETS, DEFAULT_NEGATIVE_PROMPT
 
 log = logging.getLogger("medusa")
-
-# Cache module-level pour eviter double-registration du custom_op
-_cached_sageattn_op: callable | None = None
-
-
-def _build_patched_sageattn_sm90():
-    """Build torch.compile-friendly sageattn_qk_int8_pv_fp8_cuda_sm90.
-
-    Bypass deux sources de graph breaks (ref: woct0rdho/SageAttention 358a705):
-    1. sageattn() dispatcher @functools.cache → importe sm90 directement
-    2. torch.cuda.set_device(v.device) → supprime via source patching
-
-    Sur H100 single-GPU, set_device(cuda:0) est toujours un no-op.
-    Fallback: retourne la fonction originale si le patch echoue.
-    """
-    import inspect
-    import textwrap
-    from sageattention import sageattn_qk_int8_pv_fp8_cuda_sm90 as orig_fn
-
-    try:
-        src = inspect.getsource(orig_fn)
-    except (OSError, TypeError):
-        log.warning("Cannot inspect sageattn sm90 source, using unpatched")
-        return lambda q, k, v: orig_fn(q, k, v, tensor_layout="HND", is_causal=False)
-
-    target = "torch.cuda.set_device(v.device)"
-    if target not in src:
-        log.info("sageattn sm90: set_device absent — deja patche ou API changee")
-        return lambda q, k, v: orig_fn(q, k, v, tensor_layout="HND", is_causal=False)
-
-    patched_src = src.replace(
-        f"    {target}",
-        f"    # [medusa] {target}  # removed: graph break, no-op single GPU",
-    )
-    patched_src = textwrap.dedent(patched_src)
-
-    ns = orig_fn.__globals__.copy()
-    try:
-        exec(compile(patched_src, f"<patched {orig_fn.__qualname__}>", "exec"), ns)
-    except Exception as e:
-        log.warning("Failed to compile patched sageattn sm90: %s", e)
-        return lambda q, k, v: orig_fn(q, k, v, tensor_layout="HND", is_causal=False)
-
-    patched_fn = ns.get(orig_fn.__name__)
-    if not callable(patched_fn):
-        log.warning("Patched sageattn sm90 not found in namespace")
-        return lambda q, k, v: orig_fn(q, k, v, tensor_layout="HND", is_causal=False)
-
-    log.info("sageattn sm90 patched: torch.cuda.set_device removed (graph break fix)")
-
-    # Step 3: Wrapper custom_op — Dynamo voit un seul noeud opaque, zero graph breaks
-    # Les kernels internes (Triton quant, CUTLASS sm90) tournent normalement au runtime
-    global _cached_sageattn_op
-    if _cached_sageattn_op is not None:
-        log.info("sageattn sm90: custom_op deja enregistre, reutilisation cache")
-        return _cached_sageattn_op
-
-    try:
-        @torch.library.custom_op("medusa::sageattn_sm90", mutates_args=(), device_types="cuda")
-        def sageattn_sm90(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-            return patched_fn(q, k, v, tensor_layout="HND", is_causal=False)
-
-        @sageattn_sm90.register_fake
-        def _(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-            return q.new_empty(q.shape)
-
-        _cached_sageattn_op = sageattn_sm90
-        log.info("sageattn sm90: custom_op registered (zero graph breaks)")
-        return sageattn_sm90
-    except Exception as e:
-        log.warning("sageattn sm90: custom_op failed (%s), using patched fn directly", e)
-        wrapped = lambda q, k, v: patched_fn(q, k, v, tensor_layout="HND", is_causal=False)
-        _cached_sageattn_op = wrapped
-        return wrapped
-
-
-class SageAttentionCallable:
-    """SageAttention2++ (H100 sm_90), fallback SDPA si mask present.
-
-    Appelle sageattn_qk_int8_pv_fp8_cuda_sm90 directement (bypass dispatcher)
-    avec patch set_device pour reduire les graph breaks torch.compile.
-    """
-
-    def __init__(self) -> None:
-        self._sageattn = _build_patched_sageattn_sm90()
-        self._fallback = PytorchAttention()
-
-    def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: torch.Tensor | None = None) -> torch.Tensor:
-        if mask is not None:
-            return self._fallback(q, k, v, heads, mask)
-
-        b, _, dim_head = q.shape
-        dim_head //= heads
-        q = q.to(torch.bfloat16)
-        k = k.to(torch.bfloat16)
-        v = v.to(torch.bfloat16)
-        q, k, v = (t.view(b, -1, heads, dim_head).transpose(1, 2) for t in (q, k, v))
-        out = self._sageattn(q, k, v)
-        out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
-        return out
-
 
 # Version du cache transformer (incrementer pour invalider tous les caches existants)
 CACHE_VERSION = "v4"
@@ -398,17 +296,6 @@ class MedusaPipeline:
             return mod._orig_mod
         return mod
 
-    @staticmethod
-    def _patch_sage_attention(transformer: torch.nn.Module) -> int:
-        """Remplace attention_function par SageAttention2++ sur les modules Attention."""
-        sage_attn = SageAttentionCallable()
-        patched = 0
-        for module in transformer.modules():
-            if isinstance(module, Attention):
-                module.attention_function = sage_attn
-                patched += 1
-        return patched
-
     def _cache_fingerprint(self) -> str:
         """Hash d'invalidation pour le cache transformer pre-fusionne.
 
@@ -476,7 +363,7 @@ class MedusaPipeline:
         """Retourne le transformer distilled avec FP8 Cast.
 
         Checkpoint distilled BF16 + QuantizationPolicy.fp8_cast() → stockage FP8, compute BF16.
-        Compatible torch.compile + SageAttention.
+        Compatible torch.compile (SDPA natif, FlashAttention2 sur H100).
         """
         if self._transformer is not None:
             return self._transformer
@@ -511,20 +398,7 @@ class MedusaPipeline:
             if cache_enabled:
                 self._save_transformer_cache(cache_path)
 
-        # SageAttention2++ (remplace SDPA sur les modules Attention du transformer)
-        sage_active = False
-        if os.environ.get("SAGE_ATTENTION", "1") == "1":
-            try:
-                patched = self._patch_sage_attention(self._transformer)
-                log.info("SageAttention2++ active: %d modules patches", patched)
-                sage_active = patched > 0
-            except ImportError:
-                log.warning("SageAttention non installe, fallback SDPA")
-            except Exception as e:
-                log.warning("SageAttention init echoue, fallback SDPA: %s", e)
-
         # torch.compile — dynamic=True pour eviter les recompilations entre stages
-        # SA incompatible CUDA graphs → max-autotune-no-cudagraphs (autotuning Triton sans CUDA graphs).
         if os.environ.get("TORCH_COMPILE", "1") == "1":
             torch._inductor.config.fx_graph_cache = True
             # compile_threads DOIT etre fixe — sinon varie selon cpu_count() du worker
@@ -552,16 +426,13 @@ class MedusaPipeline:
             torch._dynamo.config.allow_unspec_int_on_nn_module = True
             torch._dynamo.config.cache_size_limit = 32
             torch._dynamo.config.recompile_limit = 16
-            if sage_active:
-                compile_mode = "max-autotune-no-cudagraphs"
-            else:
-                compile_mode = os.environ.get("COMPILE_MODE", "reduce-overhead")
-                valid_modes = {"default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"}
-                if compile_mode not in valid_modes:
-                    log.warning("COMPILE_MODE=%s invalide, fallback reduce-overhead", compile_mode)
-                    compile_mode = "reduce-overhead"
+            compile_mode = os.environ.get("COMPILE_MODE", "reduce-overhead")
+            valid_modes = {"default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"}
+            if compile_mode not in valid_modes:
+                log.warning("COMPILE_MODE=%s invalide, fallback reduce-overhead", compile_mode)
+                compile_mode = "reduce-overhead"
             blocks = self._transformer.velocity_model.transformer_blocks
-            log.info("torch.compile regional: %d blocs (mode=%s, sage=%s, dynamic=True)...", len(blocks), compile_mode, sage_active)
+            log.info("torch.compile regional: %d blocs (mode=%s, dynamic=True)...", len(blocks), compile_mode)
             for i, block in enumerate(blocks):
                 blocks[i] = torch.compile(
                     block,
@@ -683,6 +554,7 @@ class MedusaPipeline:
                 aud_mod = modality_from_latent_state(
                     audio_state, a_context_p, sigma, enabled=False,
                 )
+                torch.compiler.cudagraph_mark_step_begin()
                 denoised_video, denoised_audio = transformer(
                     video=vid_mod, audio=aud_mod, perturbations=None,
                 )
@@ -1054,6 +926,7 @@ class MedusaPipeline:
                 sigma_b = sigma.unsqueeze(0).expand(batch_size)
                 vid_mod = dataclasses.replace(vid_mod, sigma=sigma_b)
                 aud_mod = dataclasses.replace(aud_mod, sigma=sigma_b)
+                torch.compiler.cudagraph_mark_step_begin()
                 denoised_video, denoised_audio = transformer(
                     video=vid_mod, audio=aud_mod, perturbations=None,
                 )
@@ -1138,6 +1011,7 @@ class MedusaPipeline:
                     sigma_b = sigma.unsqueeze(0).expand(batch_size)
                     vid_mod = dataclasses.replace(vid_mod, sigma=sigma_b)
                     aud_mod = dataclasses.replace(aud_mod, sigma=sigma_b)
+                    torch.compiler.cudagraph_mark_step_begin()
                     return transformer(video=vid_mod, audio=aud_mod, perturbations=None)
 
                 return euler_denoising_loop(

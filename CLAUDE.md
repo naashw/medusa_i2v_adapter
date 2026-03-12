@@ -18,7 +18,7 @@ Objectif : generation rapide de videos a partir d'images, qualite correcte.
 | huggingface-hub | >=0.28 (avec HF XET) |
 | runpod | >=1.7, <2.0 |
 | boto3 | >=1.34 (S3 OVH) |
-| SageAttention | >=2.2.0 pip (custom_op natif, sm_90, INT8-QK/FP8-PV) |
+| flash-attn | FlashAttention 3 (sm_90, SDPA dispatch auto) |
 | Docker | Multi-stage (cuda:12.8.1-devel -> runtime) |
 
 ## Contexte Technique
@@ -129,7 +129,6 @@ Objectif : generation rapide de videos a partir d'images, qualite correcte.
   - Video decoder persistent en VRAM (~2GB)
   - Spatial upsampler x2 persistent en VRAM (~1GB)
   - Transformer distilled permanent en VRAM (~19-20GB via FP8 cast), compile une seule fois
-  - SageAttention 2.2.0 patch runtime sur ~288 modules Attention du transformer (custom_op natif, zero graph breaks, INT8-QK/FP8-PV, kernel sm_90), fallback SDPA si mask present ou non installe
   - Embeddings pre-caches sur disque (generes par warmup_embeddings.py)
   - Cache transformer dans `/runpod-volume/cache/transformer/` (checkpoint safetensors, invalidation auto par hash checkpoint, desactivable via `TRANSFORMER_CACHE=0`)
 - **Pipeline 2-stage** :
@@ -139,12 +138,11 @@ Objectif : generation rapide de videos a partir d'images, qualite correcte.
   - Meme transformer pour les 2 stages
 - **Eager init** : pipeline init complet AVANT `runpod.serverless.start()` — premier job sans cold start
 - **Download parallele** : toutes les images (image + last_image) de tous les items telecharges en parallele via ThreadPoolExecutor au debut du job
-- **torch.compile** : `torch.compile(dynamic=True)` sur le transformer ET le video decoder (desactivable via `TORCH_COMPILE=0` et `VAE_COMPILE=0`). `mode=max-autotune-no-cudagraphs` quand SageAttention actif (autotuning Triton sans CUDA graphs, incompatibles avec kernels SA), `COMPILE_MODE` configurable sinon. Cache Triton + TorchInductor persistant sur volume (`TRITON_CACHE_DIR`, `TORCHINDUCTOR_CACHE_DIR`). Cache Inductor versionne par build hash (`/app/.build_hash` = md5 source + pip freeze) → invalidation auto a chaque nouveau build Docker. `cache_size_limit=32`, `recompile_limit=16`, `automatic_dynamic_shapes=True` pour eviter les recompilations entre stages 1/2.
+- **torch.compile** : `torch.compile(dynamic=True)` sur le transformer ET le video decoder (desactivable via `TORCH_COMPILE=0` et `VAE_COMPILE=0`). `mode=reduce-overhead` par defaut (CUDA graphs actifs), configurable via `COMPILE_MODE`. Cache Triton + TorchInductor persistant sur volume (`TRITON_CACHE_DIR`, `TORCHINDUCTOR_CACHE_DIR`). Cache Inductor versionne par build hash (`/app/.build_hash` = md5 source + pip freeze) → invalidation auto a chaque nouveau build Docker. `cache_size_limit=32`, `recompile_limit=16`, `automatic_dynamic_shapes=True` pour eviter les recompilations entre stages 1/2.
 - **Batching multi-client** : items regroupes par `camera_motion` (= meme prompt). Toujours traite via `generate_batch_frames()` avec padding a `MAX_BATCH` (defaut 3) pour shape fixe dans le compile cache. Resultats reordonnes par `_original_index`.
 - **Batching GPU** : `generate_batch_frames()` traite N images en un seul forward transformer (batch=N). Per-item noise (seeds differents), image encoding individuel. Spatial upscaler et VAE decode en sub-batches de `BATCH_SIZE`. `torch.cuda.empty_cache()` entre chaque stage (transformer → upscaler → stage 2 → VAE). Configurable via `BATCH_SIZE` (defaut 5).
 - **Async post-processing** : MP4 encode + S3 upload en parallele du GPU via ThreadPoolExecutor(3)
-- **SageAttention 2.2.0** : patch runtime `attention_function` sur les modules `Attention` du transformer uniquement (pas VAE, pas encoder, pas upsampler). `@torch.library.custom_op` natif (zero graph breaks, compatible torch.compile). Fallback SDPA si mask present. Desactivable via `SAGE_ATTENTION=0`.
-- **Ordre d'init** : warmup embeddings (process isole) → transformer distilled (FP8 cast) → patch SageAttention → torch.compile → video encoder → video decoder → spatial upsampler
+- **Ordre d'init** : warmup embeddings (process isole) → transformer distilled (FP8 cast) → torch.compile → video encoder → video decoder → spatial upsampler
 - **warmup_embeddings.py** : charge les cles TE via safe_open + Gemma sur GPU (device_map) si dispo. Encoding ~5-10s GPU vs ~30-40s CPU. Cleanup VRAM complet apres.
 - **CFG desactive** : `cfg_scale=1.0, stg_scale=0.0` → 1 seul forward par step
 - **Audio disabled** : audio modality `enabled=False` dans le forward transformer
@@ -164,7 +162,7 @@ Objectif : generation rapide de videos a partir d'images, qualite correcte.
 ## Flow d'Init Pipeline (eager, 1 seule fois)
 
 1. `warmup_embeddings()` — cache .pt ou Gemma 3 12B GPU (device_map) → encode 7 presets camera_motion + 1 negative → cleanup VRAM complet
-2. `get_transformer()` — cache pre-fusionne ou ModelLedger(checkpoint distilled BF16, quantization=fp8_cast) → patch SageAttention 2.2.0 → torch.compile(dynamic=True)
+2. `get_transformer()` — cache pre-fusionne ou ModelLedger(checkpoint distilled BF16, quantization=fp8_cast) → torch.compile(dynamic=True)
 3. `load_video_encoder()` → VRAM (~1GB, persistent)
 4. `load_video_decoder()` → VRAM (~2GB, persistent) + torch.compile(dynamic=True)
 5. `load_spatial_upsampler()` → VRAM (~1GB, persistent)
@@ -205,9 +203,8 @@ Objectif : generation rapide de videos a partir d'images, qualite correcte.
 - `start.sh` lance le warmup avec `LD_PRELOAD=""` pour desactiver tcmalloc (inutile sur process ephemere)
 - `start.sh` valide les fichiers `.safetensors` existants via `safe_open()` avant de skip le telechargement (detecte les fichiers corrompus/partiels)
 - S3 env vars : `S3_BUCKET`, `S3_ENDPOINT_URL` (defaut OVH SBG), `S3_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
-- `SAGE_ATTENTION=1` (defaut) : active SageAttention2++ sur le transformer. `0` pour rollback complet vers SDPA
 - `TORCH_COMPILE=1` (defaut) : torch.compile sur le transformer. `0` pour desactiver
-- `COMPILE_MODE=reduce-overhead` (defaut, applique uniquement quand SAGE_ATTENTION=0) : mode torch.compile. Valeurs : `default`, `reduce-overhead`, `max-autotune`, `max-autotune-no-cudagraphs`. Quand SageAttention actif, force `max-autotune-no-cudagraphs` (autotuning Triton sans CUDA graphs, incompatibles avec kernels SA)
+- `COMPILE_MODE=reduce-overhead` (defaut) : mode torch.compile. Valeurs : `default`, `reduce-overhead`, `max-autotune`, `max-autotune-no-cudagraphs`
 - `TRITON_CACHE_DIR` : repertoire cache Triton persistant (defaut `/runpod-volume/cache/triton/`). Autotuning sauvegarde les configs kernel optimales
 - `TORCHINDUCTOR_CACHE_DIR` : repertoire cache TorchInductor persistant (defaut `/runpod-volume/cache/inductor/{build_hash}/`). Versionne automatiquement par build hash Docker — invalide auto a chaque rebuild
 - `VAE_COMPILE=1` (defaut) : torch.compile(dynamic=True) sur le video decoder. `0` pour desactiver

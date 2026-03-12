@@ -14,7 +14,7 @@ Pipeline Image-to-Video avec effets camera, inference directe via ltx-pipelines 
 | huggingface-hub | >=0.28 (avec HF XET) |
 | runpod | >=1.7, <2.0 |
 | boto3 | >=1.34 (S3 OVH) |
-| SageAttention | 2++ from source (sm_90, INT8-QK/FP8-PV) |
+| flash-attn | FlashAttention 3 (sm_90, SDPA dispatch auto) |
 | Docker | Multi-stage (cuda:12.8.1-devel -> runtime) |
 
 ## Structure
@@ -109,7 +109,6 @@ MedusaPipeline(models_dir)
   ├─ 2. get_transformer()
   │     └─ Cache transformer pre-fusionne (fingerprint OK) → charger
   │     └─ Sinon → ModelLedger(checkpoint distilled BF16, quantization=fp8_cast)
-  │     └─ Patch SageAttention2++ (~288 modules Attention)
   │     └─ torch.compile(mode="reduce-overhead")
   │
   ├─ 3. load_video_encoder()     → VRAM (~1GB, persistent)
@@ -273,8 +272,6 @@ curl -X POST "https://api.runpod.ai/v2/${ENDPOINT_ID}/runsync" \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SAGE_ATTENTION` | `1` | Active SageAttention2++ sur le transformer |
-| `SAGE_COMPILE_DISABLE` | `0` | Wrappe sageattn dans `torch.compiler.disable` si CUDA graphs posent probleme |
 | `TORCH_COMPILE` | `1` | Active torch.compile reduce-overhead sur le transformer |
 | `VAE_COMPILE` | `1` | Active torch.compile reduce-overhead sur le video decoder |
 | `TRANSFORMER_CACHE` | `1` | Cache transformer pre-fusionne (skip cold start LoRA fusion) |

@@ -37,7 +37,7 @@ ENV PATH="/opt/venv/bin:$PATH" \
     VIRTUAL_ENV="/opt/venv"
 
 # --- PyTorch stable (CUDA 12.8) ---
-# Pin >=2.9,<3 : support torch.compile dynamic + custom_op SA 2.2
+# Pin >=2.9,<3 : support torch.compile dynamic
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir \
         "torch>=2.9,<3" torchvision torchaudio \
@@ -58,21 +58,20 @@ RUN cd /tmp/LTX-2/packages/ltx-pipelines && pip install --no-cache-dir .
 # Cleanup repo clone
 RUN rm -rf /tmp/LTX-2
 
-# H100 sm_90 pour kernels SageAttention CUDA/Triton
+# H100 sm_90
 ENV TORCH_CUDA_ARCH_LIST="9.0"
 
-# --- SageAttention 2.2.0 from source (custom_op natif, zero graph breaks) ---
-# Pas sur PyPI (max 1.0.6), install depuis GitHub main branch
-RUN pip install --no-build-isolation --no-cache-dir "sageattention @ git+https://github.com/thu-ml/SageAttention.git"
+# --- FlashAttention 3 (H100 sm_90, SDPA dispatch automatique) ---
+RUN pip install --no-build-isolation --no-cache-dir flash-attn
 
 # --- Runtime Python dependencies (runpod, requests, etc.) ---
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-# Verification builder : ltx_core, ltx_pipelines et SageAttention importables
+# Verification builder : ltx_core, ltx_pipelines et flash-attn importables
 RUN python -c "import ltx_core; print('ltx_core OK:', ltx_core.__file__)" && \
     python -c "import ltx_pipelines; print('ltx_pipelines OK')" && \
-    python -c "from sageattention import sageattn; print('SageAttention OK')" && \
+    python -c "import flash_attn; print('flash-attn OK:', flash_attn.__version__)" && \
     pip list | grep -i ltx
 
 # ============================================================
