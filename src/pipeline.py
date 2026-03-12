@@ -530,11 +530,7 @@ class MedusaPipeline:
             # compile_threads DOIT etre fixe — sinon varie selon cpu_count() du worker
             # RunPod et change le hash du cache key (save_config_portable inclut cette valeur)
             torch._inductor.config.compile_threads = 12
-            # Forcer cache_dir depuis env var (si config importe avant que env var soit lue,
-            # la valeur par defaut /tmp/torchinductor_root/ serait utilisee)
-            cache_dir_val = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
-            if cache_dir_val:
-                torch._inductor.config.cache_dir = cache_dir_val
+            # cache_dir lu depuis env var TORCHINDUCTOR_CACHE_DIR (set dans start.sh)
 
             # === DIAGNOSTIC CACHE INDUCTOR ===
             self._log_inductor_cache_diagnostic()
