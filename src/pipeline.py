@@ -61,6 +61,13 @@ from prompts import CAMERA_PRESETS, DEFAULT_NEGATIVE_PROMPT
 
 log = logging.getLogger("medusa")
 
+# Log FlashAttention disponibilite (SDPA dispatch auto vers FA3 sur H100)
+try:
+    import flash_attn
+    log.info("FlashAttention %s disponible (SDPA dispatch auto sm_90)", flash_attn.__version__)
+except ImportError:
+    log.warning("flash-attn non installe, SDPA fallback vers FA2/math kernel")
+
 # Version du cache transformer (incrementer pour invalider tous les caches existants)
 CACHE_VERSION = "v4"
 
@@ -426,11 +433,11 @@ class MedusaPipeline:
             torch._dynamo.config.allow_unspec_int_on_nn_module = True
             torch._dynamo.config.cache_size_limit = 32
             torch._dynamo.config.recompile_limit = 16
-            compile_mode = os.environ.get("COMPILE_MODE", "reduce-overhead")
+            compile_mode = os.environ.get("COMPILE_MODE", "max-autotune")
             valid_modes = {"default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"}
             if compile_mode not in valid_modes:
-                log.warning("COMPILE_MODE=%s invalide, fallback reduce-overhead", compile_mode)
-                compile_mode = "reduce-overhead"
+                log.warning("COMPILE_MODE=%s invalide, fallback max-autotune", compile_mode)
+                compile_mode = "max-autotune"
             blocks = self._transformer.velocity_model.transformer_blocks
             log.info("torch.compile regional: %d blocs (mode=%s, dynamic=True)...", len(blocks), compile_mode)
             for i, block in enumerate(blocks):

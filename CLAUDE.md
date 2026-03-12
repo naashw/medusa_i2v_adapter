@@ -138,7 +138,7 @@ Objectif : generation rapide de videos a partir d'images, qualite correcte.
   - Meme transformer pour les 2 stages
 - **Eager init** : pipeline init complet AVANT `runpod.serverless.start()` — premier job sans cold start
 - **Download parallele** : toutes les images (image + last_image) de tous les items telecharges en parallele via ThreadPoolExecutor au debut du job
-- **torch.compile** : `torch.compile(dynamic=True)` sur le transformer ET le video decoder (desactivable via `TORCH_COMPILE=0` et `VAE_COMPILE=0`). `mode=reduce-overhead` par defaut (CUDA graphs actifs), configurable via `COMPILE_MODE`. Cache Triton + TorchInductor persistant sur volume (`TRITON_CACHE_DIR`, `TORCHINDUCTOR_CACHE_DIR`). Cache Inductor versionne par build hash (`/app/.build_hash` = md5 source + pip freeze) → invalidation auto a chaque nouveau build Docker. `cache_size_limit=32`, `recompile_limit=16`, `automatic_dynamic_shapes=True` pour eviter les recompilations entre stages 1/2.
+- **torch.compile** : `torch.compile(dynamic=True)` sur le transformer ET le video decoder (desactivable via `TORCH_COMPILE=0` et `VAE_COMPILE=0`). `mode=max-autotune` par defaut (CUDA graphs + autotuning Triton), configurable via `COMPILE_MODE`. Cache Triton + TorchInductor persistant sur volume (`TRITON_CACHE_DIR`, `TORCHINDUCTOR_CACHE_DIR`). Cache Inductor versionne par build hash (`/app/.build_hash` = md5 source + pip freeze) → invalidation auto a chaque nouveau build Docker. `cache_size_limit=32`, `recompile_limit=16`, `automatic_dynamic_shapes=True` pour eviter les recompilations entre stages 1/2.
 - **Batching multi-client** : items regroupes par `camera_motion` (= meme prompt). Toujours traite via `generate_batch_frames()` avec padding a `MAX_BATCH` (defaut 3) pour shape fixe dans le compile cache. Resultats reordonnes par `_original_index`.
 - **Batching GPU** : `generate_batch_frames()` traite N images en un seul forward transformer (batch=N). Per-item noise (seeds differents), image encoding individuel. Spatial upscaler et VAE decode en sub-batches de `BATCH_SIZE`. `torch.cuda.empty_cache()` entre chaque stage (transformer → upscaler → stage 2 → VAE). Configurable via `BATCH_SIZE` (defaut 5).
 - **Async post-processing** : MP4 encode + S3 upload en parallele du GPU via ThreadPoolExecutor(3)
@@ -204,7 +204,7 @@ Objectif : generation rapide de videos a partir d'images, qualite correcte.
 - `start.sh` valide les fichiers `.safetensors` existants via `safe_open()` avant de skip le telechargement (detecte les fichiers corrompus/partiels)
 - S3 env vars : `S3_BUCKET`, `S3_ENDPOINT_URL` (defaut OVH SBG), `S3_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
 - `TORCH_COMPILE=1` (defaut) : torch.compile sur le transformer. `0` pour desactiver
-- `COMPILE_MODE=reduce-overhead` (defaut) : mode torch.compile. Valeurs : `default`, `reduce-overhead`, `max-autotune`, `max-autotune-no-cudagraphs`
+- `COMPILE_MODE=max-autotune` (defaut) : mode torch.compile. Valeurs : `default`, `reduce-overhead`, `max-autotune`, `max-autotune-no-cudagraphs`
 - `TRITON_CACHE_DIR` : repertoire cache Triton persistant (defaut `/runpod-volume/cache/triton/`). Autotuning sauvegarde les configs kernel optimales
 - `TORCHINDUCTOR_CACHE_DIR` : repertoire cache TorchInductor persistant (defaut `/runpod-volume/cache/inductor/{build_hash}/`). Versionne automatiquement par build hash Docker — invalide auto a chaque rebuild
 - `VAE_COMPILE=1` (defaut) : torch.compile(dynamic=True) sur le video decoder. `0` pour desactiver

@@ -62,7 +62,7 @@ RUN rm -rf /tmp/LTX-2
 ENV TORCH_CUDA_ARCH_LIST="9.0"
 
 # --- FlashAttention 3 (H100 sm_90, SDPA dispatch automatique) ---
-RUN pip install --no-build-isolation --no-cache-dir flash-attn
+RUN MAX_JOBS=$(nproc) pip install --no-build-isolation --no-cache-dir flash-attn
 
 # --- Runtime Python dependencies (runpod, requests, etc.) ---
 COPY requirements.txt /tmp/requirements.txt
