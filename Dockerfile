@@ -61,9 +61,9 @@ RUN rm -rf /tmp/LTX-2
 # H100 sm_90
 ENV TORCH_CUDA_ARCH_LIST="9.0"
 
-# --- FlashAttention 3 (H100 sm_90, SDPA dispatch automatique) ---
-# MAX_JOBS=4 : flash-attn compile ~50 kernels CUDA, chacun consomme beaucoup de RAM
-RUN MAX_JOBS=4 pip install --no-build-isolation --no-cache-dir flash-attn
+# --- FlashAttention 2.8.3 (wheel pre-compile, H100 sm_90, SDPA dispatch auto) ---
+RUN pip install --no-cache-dir \
+    "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 
 # --- Runtime Python dependencies (runpod, requests, etc.) ---
 COPY requirements.txt /tmp/requirements.txt
