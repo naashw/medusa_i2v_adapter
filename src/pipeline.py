@@ -111,6 +111,7 @@ class MedusaPipeline:
 
         # Embeddings cache (prompt/key -> (video_ctx, audio_ctx))
         self._embeddings_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._embeddings_cache_dir: str | None = None
 
         # Sigmas distilled (8 steps stage 1, 3 steps stage 2)
         self._sigmas = torch.tensor(
@@ -124,13 +125,18 @@ class MedusaPipeline:
         """Charge les embeddings depuis cache disque (genere par warmup_embeddings.py).
 
         Si le cache n'existe pas, genere les embeddings avec Gemma sur GPU.
+        Charge aussi les prompts custom caches (prompt_*.pt).
         """
+        self._embeddings_cache_dir = cache_dir
         cache_path = os.path.join(cache_dir, "embeddings_cache.pt")
 
         # Si cache existe deja, charger directement
         if os.path.isfile(cache_path):
             log.info("Chargement embeddings depuis cache: %s", cache_path)
             self._load_embeddings_cache(cache_path)
+
+            # Charger aussi les prompts custom caches
+            self._load_custom_embeddings(cache_dir)
             return
 
         log.info("Pas de cache embeddings — generation avec text encoder sur GPU...")
@@ -198,6 +204,25 @@ class MedusaPipeline:
                 tensors["audio"].to(self.device),
             )
         log.info("Embeddings charges: %d prompts", len(self._embeddings_cache))
+
+    def _load_custom_embeddings(self, cache_dir: str) -> None:
+        """Charge les embeddings custom caches (prompt_*.pt) depuis le disque."""
+        count = 0
+        for filename in os.listdir(cache_dir):
+            if not filename.startswith("prompt_") or not filename.endswith(".pt"):
+                continue
+            prompt_hash = filename[len("prompt_"):-len(".pt")]
+            if prompt_hash in self._embeddings_cache:
+                continue
+            filepath = os.path.join(cache_dir, filename)
+            try:
+                data = torch.load(filepath, map_location="cpu", weights_only=True)
+                self._embeddings_cache[prompt_hash] = (data["video"], data["audio"])
+                count += 1
+            except Exception as e:
+                log.warning("Skip custom embedding %s: %s", filename, e)
+        if count:
+            log.info("Custom embeddings charges: %d prompt(s)", count)
 
     @staticmethod
     def _log_vram(label: str) -> None:
@@ -452,19 +477,40 @@ class MedusaPipeline:
     def encode_prompt(self, prompt: str, negative: str | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode un prompt (cache hit ou Gemma GPU on-demand).
 
-        1. Verifie si le prompt est un preset connu dans le cache
-        2. Sinon charge Gemma GPU → encode → cleanup VRAM → retourne
+        Lookup 3-step :
+        1. Preset connu (cache RAM par nom de preset)
+        2. Custom en RAM (cache par hash du prompt)
+        3. Custom sur volume (fichier prompt_{hash}.pt)
+        4. Sinon Gemma GPU → encode → cache RAM + volume → cleanup VRAM
         """
-        # Chercher dans le cache par valeur (preset text → key)
+        # 1. Chercher dans les presets (par valeur puis par key)
         for key, preset_text in CAMERA_PRESETS.items():
             if prompt == preset_text and key in self._embeddings_cache:
                 return self._embeddings_cache[key]
-
-        # Chercher par key directe (ex: "dolly-in")
         if prompt in self._embeddings_cache:
             return self._embeddings_cache[prompt]
 
-        # On-demand : charger Gemma GPU et encoder
+        # 2. Check RAM cache (custom, par hash)
+        prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:16]
+        if prompt_hash in self._embeddings_cache:
+            log.info("Prompt cache hit (RAM): %s", prompt[:40])
+            v, a = self._embeddings_cache[prompt_hash]
+            return v.to(self.device), a.to(self.device)
+
+        # 3. Check volume cache (fichier individuel, peut venir d'un autre worker)
+        if self._embeddings_cache_dir:
+            cache_path = os.path.join(self._embeddings_cache_dir, f"prompt_{prompt_hash}.pt")
+            if os.path.isfile(cache_path):
+                try:
+                    data = torch.load(cache_path, map_location="cpu", weights_only=True)
+                    v_cpu, a_cpu = data["video"], data["audio"]
+                    self._embeddings_cache[prompt_hash] = (v_cpu, a_cpu)
+                    log.info("Prompt cache hit (volume): %s", prompt[:40])
+                    return v_cpu.to(self.device), a_cpu.to(self.device)
+                except Exception as e:
+                    log.warning("Cache volume corrompu %s: %s", cache_path, e)
+
+        # 4. On-demand : charger Gemma GPU et encoder
         log.info("Encoding prompt custom via Gemma GPU: %s", prompt[:80])
         te_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         te_ledger = ModelLedger(
@@ -487,7 +533,15 @@ class MedusaPipeline:
             torch.cuda.empty_cache()
         log.info("Gemma cleanup done")
 
-        return v_ctx.to(self.device), a_ctx.to(self.device)
+        # Sauvegarder en cache RAM (CPU) + volume
+        v_cpu, a_cpu = v_ctx.cpu(), a_ctx.cpu()
+        self._embeddings_cache[prompt_hash] = (v_cpu, a_cpu)
+        if self._embeddings_cache_dir:
+            cache_path = os.path.join(self._embeddings_cache_dir, f"prompt_{prompt_hash}.pt")
+            torch.save({"video": v_cpu, "audio": a_cpu}, cache_path)
+            log.info("Prompt cached (RAM + volume): %s", prompt[:40])
+
+        return v_cpu.to(self.device), a_cpu.to(self.device)
 
     def _get_negative_embeddings(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Retourne les embeddings du negative prompt (toujours pre-cache)."""
