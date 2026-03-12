@@ -61,18 +61,13 @@ RUN rm -rf /tmp/LTX-2
 # H100 sm_90
 ENV TORCH_CUDA_ARCH_LIST="9.0"
 
-# --- FlashAttention from source (H100 sm_90, SDPA dispatch auto) ---
-# MAX_JOBS=2 : compilation CUDA lourde en RAM, 2 jobs suffisent pour eviter timeout/OOM
-RUN MAX_JOBS=2 pip install --no-build-isolation --no-cache-dir flash-attn
-
 # --- Runtime Python dependencies (runpod, requests, etc.) ---
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-# Verification builder : ltx_core, ltx_pipelines et flash-attn importables
+# Verification builder : ltx_core et ltx_pipelines importables
 RUN python -c "import ltx_core; print('ltx_core OK:', ltx_core.__file__)" && \
     python -c "import ltx_pipelines; print('ltx_pipelines OK')" && \
-    python -c "import flash_attn; print('flash-attn OK:', flash_attn.__version__)" && \
     pip list | grep -i ltx
 
 # ============================================================

@@ -14,7 +14,7 @@ Pipeline Image-to-Video avec effets camera, inference directe via ltx-pipelines 
 | huggingface-hub | >=0.28 (avec HF XET) |
 | runpod | >=1.7, <2.0 |
 | boto3 | >=1.34 (S3 OVH) |
-| flash-attn | FlashAttention 3 (sm_90, SDPA dispatch auto) |
+| SDPA | cuDNN Fused Flash Attention (natif PyTorch >=2.5, H100 sm_90) |
 | Docker | Multi-stage (cuda:12.8.1-devel -> runtime) |
 
 ## Structure

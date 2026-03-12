@@ -20,7 +20,7 @@ LTX_COMMIT="9e8a28e17ac4dd9e49695223d50753a1ebda36fe"
 APP_DIR="/root/medusa_i2v_adapter"
 LTX_DIR="/tmp/LTX-2"
 
-echo "=== [1/7] Symlink /runpod-volume -> /workspace ==="
+echo "=== [1/6] Symlink /runpod-volume -> /workspace ==="
 if [ ! -e /runpod-volume ]; then
     ln -s /workspace /runpod-volume
     echo "OK: symlink created"
@@ -28,26 +28,23 @@ else
     echo "SKIP: /runpod-volume already exists"
 fi
 
-echo "=== [2/7] PyTorch >=2.9 (CUDA 12.8) ==="
+echo "=== [2/6] PyTorch >=2.9 (CUDA 12.8) ==="
 $PIP "torch>=2.9" --index-url https://download.pytorch.org/whl/cu128
 python3 -c "import torch; print(f'PyTorch {torch.__version__} CUDA {torch.version.cuda}')"
 
-echo "=== [3/7] Clone LTX-2 (commit $LTX_COMMIT) ==="
+echo "=== [3/6] Clone LTX-2 (commit $LTX_COMMIT) ==="
 if [ ! -d "$LTX_DIR" ]; then
     git clone --filter=blob:none --quiet https://github.com/Lightricks/LTX-2.git "$LTX_DIR"
 fi
 cd "$LTX_DIR" && git checkout "$LTX_COMMIT" 2>/dev/null
 
-echo "=== [4/7] Install ltx-core + ltx-pipelines (--no-deps to keep PyTorch) ==="
+echo "=== [4/6] Install ltx-core + ltx-pipelines (--no-deps to keep PyTorch) ==="
 cd "$LTX_DIR/packages/ltx-core" && $PIP --no-deps .
 cd "$LTX_DIR/packages/ltx-pipelines" && $PIP --no-deps .
 # Install their deps without torch
 $PIP einops scipy
 
-echo "=== [5/7] FlashAttention 3 (H100 sm_90) ==="
-$PIP --no-build-isolation flash-attn
-
-echo "=== [6/7] Clone medusa_i2v_adapter ==="
+echo "=== [5/6] Clone medusa_i2v_adapter ==="
 if [ ! -d "$APP_DIR" ]; then
     git clone "$REPO_URL" "$APP_DIR"
 else
@@ -57,13 +54,13 @@ $PIP "huggingface-hub[hf-xet]>=0.28,<1.0" safetensors sentencepiece accelerate \
     "runpod>=1.8,<2.0" "requests>=2.31,<3.0" "boto3>=1.34,<2.0" \
     "transformers>=4.52,<5.0" "Pillow>=10.0"
 
-echo "=== [7/7] Verification ==="
+echo "=== [6/6] Verification ==="
 python3 -c "
 import torch; print(f'torch {torch.__version__} CUDA {torch.version.cuda}')
 import ltx_core; print('ltx_core OK')
 import ltx_pipelines; print('ltx_pipelines OK')
-import flash_attn; print(f'flash-attn {flash_attn.__version__}')
 import transformers; print(f'transformers {transformers.__version__}')
+print(f'SDPA backends: cuDNN attention natif (H100 sm_90)')
 "
 echo ""
 echo "=== READY ==="

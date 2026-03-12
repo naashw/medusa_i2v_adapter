@@ -61,12 +61,10 @@ from prompts import CAMERA_PRESETS, DEFAULT_NEGATIVE_PROMPT
 
 log = logging.getLogger("medusa")
 
-# Log FlashAttention disponibilite (SDPA dispatch auto vers FA3 sur H100)
-try:
-    import flash_attn
-    log.info("FlashAttention %s disponible (SDPA dispatch auto sm_90)", flash_attn.__version__)
-except ImportError:
-    log.warning("flash-attn non installe, SDPA fallback vers FA2/math kernel")
+# Log SDPA backend (cuDNN Fused Flash Attention natif sur H100, pas de dep externe)
+if torch.cuda.is_available():
+    log.info("SDPA backend: cuDNN attention (natif PyTorch, H100 sm_90)")
+
 
 # Version du cache transformer (incrementer pour invalider tous les caches existants)
 CACHE_VERSION = "v4"
