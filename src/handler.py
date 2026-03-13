@@ -401,16 +401,10 @@ def handler(job: dict) -> dict:
             for batch_idx, sub_batch in enumerate(sub_batches):
                 start_time = time.time()
 
-                # Padding : toujours envoyer MAX_BATCH items au transformer pour eviter
-                # les recompilations Dynamo (shape fixe dans le compile cache)
                 real_count = len(sub_batch)
-                if real_count < MAX_BATCH:
-                    sub_batch_padded = sub_batch + [sub_batch[-1]] * (MAX_BATCH - real_count)
-                else:
-                    sub_batch_padded = sub_batch
 
                 pipeline_items = []
-                for item in sub_batch_padded:
+                for item in sub_batch:
                     pi: dict = {"image_path": item["_image_path"], "seed": item["seed"]}
                     if item.get("_last_image_path"):
                         pi["last_image_path"] = item["_last_image_path"]
@@ -420,8 +414,6 @@ def handler(job: dict) -> dict:
                 # Callback : soumettre le MP4 encode + S3 upload des que
                 # le VAE decode un item, pendant que le VAE decode les suivants
                 def on_decoded(batch_idx: int, frames: list) -> None:
-                    if batch_idx >= real_count:
-                        return  # Ignorer items padding
                     item = sub_batch[batch_idx]
                     orig_idx = item["_original_index"]
                     output_dir = tempfile.mkdtemp(prefix="medusa_")
@@ -455,9 +447,9 @@ def handler(job: dict) -> dict:
 
                 elapsed = time.time() - start_time
                 log.info(
-                    "Groupe '%s' sub-batch %d/%d: %.1fs (%d item(s), %d padded)",
+                    "Groupe '%s' sub-batch %d/%d: %.1fs (%d item(s))",
                     prompt_text[:30], batch_idx + 1, len(sub_batches), elapsed,
-                    real_count, MAX_BATCH - real_count,
+                    real_count,
                 )
 
         # --- Reordonner les resultats par _original_index ---

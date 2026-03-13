@@ -164,7 +164,9 @@ export TORCHINDUCTOR_CACHE_DIR="${WORKSPACE}/cache/inductor/${INDUCTOR_CACHE_V}"
 export TORCHINDUCTOR_FX_GRAPH_CACHE=1
 export TORCHINDUCTOR_AUTOGRAD_CACHE=1
 export TORCHINDUCTOR_COMPILE_THREADS=12
-export TORCH_LOGS="+torch._inductor.codecache"
+if [[ "${LOG_LEVEL:-info}" == "debug" ]]; then
+  export TORCH_LOGS="+torch._inductor.codecache"
+fi
 export PYTHONHASHSEED="${PYTHONHASHSEED:-0}"
 
 echo "[medusa] Inductor cache: $TORCHINDUCTOR_CACHE_DIR"
