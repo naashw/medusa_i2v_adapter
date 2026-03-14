@@ -50,7 +50,6 @@ from ltx_pipelines.utils.helpers import (
     modality_from_latent_state,
     noise_audio_state,
     noise_video_state,
-    simple_denoising_func,
 )
 from ltx_pipelines.utils.samplers import euler_denoising_loop
 from ltx_pipelines.utils.media_io import encode_video
@@ -309,26 +308,25 @@ class MedusaPipeline:
         gen = torch.Generator(device=self.device).manual_seed(0)
         noiser = GaussianNoiser(generator=gen)
 
-        # Configs couvrant toutes les shapes (landscape + portrait) + les 2 patterns audio:
-        # - 1-stage : audio=False (stage 1 pattern)
-        # - 2-stage full-res : audio=default (stage 2 pattern, pas de kwarg enabled)
+        # Configs couvrant toutes les shapes (landscape + portrait).
+        # audio.enabled=False partout (on ne genere pas d'audio) → un seul chemin Dynamo par shape.
         # Portrait = landscape transpose (memes megapixels, sequences de tokens differentes)
         # Note : 540p (544×960) = meme shape que 1080p-s1, pas de warmup supplementaire
-        configs: list[tuple[str, int, int, torch.Tensor, bool]] = [
+        configs: list[tuple[str, int, int, torch.Tensor]] = [
             # Tier 2 — Standard 720p 2-stage
-            ("720p-s1",              352,  640,  self._sigmas,        True),
-            ("720p-s2",              704,  1280, self._stage2_sigmas, False),
+            ("720p-s1",              352,  640,  self._sigmas),
+            ("720p-s2",              704,  1280, self._stage2_sigmas),
             # Tier 3 — Production 1080p 2-stage
-            ("1080p-s1",             544,  960,  self._sigmas,        True),
-            ("1080p-s2",             1088, 1920, self._stage2_sigmas, False),
+            ("1080p-s1",             544,  960,  self._sigmas),
+            ("1080p-s2",             1088, 1920, self._stage2_sigmas),
             # Portrait 9:16
-            ("720p-portrait-s1",     640,  352,  self._sigmas,        True),
-            ("720p-portrait-s2",     1280, 704,  self._stage2_sigmas, False),
-            ("1080p-portrait-s1",    960,  544,  self._sigmas,        True),
-            ("1080p-portrait-s2",    1920, 1088, self._stage2_sigmas, False),
+            ("720p-portrait-s1",     640,  352,  self._sigmas),
+            ("720p-portrait-s2",     1280, 704,  self._stage2_sigmas),
+            ("1080p-portrait-s1",    960,  544,  self._sigmas),
+            ("1080p-portrait-s2",    1920, 1088, self._stage2_sigmas),
         ]
 
-        for label, h, w, sigmas, explicit_audio_disabled in configs:
+        for label, h, w, sigmas in configs:
             t0 = time.perf_counter()
 
             images = [ImageConditioningInput(path=tmp_path, frame_idx=0, strength=1.0)]
@@ -352,14 +350,8 @@ class MedusaPipeline:
             )
 
             sigma = sigmas[0]
-            if explicit_audio_disabled:
-                # Stage 1 pattern : video enabled, audio disabled
-                vid_mod = modality_from_latent_state(vs, v_ctx, sigma, enabled=True)
-                aud_mod = modality_from_latent_state(as_, a_ctx, sigma, enabled=False)
-            else:
-                # Stage 2 pattern : defaults (pas de kwarg enabled)
-                vid_mod = modality_from_latent_state(vs, v_ctx, sigma)
-                aud_mod = modality_from_latent_state(as_, a_ctx, sigma)
+            vid_mod = modality_from_latent_state(vs, v_ctx, sigma, enabled=True)
+            aud_mod = modality_from_latent_state(as_, a_ctx, sigma, enabled=False)
 
             sigma_b = sigma.unsqueeze(0)
             vid_mod = dataclasses.replace(vid_mod, sigma=sigma_b)
@@ -849,16 +841,28 @@ class MedusaPipeline:
                 audio_state: LatentState,
                 stepper_arg: DiffusionStepProtocol,
             ) -> tuple[LatentState, LatentState]:
+                def denoise_step_s2(
+                    video_state: LatentState,
+                    audio_state: LatentState,
+                    sigmas: torch.Tensor,
+                    step_index: int,
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+                    sigma = sigmas[step_index]
+                    vid_mod = modality_from_latent_state(
+                        video_state, v_context_p, sigma, enabled=True,
+                    )
+                    aud_mod = modality_from_latent_state(
+                        audio_state, a_context_p, sigma, enabled=False,
+                    )
+                    torch.compiler.cudagraph_mark_step_begin()
+                    return transformer(video=vid_mod, audio=aud_mod, perturbations=None)
+
                 return euler_denoising_loop(
                     sigmas=sigmas,
                     video_state=video_state,
                     audio_state=audio_state,
                     stepper=stepper_arg,
-                    denoise_fn=simple_denoising_func(
-                        video_context=v_context_p,
-                        audio_context=a_context_p,
-                        transformer=transformer,
-                    ),
+                    denoise_fn=denoise_step_s2,
                 )
 
             output_shape_s2 = VideoPixelShape(
@@ -1216,8 +1220,8 @@ class MedusaPipeline:
                     step_index: int,
                 ) -> tuple[torch.Tensor, torch.Tensor]:
                     sigma = sigmas[step_index]
-                    vid_mod = modality_from_latent_state(video_state, v_ctx_batch, sigma)
-                    aud_mod = modality_from_latent_state(audio_state, a_ctx_batch, sigma)
+                    vid_mod = modality_from_latent_state(video_state, v_ctx_batch, sigma, enabled=True)
+                    aud_mod = modality_from_latent_state(audio_state, a_ctx_batch, sigma, enabled=False)
                     # Fix: expand scalar sigma to (batch_size,) for prompt_adaln
                     sigma_b = sigma.unsqueeze(0).expand(batch_size)
                     vid_mod = dataclasses.replace(vid_mod, sigma=sigma_b)

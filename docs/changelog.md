@@ -1,5 +1,37 @@
 # Changelog — Medusa I2V
 
+## 2026-03-14 — Unification audio.enabled=False (halve Dynamo specializations)
+
+### Contexte
+
+Le pipeline avait 2 patterns Dynamo distincts : stage 1 passait `audio.enabled=False`, stage 2 utilisait le default (`enabled=True`). Dynamo compilait donc 2 chemins par bloc transformer (8 shapes x 2 patterns = 16 specialisations). Vu qu'on ne genere pas d'audio (videos immobilieres), unifier sur `audio.enabled=False` partout divise les specialisations par 2.
+
+### Modifications
+
+- **Warmup** — Suppression du flag `explicit_audio_disabled` et du branch if/else. Toutes les configs passent `enabled=True` (video) / `enabled=False` (audio). Tuple configs passe de 5 a 4 colonnes
+- **Stage 2 single** — Remplacement de `simple_denoising_func` (qui utilisait `enabled=True` par defaut pour audio) par une `denoise_step_s2` inline avec `audio.enabled=False` explicite + `cudagraph_mark_step_begin()`
+- **Stage 2 batch** — Ajout `enabled=True` / `enabled=False` explicites sur les appels `modality_from_latent_state`
+- **Import `simple_denoising_func`** — Supprime (plus utilise)
+
+### Fichiers modifies
+
+| Fichier | Modifications |
+|---------|---------------|
+| `src/pipeline.py` | Warmup configs, stage 2 single denoise_fn, stage 2 batch enabled flags, suppression import simple_denoising_func |
+
+### Impact attendu
+
+- Warmup : 8 graphes au lieu de 16 (~50% du temps)
+- Aucun impact qualite video (audio jamais utilise)
+
+### Verification
+
+1. Job 720p 2-stage — output identique, pas de regression
+2. Job 1080p 2-stage — output identique, pas de regression
+3. Warmup logs — 8 entries au lieu de 16 compilations Dynamo distinctes
+
+---
+
 ## 2026-03-14 — Mega Cache artifacts + diagnostic compact + fix VAE batch recompilation
 
 ### Ajouts
