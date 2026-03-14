@@ -52,6 +52,7 @@ Voir `src/handler.py` pour le schema complet. Points cles :
 | `VAE_TILING` | `0` | Tiled VAE decode (reduit VRAM 1080p, risque ghosting) |
 | `BATCH_SIZE` | `5` | Max items par sub-batch denoising |
 | `MAX_BATCH` | `9` | Plafond items par sub-batch handler |
+| `CLEAN_OLD_CACHE` | `1` | Purge cache inductor/triton/artifacts des builds precedents au demarrage (`0` desactive) |
 | `LOG_LEVEL` | `info` | `debug` active les logs Inductor verbose |
 | `S3_BUCKET` | _(vide)_ | Active S3 upload OVH si defini |
 | `S3_ENDPOINT_URL` | OVH SBG | Endpoint S3 |

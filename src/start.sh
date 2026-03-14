@@ -152,6 +152,31 @@ mkdir -p "${WORKSPACE}/cache/transformer"
 mkdir -p "${WORKSPACE}/cache/triton"
 # Inductor cache versione par build hash (source + packages) — invalide auto
 INDUCTOR_CACHE_V=$(cat /app/.build_hash 2>/dev/null || echo "unknown")
+
+# Clean ancien cache inductor/triton/compile_artifacts d'un build precedent
+if [[ "${CLEAN_OLD_CACHE:-1}" == "1" ]] && [[ -d "${WORKSPACE}/cache/inductor" ]]; then
+    for old_dir in "${WORKSPACE}/cache/inductor"/*/; do
+        [[ -d "$old_dir" ]] || continue
+        if [[ "$(basename "$old_dir")" != "${INDUCTOR_CACHE_V}" ]]; then
+            echo "[medusa] Purge ancien cache inductor: $(basename "$old_dir")"
+            rm -rf "$old_dir"
+        fi
+    done
+fi
+if [[ "${CLEAN_OLD_CACHE:-1}" == "1" ]] && [[ -d "${WORKSPACE}/cache/compile_artifacts" ]]; then
+    for old_bin in "${WORKSPACE}/cache/compile_artifacts"/*.bin; do
+        [[ -f "$old_bin" ]] || continue
+        if [[ "$(basename "$old_bin")" != "${INDUCTOR_CACHE_V}.bin" ]]; then
+            echo "[medusa] Purge ancien compile artifact: $(basename "$old_bin")"
+            rm -rf "$old_bin"
+        fi
+    done
+fi
+if [[ "${CLEAN_OLD_CACHE:-1}" == "1" ]] && [[ -d "${WORKSPACE}/cache/triton" ]]; then
+    echo "[medusa] Purge cache triton (rebuild avec nouveau build)"
+    rm -rf "${WORKSPACE}/cache/triton"
+fi
+
 mkdir -p "${WORKSPACE}/cache/inductor/${INDUCTOR_CACHE_V}"
 mkdir -p "${WORKSPACE}/cache/compile_artifacts"
 mkdir -p "${WORKSPACE}/output"
