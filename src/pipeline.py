@@ -113,6 +113,9 @@ class MedusaPipeline:
         self._embeddings_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         self._embeddings_cache_dir: str | None = None
 
+        # Charger les compile artifacts (Mega Cache) AVANT tout torch.compile()
+        self._load_compile_artifacts()
+
         # Sigmas distilled (8 steps stage 1, 3 steps stage 2)
         self._sigmas = torch.tensor(
             DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=self.device
@@ -233,91 +236,134 @@ class MedusaPipeline:
             log.info("VRAM [%s]: %.2fGB alloc, %.2fGB reserved", label, alloc, rsvd)
 
     @staticmethod
+    def _compile_artifacts_path() -> str:
+        """Chemin du blob Mega Cache sur le volume."""
+        build_hash = os.environ.get("BUILD_HASH", "unknown")
+        return os.path.join(
+            os.environ.get("WORKSPACE", "/runpod-volume"),
+            "cache", "compile_artifacts", f"{build_hash}.bin",
+        )
+
+    def _load_compile_artifacts(self) -> None:
+        """Charge les compile artifacts (Mega Cache) depuis le volume si disponibles.
+
+        DOIT etre appele AVANT tout torch.compile() dans le process.
+        """
+        artifacts_path = self._compile_artifacts_path()
+        if os.path.isfile(artifacts_path):
+            try:
+                with open(artifacts_path, "rb") as f:
+                    info = torch.compiler.load_cache_artifacts(f.read())
+                sz = os.path.getsize(artifacts_path) / (1024 * 1024)
+                log.info("Compile artifacts loaded: %s (%.0f MB, info=%s)", artifacts_path, sz, info)
+            except Exception as e:
+                log.warning("load_cache_artifacts failed (will recompile): %s", e)
+        else:
+            log.info("No compile artifacts found at %s (cold start)", artifacts_path)
+
+    def save_compile_artifacts(self) -> None:
+        """Sauvegarde les artifacts torch.compile sur le volume (Mega Cache)."""
+        artifacts_path = self._compile_artifacts_path()
+        if os.path.isfile(artifacts_path):
+            return  # deja sauvegarde
+        try:
+            result = torch.compiler.save_cache_artifacts()
+            if result is None:
+                log.warning("save_cache_artifacts returned None (no compilation done?)")
+                return
+            artifact_bytes, info = result
+            os.makedirs(os.path.dirname(artifacts_path), exist_ok=True)
+            tmp = artifacts_path + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(artifact_bytes)
+            os.replace(tmp, artifacts_path)
+            sz = len(artifact_bytes) / (1024 * 1024)
+            log.info("Compile artifacts saved: %s (%.0f MB, info=%s)", artifacts_path, sz, info)
+        except Exception as e:
+            log.warning("save_compile_artifacts failed: %s", e)
+
+    @staticmethod
     def _log_inductor_cache_diagnostic() -> None:
-        """Diagnostic complet du cache Inductor pour debug cross-process."""
-        log.info("=== DIAGNOSTIC CACHE INDUCTOR ===")
+        """Diagnostic compact du cache Inductor."""
+        cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR", "")
+        build_hash = os.environ.get("BUILD_HASH", "unknown")
+        is_debug = os.environ.get("LOG_LEVEL", "info").lower() == "debug"
 
-        # 1. Env vars vues par le process Python
-        env_keys = [
-            "TORCHINDUCTOR_CACHE_DIR", "TORCHINDUCTOR_FX_GRAPH_CACHE",
-            "TORCHINDUCTOR_AUTOGRAD_CACHE", "TRITON_CACHE_DIR",
-            "PYTHONHASHSEED", "TORCH_LOGS",
-        ]
-        for k in env_keys:
-            log.info("  ENV %s=%s", k, os.environ.get(k, "(not set)"))
+        # Counts aotautograd + fxgraph
+        aot_count = 0
+        aot_dir = os.path.join(cache_dir, "aotautograd") if cache_dir else ""
+        if aot_dir and os.path.isdir(aot_dir):
+            aot_count = len(os.listdir(aot_dir))
 
-        # 2. torch._inductor.config values
-        try:
-            ic = torch._inductor.config
-            log.info("  config.cache_dir=%s", getattr(ic, "cache_dir", "(attr missing)"))
-            log.info("  config.fx_graph_cache=%s", getattr(ic, "fx_graph_cache", "(attr missing)"))
-            log.info("  config.compile_threads=%s", getattr(ic, "compile_threads", "(attr missing)"))
-            log.info("  os.cpu_count()=%s", os.cpu_count())
-        except Exception as e:
-            log.warning("  config read failed: %s", e)
+        fx_dirs, fx_files = 0, 0
+        fxgraph_dir = os.path.join(cache_dir, "fxgraph") if cache_dir else ""
+        if fxgraph_dir and os.path.isdir(fxgraph_dir):
+            for d in os.listdir(fxgraph_dir):
+                dp = os.path.join(fxgraph_dir, d)
+                if os.path.isdir(dp):
+                    fx_dirs += 1
+                    fx_files += sum(1 for f in os.listdir(dp) if os.path.isfile(os.path.join(dp, f)))
 
-        # 3. torch_key — hash de tous les .py sous torch/
-        try:
-            import torch._inductor.codecache as cc
-            tk = cc.torch_key()
-            log.info("  torch_key=%s", tk.hex()[:24])
-        except Exception as e:
-            log.warning("  torch_key failed: %s", e)
+        # Compile artifacts (Mega Cache)
+        artifacts_path = os.path.join(
+            os.environ.get("WORKSPACE", "/runpod-volume"),
+            "cache", "compile_artifacts", f"{build_hash}.bin",
+        )
+        if os.path.isfile(artifacts_path):
+            art_sz = os.path.getsize(artifacts_path) / (1024 * 1024)
+            art_info = f"{artifacts_path} (exists, {art_sz:.0f} MB)"
+        else:
+            art_info = f"{artifacts_path} (missing)"
 
-        # 4. system_info
-        try:
-            import torch._inductor.codecache as cc
-            si = cc.CacheBase.get_system()
-            log.info("  system_info=%s", json.dumps(si, sort_keys=True))
-        except Exception as e:
-            log.warning("  system_info failed: %s", e)
-
-        # 5. CUDA device properties
-        if torch.cuda.is_available():
-            props = torch.cuda.get_device_properties(0)
-            log.info("  CUDA device=%s, sm=%d.%d", props.name, props.major, props.minor)
-            log.info("  CUDA version=%s, torch=%s", torch.version.cuda, torch.__version__)
-
-        # 6. inductor_config portable hash
+        # Inductor config hash
+        cfg_hash = "?"
         try:
             from torch._inductor import config as ind_config
             cfg = ind_config.save_config_portable()
             cfg_str = json.dumps(cfg, sort_keys=True, default=str)
             cfg_hash = hashlib.sha256(cfg_str.encode()).hexdigest()[:16]
-            log.info("  inductor_config hash=%s (%d keys)", cfg_hash, len(cfg))
-            # Log les valeurs non-default pour identifier les differences entre containers
-            for k, v in sorted(cfg.items()):
-                if v is not None and v != "" and v is not False and v != 0:
-                    log.info("  inductor_config %s=%s", k, v)
-        except Exception as e:
-            log.warning("  inductor_config hash failed: %s", e)
+        except Exception:
+            pass
 
-        # 7. Contenu du cache fxgraph sur le volume
-        cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR", "")
-        fxgraph_dir = os.path.join(cache_dir, "fxgraph") if cache_dir else ""
-        if fxgraph_dir and os.path.isdir(fxgraph_dir):
-            entries = []
-            for d in os.listdir(fxgraph_dir):
-                dp = os.path.join(fxgraph_dir, d)
-                if os.path.isdir(dp):
-                    files = [f for f in os.listdir(dp) if os.path.isfile(os.path.join(dp, f))]
-                    total_size = sum(os.path.getsize(os.path.join(dp, f)) for f in files)
-                    entries.append((d, len(files), total_size))
-            log.info("  fxgraph entries: %d dirs", len(entries))
-            for name, nfiles, size in entries:
-                log.info("    fxgraph/%s: %d files, %.1f KB", name, nfiles, size / 1024)
-        else:
-            log.info("  fxgraph dir: %s (missing or empty)", fxgraph_dir)
+        # CUDA info
+        cuda_info = ""
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            cuda_info = f"{props.name}, sm_{props.major}.{props.minor}, torch={torch.__version__}"
 
-        # 8. Contenu du cache aotautograd
-        aot_dir = os.path.join(cache_dir, "aotautograd") if cache_dir else ""
-        if aot_dir and os.path.isdir(aot_dir):
-            aot_entries = list(os.listdir(aot_dir))
-            log.info("  aotautograd entries: %d", len(aot_entries))
-        else:
-            log.info("  aotautograd dir: missing or empty")
+        ic = torch._inductor.config
+        log.info("=== INDUCTOR CACHE ===")
+        log.info("  cache_dir=%s", cache_dir or "(default)")
+        log.info(
+            "  fx_graph_cache=%s, autograd_cache=%s, compile_threads=%s, config_hash=%s",
+            getattr(ic, "fx_graph_cache", "?"),
+            os.environ.get("TORCHINDUCTOR_AUTOGRAD_CACHE", "0"),
+            getattr(ic, "compile_threads", "?"),
+            cfg_hash,
+        )
+        log.info("  aotautograd: %d entries | fxgraph: %d dirs (%d files)", aot_count, fx_dirs, fx_files)
+        log.info("  artifacts: %s", art_info)
+        if cuda_info:
+            log.info("  CUDA: %s", cuda_info)
+        log.info("=== FIN CACHE ===")
 
-        log.info("=== FIN DIAGNOSTIC ===")
+        # Mode debug : inductor config non-default + fxgraph listing detaille
+        if is_debug:
+            try:
+                cfg = ind_config.save_config_portable()
+                non_default = {k: v for k, v in sorted(cfg.items())
+                               if v is not None and v != "" and v is not False and v != 0}
+                for k, v in non_default.items():
+                    log.debug("  inductor_config %s=%s", k, v)
+            except Exception:
+                pass
+            if fxgraph_dir and os.path.isdir(fxgraph_dir):
+                for d in os.listdir(fxgraph_dir):
+                    dp = os.path.join(fxgraph_dir, d)
+                    if os.path.isdir(dp):
+                        files = [f for f in os.listdir(dp) if os.path.isfile(os.path.join(dp, f))]
+                        total_sz = sum(os.path.getsize(os.path.join(dp, f)) for f in files)
+                        log.debug("    fxgraph/%s: %d files, %.1f KB", d, len(files), total_sz / 1024)
 
     def _get_orig_module(self) -> torch.nn.Module:
         """Unwrap torch.compile OptimizedModule si besoin."""
@@ -1003,7 +1049,8 @@ class MedusaPipeline:
                     # Log Inductor cache counters apres premier step
                     try:
                         from torch._dynamo.utils import counters
-                        cache_counters = {k: v for k, v in counters["inductor"].items() if "cache" in k.lower()}
+                        cache_counters = {k: v for k, v in counters["inductor"].items()
+                                          if "cache" in k.lower() or "autograd" in k.lower()}
                         if cache_counters:
                             log.info("Inductor cache counters: %s", cache_counters)
                         else:
@@ -1114,9 +1161,13 @@ class MedusaPipeline:
         log.info("Batch VAE decode (%d items, sequentiel)...", batch_size)
         all_frames: list[list[torch.Tensor]] = []
         for i in range(batch_size):
-            item_latent = video_state.latent[i:i+1]
+            t0 = time.perf_counter()
+            item_latent = video_state.latent[i:i+1].contiguous()
             decoded = vae_decode_video(item_latent, self._video_decoder, tiling, generators[i])
             item_frames = [chunk.cpu() for chunk in decoded]
+            dt = time.perf_counter() - t0
+            if dt > 5.0:
+                log.warning("VAE decode item %d/%d: %.1fs (possible recompilation)", i, batch_size, dt)
             all_frames.append(item_frames)
             if on_item_decoded is not None:
                 on_item_decoded(i, item_frames)

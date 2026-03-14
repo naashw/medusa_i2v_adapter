@@ -153,8 +153,10 @@ mkdir -p "${WORKSPACE}/cache/triton"
 # Inductor cache versione par build hash (source + packages) — invalide auto
 INDUCTOR_CACHE_V=$(cat /app/.build_hash 2>/dev/null || echo "unknown")
 mkdir -p "${WORKSPACE}/cache/inductor/${INDUCTOR_CACHE_V}"
+mkdir -p "${WORKSPACE}/cache/compile_artifacts"
 mkdir -p "${WORKSPACE}/output"
 
+export BUILD_HASH="${INDUCTOR_CACHE_V}"
 export MODELS_DIR="$MODELS_DIR"
 export VOLUME_ROOT="$WORKSPACE"
 export CACHE_DIR="${WORKSPACE}/cache"
