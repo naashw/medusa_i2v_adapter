@@ -1,5 +1,45 @@
 # Changelog — Medusa I2V
 
+## 2026-03-14 — Mega Cache artifacts + diagnostic compact + fix VAE batch recompilation
+
+### Ajouts
+
+- **Mega Cache (`save/load_cache_artifacts`)** — Bundle les 5 caches torch.compile (PGO, AOTAutograd, Inductor, Triton, Autotuning) en un blob portable sur le volume (`cache/compile_artifacts/{build_hash}.bin`). Load dans `__init__()` avant tout `torch.compile()`, save apres le 1er job reussi. Cold start 2+ devrait skip la recompilation (~18s/step transformer, ~170s VAE)
+- **Timing VAE decode par item** — Log warning si un item prend >5s (diagnostic recompilation)
+- **Cache counters enrichis** — Filtre elargi avec "autograd" en plus de "cache"
+- **`BUILD_HASH` env var** — Exporte dans start.sh pour versionner les compile artifacts
+
+### Corrections
+
+- **`.contiguous()` sur VAE decode batch** — Le slice `video_state.latent[i:i+1]` d'un tensor batche peut avoir des strides/metadata differents du tensor single-item pour lequel le VAE a ete compile initialement → recompilation Dynamo de 347s. `.contiguous()` normalise le layout memoire. Cout negligeable (~quelques MB BF16)
+
+### Ameliorations
+
+- **Diagnostic Inductor compact** — Reduit de ~200 lignes a ~6 lignes. Supprime le dump des 419 keys inductor config, le listing des 61 sous-repertoires fxgraph, torch_key et system_info. Detail complet disponible en `LOG_LEVEL=debug`
+
+### Fichiers modifies
+
+| Fichier | Modifications |
+|---------|---------------|
+| `src/pipeline.py` | `_load_compile_artifacts()`, `save_compile_artifacts()`, `_compile_artifacts_path()`, diagnostic compact, `.contiguous()` VAE, timing VAE par item, counters enrichis |
+| `src/handler.py` | Flag `_artifacts_saved` + trigger save apres 1er job |
+| `src/start.sh` | `mkdir compile_artifacts`, `export BUILD_HASH` |
+
+### Verification en production
+
+1. **Cold start 1** : "No compile artifacts found" → recompilation normale → "Compile artifacts saved" apres 1er job
+2. **Cold start 2+** : "Compile artifacts loaded" → step 0 transformer < 1s (au lieu de 18s)
+3. **Batch=5** : gap VAE decode < 10s (au lieu de 347s)
+4. **Logs** : diagnostic ~6 lignes au lieu de ~200
+5. **Warm perf** : jobs single-item restent a 7-8s (pas de regression)
+
+### Rollback
+
+- Supprimer le fichier `cache/compile_artifacts/{build_hash}.bin` sur le volume pour forcer la recompilation
+- `.contiguous()` est sans risque (copie memoire negligeable)
+
+---
+
 ## 2026-03-09 — PyTorch 2.9 + SageAttention 2.2.0 + max-autotune + cache Triton
 
 ### Upgrade majeur
