@@ -186,9 +186,10 @@ class MedusaPipeline:
         log.info("Chargement video decoder (persistent)...")
         self._video_decoder = self._base_ledger.video_decoder()
         if os.environ.get("VAE_COMPILE", "1") == "1":
-            log.info("torch.compile video decoder (mode=default, dynamic=True)...")
+            vae_dynamic = os.environ.get("DYNAMIC_COMPILE", "0") == "1"
+            log.info("torch.compile video decoder (mode=default, dynamic=%s)...", vae_dynamic)
             self._video_decoder = torch.compile(
-                self._video_decoder, mode="default", fullgraph=False, dynamic=True,
+                self._video_decoder, mode="default", fullgraph=False, dynamic=vae_dynamic,
             )
         self._log_vram("apres video decoder")
 
@@ -599,9 +600,10 @@ class MedusaPipeline:
                     log.info("Inductor debug logging active (cache hit/miss visible)")
                 except Exception as e:
                     log.warning("Inductor debug logging failed: %s", e)
-            torch._dynamo.config.automatic_dynamic_shapes = True
-            torch._dynamo.config.allow_unspec_int_on_nn_module = True
-            torch._dynamo.config.force_parameter_static_shapes = False
+            dynamic_compile = os.environ.get("DYNAMIC_COMPILE", "0") == "1"
+            torch._dynamo.config.automatic_dynamic_shapes = dynamic_compile
+            torch._dynamo.config.allow_unspec_int_on_nn_module = dynamic_compile
+            torch._dynamo.config.force_parameter_static_shapes = not dynamic_compile
             torch._dynamo.config.cache_size_limit = 32
             torch._dynamo.config.recompile_limit = 48
             compile_mode = os.environ.get("COMPILE_MODE", "default")
@@ -610,13 +612,13 @@ class MedusaPipeline:
                 log.warning("COMPILE_MODE=%s invalide, fallback default", compile_mode)
                 compile_mode = "default"
             blocks = self._transformer.velocity_model.transformer_blocks
-            log.info("torch.compile regional: %d blocs (mode=%s, dynamic=True)...", len(blocks), compile_mode)
+            log.info("torch.compile regional: %d blocs (mode=%s, dynamic=%s)...", len(blocks), compile_mode, dynamic_compile)
             for i, block in enumerate(blocks):
                 blocks[i] = torch.compile(
                     block,
                     mode=compile_mode,
                     fullgraph=False,
-                    dynamic=True,
+                    dynamic=dynamic_compile,
                 )
 
         self._log_vram("apres base transformer")

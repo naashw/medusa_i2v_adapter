@@ -46,6 +46,7 @@ Voir `src/handler.py` pour le schema complet. Points cles :
 | `TORCH_COMPILE` | `1` | torch.compile transformer (`0` desactive) |
 | `VAE_COMPILE` | `1` | torch.compile VAE decoder (`0` desactive) |
 | `COMPILE_MODE` | `default` | `default`, `reduce-overhead`, `max-autotune`, `max-autotune-no-cudagraphs` |
+| `DYNAMIC_COMPILE` | `0` | `1` active dynamic shapes (defaut: static, optimal pour 8 shapes fixes) |
 | `TRANSFORMER_CACHE` | `1` | Cache transformer pre-fusionne sur volume |
 | `SAMPLER` | `euler` | `res2s` pour Res2sDiffusionStep (second ordre) |
 | `VAE_TILING` | `0` | Tiled VAE decode (reduit VRAM 1080p, risque ghosting) |
