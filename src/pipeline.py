@@ -282,6 +282,97 @@ class MedusaPipeline:
         except Exception as e:
             log.warning("save_compile_artifacts failed: %s", e)
 
+    @torch.inference_mode()
+    def warmup_compile(self, num_frames: int = 25, frame_rate: float = 24) -> None:
+        """Pre-compile le transformer pour toutes les shapes (720p + 1080p 2-stage).
+
+        Lance un forward dummy par resolution pour declencher la compilation
+        Dynamo de toutes les variantes attention/shapes. Elimine les recompilations
+        couteuses (~30s) du premier job reel.
+        """
+        from PIL import Image
+
+        log.info("Warmup compile: pre-compilation transformer...")
+        t0_total = time.perf_counter()
+
+        transformer = self.get_transformer()
+
+        # Image dummy (blank, sera remplacee par le conditioning latent)
+        tmp_path = "/tmp/warmup_compile_dummy.png"
+        Image.new("RGB", (64, 64), (128, 128, 128)).save(tmp_path)
+
+        # Embeddings depuis le cache (premier preset disponible)
+        first_key = next(iter(self._embeddings_cache))
+        v_ctx, a_ctx = self._embeddings_cache[first_key]
+
+        gen = torch.Generator(device=self.device).manual_seed(0)
+        noiser = GaussianNoiser(generator=gen)
+
+        # Configs couvrant les 3 shapes + les 2 patterns audio:
+        # - 720p 1-stage : audio=False (stage 1 pattern)
+        # - 1080p stage 1 half-res : audio=False (stage 1 pattern)
+        # - 1080p stage 2 full-res : audio=default (stage 2 pattern, pas de kwarg enabled)
+        configs: list[tuple[str, int, int, torch.Tensor, bool]] = [
+            ("720p",     704,  1280, self._sigmas,        True),
+            ("1080p-s1", 544,  960,  self._sigmas,        True),
+            ("1080p-s2", 1088, 1920, self._stage2_sigmas, False),
+        ]
+
+        for label, h, w, sigmas, explicit_audio_disabled in configs:
+            t0 = time.perf_counter()
+
+            images = [ImageConditioningInput(path=tmp_path, frame_idx=0, strength=1.0)]
+            conds = image_conditionings_by_replacing_latent(
+                images=images, height=h, width=w,
+                video_encoder=self._video_encoder,
+                dtype=self.dtype, device=self.device,
+            )
+
+            shape = VideoPixelShape(
+                batch=1, frames=num_frames, width=w, height=h, fps=frame_rate,
+            )
+
+            vs, _ = noise_video_state(
+                output_shape=shape, noiser=noiser, conditionings=conds,
+                components=self._components, dtype=self.dtype, device=self.device,
+            )
+            as_, _ = noise_audio_state(
+                output_shape=shape, noiser=noiser, conditionings=[],
+                components=self._components, dtype=self.dtype, device=self.device,
+            )
+
+            sigma = sigmas[0]
+            if explicit_audio_disabled:
+                # Stage 1 pattern : video enabled, audio disabled
+                vid_mod = modality_from_latent_state(vs, v_ctx, sigma, enabled=True)
+                aud_mod = modality_from_latent_state(as_, a_ctx, sigma, enabled=False)
+            else:
+                # Stage 2 pattern : defaults (pas de kwarg enabled)
+                vid_mod = modality_from_latent_state(vs, v_ctx, sigma)
+                aud_mod = modality_from_latent_state(as_, a_ctx, sigma)
+
+            sigma_b = sigma.unsqueeze(0)
+            vid_mod = dataclasses.replace(vid_mod, sigma=sigma_b)
+            aud_mod = dataclasses.replace(aud_mod, sigma=sigma_b)
+
+            torch.compiler.cudagraph_mark_step_begin()
+            transformer(video=vid_mod, audio=aud_mod, perturbations=None)
+            torch.cuda.synchronize()
+
+            dt = time.perf_counter() - t0
+            log.info("Warmup %s (%dx%d): %.1fs", label, w, h, dt)
+
+            del vs, as_, vid_mod, aud_mod, conds
+            torch.cuda.empty_cache()
+
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+        dt_total = time.perf_counter() - t0_total
+        log.info("Warmup compile termine: %.1fs total", dt_total)
+
     @staticmethod
     def _log_inductor_cache_diagnostic() -> None:
         """Diagnostic compact du cache Inductor."""
@@ -501,6 +592,7 @@ class MedusaPipeline:
                     log.warning("Inductor debug logging failed: %s", e)
             torch._dynamo.config.automatic_dynamic_shapes = True
             torch._dynamo.config.allow_unspec_int_on_nn_module = True
+            torch._dynamo.config.force_parameter_static_shapes = False
             torch._dynamo.config.cache_size_limit = 32
             torch._dynamo.config.recompile_limit = 48
             compile_mode = os.environ.get("COMPILE_MODE", "default")

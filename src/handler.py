@@ -509,6 +509,10 @@ def init_pipeline() -> MedusaPipeline:
         for f in futs:
             f.result()
 
+    # 4. Warmup compile — pre-compile transformer pour toutes les shapes
+    # (720p + 1080p stage1 + 1080p stage2) pour eviter les recompilations du 1er job
+    p.warmup_compile()
+
     log.info("Pipeline pret.")
     return p
 
