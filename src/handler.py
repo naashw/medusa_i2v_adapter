@@ -6,7 +6,7 @@ Reprend les fonctionnalites cles de handler_wrapper.py :
   - Dedup cache par hash
   - Sauvegarde outputs sur network volume
   - Cleanup disque ephemere
-  - Resolution dynamique (720p 1-stage ou 1080p 2-stage, aspect ratio preserve)
+  - Resolution dynamique (540p 1-stage, 720p/1080p 2-stage, aspect ratio preserve)
 """
 
 from __future__ import annotations
@@ -128,15 +128,22 @@ def resolve_image(image_data: str) -> str:
 
 
 FIXED_RESOLUTIONS: dict[str, tuple[int, int]] = {
+    # Tier 1 — Preview (1-stage)
+    "540p": (544, 960),
+    "540p-portrait": (960, 544),
+    # Tier 2 — Standard (2-stage: 352×640 → x2 → 704×1280)
     "720p": (704, 1280),
-    "1080p": (1088, 1920),
     "720p-portrait": (1280, 704),
+    # Tier 3 — Production (2-stage: 544×960 → x2 → 1088×1920)
+    "1080p": (1088, 1920),
     "1080p-portrait": (1920, 1088),
 }
 
 DYNAMIC_CONFIGS: dict[str, tuple[float, int]] = {
+    "540p": (0.52, 32),
     "720p": (0.92, 32),
     "1080p": (2.0, 64),
+    "540p-portrait": (0.52, 32),
     "720p-portrait": (0.92, 32),
     "1080p-portrait": (2.0, 64),
 }
@@ -341,7 +348,7 @@ def handler(job: dict) -> dict:
     frame_rate = job_input.get("frame_rate", 24)
     image_strength = job_input.get("image_strength", 1.0)
     negative_override = job_input.get("negative_prompt")
-    two_stage = resolution in ("1080p", "1080p-portrait")
+    two_stage = resolution in ("720p", "720p-portrait", "1080p", "1080p-portrait")
 
     # --- Pipeline deja init au startup (eager init) ---
     if pipeline is None:
@@ -514,7 +521,7 @@ def init_pipeline() -> MedusaPipeline:
             f.result()
 
     # 4. Warmup compile — pre-compile transformer pour toutes les shapes
-    # (720p + 1080p stage1 + 1080p stage2) pour eviter les recompilations du 1er job
+    # (720p 2-stage + 1080p 2-stage, landscape + portrait) pour eviter les recompilations du 1er job
     p.warmup_compile()
 
     log.info("Pipeline pret.")

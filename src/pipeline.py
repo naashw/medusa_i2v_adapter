@@ -284,7 +284,7 @@ class MedusaPipeline:
 
     @torch.inference_mode()
     def warmup_compile(self, num_frames: int = 25, frame_rate: float = 24) -> None:
-        """Pre-compile le transformer pour toutes les shapes (720p + 1080p 2-stage).
+        """Pre-compile le transformer pour toutes les shapes (720p + 1080p 2-stage, landscape + portrait).
 
         Lance un forward dummy par resolution pour declencher la compilation
         Dynamo de toutes les variantes attention/shapes. Elimine les recompilations
@@ -312,15 +312,19 @@ class MedusaPipeline:
         # - 1-stage : audio=False (stage 1 pattern)
         # - 2-stage full-res : audio=default (stage 2 pattern, pas de kwarg enabled)
         # Portrait = landscape transpose (memes megapixels, sequences de tokens differentes)
+        # Note : 540p (544×960) = meme shape que 1080p-s1, pas de warmup supplementaire
         configs: list[tuple[str, int, int, torch.Tensor, bool]] = [
-            # Landscape 16:9
-            ("720p",              704,  1280, self._sigmas,        True),
-            ("1080p-s1",          544,  960,  self._sigmas,        True),
-            ("1080p-s2",          1088, 1920, self._stage2_sigmas, False),
+            # Tier 2 — Standard 720p 2-stage
+            ("720p-s1",              352,  640,  self._sigmas,        True),
+            ("720p-s2",              704,  1280, self._stage2_sigmas, False),
+            # Tier 3 — Production 1080p 2-stage
+            ("1080p-s1",             544,  960,  self._sigmas,        True),
+            ("1080p-s2",             1088, 1920, self._stage2_sigmas, False),
             # Portrait 9:16
-            ("720p-portrait",     1280, 704,  self._sigmas,        True),
-            ("1080p-portrait-s1", 960,  544,  self._sigmas,        True),
-            ("1080p-portrait-s2", 1920, 1088, self._stage2_sigmas, False),
+            ("720p-portrait-s1",     640,  352,  self._sigmas,        True),
+            ("720p-portrait-s2",     1280, 704,  self._stage2_sigmas, False),
+            ("1080p-portrait-s1",    960,  544,  self._sigmas,        True),
+            ("1080p-portrait-s2",    1920, 1088, self._stage2_sigmas, False),
         ]
 
         for label, h, w, sigmas, explicit_audio_disabled in configs:

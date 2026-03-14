@@ -3,7 +3,7 @@
 ## Projet
 
 Pipeline Image-to-Video (LTX-2.3 22B Distilled) via ltx-pipelines sur RunPod Serverless H100 80GB.
-Inference directe Python, sans ComfyUI. Output H264 MP4, 720p (1-stage) ou 1080p (2-stage).
+Inference directe Python, sans ComfyUI. Output H264 MP4, 3 tiers : 540p (1-stage), 720p (2-stage), 1080p (2-stage).
 
 ## Stack Technique
 
@@ -20,7 +20,7 @@ Inference directe Python, sans ComfyUI. Output H264 MP4, 720p (1-stage) ou 1080p
 3 formats retro-compatibles : `image` (single), `images[]` (batch), `items[]` (multi-client).
 Voir `src/handler.py` pour le schema complet. Points cles :
 - `camera_motion` : preset (`dolly-in`, `dolly-out`, `dolly-left`, `dolly-right`, `jib-up`, `jib-down`, `static`) ou texte libre. Alias `camera`
-- `resolution` : `"720p"` (defaut, 1-stage) ou `"1080p"` (2-stage)
+- `resolution` : `"540p"` (1-stage preview), `"720p"` (defaut, 2-stage), `"1080p"` (2-stage). Suffixe `-portrait` pour 9:16
 - `last_image` + `last_image_strength` : optionnels, guidage derniere frame
 - `items[]` : regroupes par prompt pour batching GPU, resultats reordonnes par `_original_index`
 
