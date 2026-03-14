@@ -57,6 +57,13 @@ Voir `src/handler.py` pour le schema complet. Points cles :
 | `S3_BUCKET` | _(vide)_ | Active S3 upload OVH si defini |
 | `S3_ENDPOINT_URL` | OVH SBG | Endpoint S3 |
 
+## Documentation
+
+| Fichier | Contenu |
+|---------|---------|
+| `docs/changelog.md` | Historique detaille des changements (contexte, modifications, verification, rollback) |
+| `docs/audit-report-2026-03-09.md` | Audit architecture et performance du 2026-03-09 |
+
 ## Conventions
 
 - Prefixe output : `medusa_i2v`
