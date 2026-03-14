@@ -308,14 +308,19 @@ class MedusaPipeline:
         gen = torch.Generator(device=self.device).manual_seed(0)
         noiser = GaussianNoiser(generator=gen)
 
-        # Configs couvrant les 3 shapes + les 2 patterns audio:
-        # - 720p 1-stage : audio=False (stage 1 pattern)
-        # - 1080p stage 1 half-res : audio=False (stage 1 pattern)
-        # - 1080p stage 2 full-res : audio=default (stage 2 pattern, pas de kwarg enabled)
+        # Configs couvrant toutes les shapes (landscape + portrait) + les 2 patterns audio:
+        # - 1-stage : audio=False (stage 1 pattern)
+        # - 2-stage full-res : audio=default (stage 2 pattern, pas de kwarg enabled)
+        # Portrait = landscape transpose (memes megapixels, sequences de tokens differentes)
         configs: list[tuple[str, int, int, torch.Tensor, bool]] = [
-            ("720p",     704,  1280, self._sigmas,        True),
-            ("1080p-s1", 544,  960,  self._sigmas,        True),
-            ("1080p-s2", 1088, 1920, self._stage2_sigmas, False),
+            # Landscape 16:9
+            ("720p",              704,  1280, self._sigmas,        True),
+            ("1080p-s1",          544,  960,  self._sigmas,        True),
+            ("1080p-s2",          1088, 1920, self._stage2_sigmas, False),
+            # Portrait 9:16
+            ("720p-portrait",     1280, 704,  self._sigmas,        True),
+            ("1080p-portrait-s1", 960,  544,  self._sigmas,        True),
+            ("1080p-portrait-s2", 1920, 1088, self._stage2_sigmas, False),
         ]
 
         for label, h, w, sigmas, explicit_audio_disabled in configs:

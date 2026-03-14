@@ -130,11 +130,15 @@ def resolve_image(image_data: str) -> str:
 FIXED_RESOLUTIONS: dict[str, tuple[int, int]] = {
     "720p": (704, 1280),
     "1080p": (1088, 1920),
+    "720p-portrait": (1280, 704),
+    "1080p-portrait": (1920, 1088),
 }
 
 DYNAMIC_CONFIGS: dict[str, tuple[float, int]] = {
     "720p": (0.92, 32),
     "1080p": (2.0, 64),
+    "720p-portrait": (0.92, 32),
+    "1080p-portrait": (2.0, 64),
 }
 
 
@@ -337,7 +341,7 @@ def handler(job: dict) -> dict:
     frame_rate = job_input.get("frame_rate", 24)
     image_strength = job_input.get("image_strength", 1.0)
     negative_override = job_input.get("negative_prompt")
-    two_stage = resolution == "1080p"
+    two_stage = resolution in ("1080p", "1080p-portrait")
 
     # --- Pipeline deja init au startup (eager init) ---
     if pipeline is None:
