@@ -106,6 +106,7 @@ COPY src/start.sh /start.sh
 RUN chmod +x /start.sh
 
 COPY src/prompts.py /app/prompts.py
+COPY src/video_encoder.py /app/video_encoder.py
 COPY src/pipeline.py /app/pipeline.py
 COPY src/handler.py /app/handler.py
 COPY src/warmup_embeddings.py /app/warmup_embeddings.py
