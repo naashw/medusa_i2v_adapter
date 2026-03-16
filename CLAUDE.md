@@ -56,6 +56,8 @@ Voir `src/handler.py` pour le schema complet. Points cles :
 | `LOG_LEVEL` | `info` | `debug` active les logs Inductor verbose |
 | `S3_BUCKET` | _(vide)_ | Active S3 upload OVH si defini |
 | `S3_ENDPOINT_URL` | OVH SBG | Endpoint S3 |
+| `ENCODE_PRESET` | `veryfast` | Preset x264 (`ultrafast`, `veryfast`, `medium`, etc.) |
+| `ENCODE_CRF` | `23` | CRF qualite (0-51, lower = meilleur) |
 
 ## Documentation
 

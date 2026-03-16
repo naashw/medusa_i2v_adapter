@@ -52,7 +52,7 @@ from ltx_pipelines.utils.helpers import (
     noise_video_state,
 )
 from ltx_pipelines.utils.samplers import euler_denoising_loop
-from ltx_pipelines.utils.media_io import encode_video
+from video_encoder import encode_video_fast
 from ltx_pipelines.utils.types import PipelineComponents
 from ltx_core.quantization import QuantizationPolicy
 
@@ -967,13 +967,7 @@ class MedusaPipeline:
         )
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        encode_video(
-            video=iter(frames),
-            fps=int(frame_rate),
-            audio=None,
-            output_path=output_path,
-            video_chunks_number=1,
-        )
+        encode_video_fast(video=iter(frames), fps=int(frame_rate), output_path=output_path)
         log.info("Video sauvegardee: %s", output_path)
 
     @torch.inference_mode()

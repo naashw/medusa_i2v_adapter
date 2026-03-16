@@ -28,7 +28,7 @@ import runpod
 from botocore.config import Config
 from PIL import Image
 
-from ltx_pipelines.utils.media_io import encode_video
+from video_encoder import encode_video_fast
 
 from pipeline import MedusaPipeline
 from prompts import CAMERA_PRESETS
@@ -174,37 +174,45 @@ def compute_target_resolution(
 
 
 def collect_output(source_file: str, job_id: str) -> dict:
-    """Copie l'output sur le volume et retourne les metadonnees."""
-    dest_dir = os.path.join(OUTPUT_VOLUME_DIR, job_id)
-    os.makedirs(dest_dir, exist_ok=True)
-
+    """Upload S3 direct (ou copie volume si S3 desactive). Retourne les metadonnees."""
     filename = os.path.basename(source_file)
-    dest_path = os.path.join(dest_dir, filename)
-    shutil.copy2(source_file, dest_path)
-
     ext = os.path.splitext(filename)[1].lower()
     file_type = "video" if ext in VIDEO_EXTENSIONS else "image"
-    size_mb = os.path.getsize(dest_path) / (1024 * 1024)
+    size_mb = os.path.getsize(source_file) / (1024 * 1024)
     s3_key = f"generated/videos/{filename}"
 
-    log.info("%s: %.1f MB (%s) -> %s/", filename, size_mb, file_type, dest_dir)
+    if S3_BUCKET:
+        # S3 actif : upload direct depuis temp, pas de copie volume
+        s3_url = upload_to_s3(source_file, s3_key)
+        log.info("%s: %.1f MB (%s) -> S3", filename, size_mb, file_type)
+        result = {
+            "filename": filename,
+            "content_type": file_type,
+            "size_mb": round(size_mb, 2),
+            "s3_key": s3_key,
+        }
+        if s3_url:
+            result["s3_url"] = s3_url
+        return result
 
-    s3_url = upload_to_s3(dest_path, s3_key)
-    result = {
+    # S3 desactive : copie sur volume comme stockage persistant
+    dest_dir = os.path.join(OUTPUT_VOLUME_DIR, job_id)
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = os.path.join(dest_dir, filename)
+    shutil.copy2(source_file, dest_path)
+    log.info("%s: %.1f MB (%s) -> %s/", filename, size_mb, file_type, dest_dir)
+    return {
         "filename": filename,
         "content_type": file_type,
         "size_mb": round(size_mb, 2),
         "volume_path": dest_path,
         "s3_key": s3_key,
     }
-    if s3_url:
-        result["s3_url"] = s3_url
-    return result
 
 
 # --- Post-processing pool (MP4 encode + S3 upload en parallele du GPU) ---
 
-postprocess_pool = ThreadPoolExecutor(max_workers=3)
+postprocess_pool = ThreadPoolExecutor(max_workers=MAX_BATCH)
 
 
 def postprocess_and_upload(
@@ -218,13 +226,7 @@ def postprocess_and_upload(
     output_path = os.path.join(output_dir, output_filename)
     os.makedirs(output_dir, exist_ok=True)
 
-    encode_video(
-        video=iter(frames),
-        fps=frame_rate,
-        audio=None,
-        output_path=output_path,
-        video_chunks_number=1,
-    )
+    encode_video_fast(video=iter(frames), fps=frame_rate, output_path=output_path)
     log.info("MP4 encode: %s", output_filename)
 
     output_meta = collect_output(output_path, job_id)
