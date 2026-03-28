@@ -103,24 +103,6 @@ migrate_volume() {
         fi
     done
 
-    # Supprimer les 7 camera LoRAs
-    local camera_loras=(
-        "ltx-2-19b-lora-camera-control-dolly-in.safetensors"
-        "ltx-2-19b-lora-camera-control-dolly-out.safetensors"
-        "ltx-2-19b-lora-camera-control-dolly-left.safetensors"
-        "ltx-2-19b-lora-camera-control-dolly-right.safetensors"
-        "ltx-2-19b-lora-camera-control-jib-down.safetensors"
-        "ltx-2-19b-lora-camera-control-jib-up.safetensors"
-        "ltx-2-19b-lora-camera-control-static.safetensors"
-    )
-    for f in "${camera_loras[@]}"; do
-        local target="${MODELS_DIR}/loras/${f}"
-        if [[ -f "$target" ]]; then
-            echo "[medusa] Suppression camera LoRA: $target"
-            rm -f "$target"
-        fi
-    done
-
     # Supprimer cache HuggingFace residuel
     if [[ -d "${WORKSPACE}/.cache/huggingface" ]]; then
         echo "[medusa] Suppression cache HuggingFace residuel"
@@ -273,6 +255,7 @@ for p in sys.argv[1:]:
     "${MODELS_DIR}/checkpoints/ltx-2.3-22b-distilled.safetensors" \
     "${MODELS_DIR}/upscalers/ltx-2.3-spatial-upscaler-x2-1.0.safetensors" \
     "${MODELS_DIR}/upscalers/ltx-2.3-temporal-upscaler-x2-1.0.safetensors" \
+    "${MODELS_DIR}/loras/ltx-2-19b-lora-camera-control-dolly-in.safetensors" \
     2>/dev/null || true)
 
 # --- Checkpoint distilled BF16 (~46GB) — le plus gros, echouer tot ---
@@ -298,6 +281,13 @@ snapshot_download(
     ignore_patterns=['*.gguf', '*.bin'],
 )
 "
+fi
+
+# --- Camera LoRA: Dolly-In (~200MB) ---
+if [[ "${CAMERA_LORA:-1}" == "1" ]]; then
+    download_model "Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-In" \
+        "ltx-2-19b-lora-camera-control-dolly-in.safetensors" \
+        "${MODELS_DIR}/loras"
 fi
 
 echo "[medusa] Tous les modeles sont prets."

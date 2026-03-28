@@ -56,6 +56,11 @@ from video_encoder import encode_video_fast
 from ltx_pipelines.utils.types import PipelineComponents
 from ltx_core.quantization import QuantizationPolicy
 
+try:
+    from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP
+except ImportError:
+    LTXV_LORA_COMFY_RENAMING_MAP = {}
+
 from prompts import CAMERA_PRESETS, DEFAULT_NEGATIVE_PROMPT
 
 log = logging.getLogger("medusa")
@@ -107,6 +112,20 @@ class MedusaPipeline:
 
         # Transformer distilled en VRAM (FP8 cast via QuantizationPolicy)
         self._transformer: torch.nn.Module | None = None
+
+        # --- Camera LoRA config ---
+        self._camera_lora_enabled = os.environ.get("CAMERA_LORA", "1") == "1"
+        self._camera_lora_strength = float(os.environ.get("CAMERA_LORA_STRENGTH", "0.8"))
+        self._lora_dir = os.path.join(models_dir, "loras")
+
+        # Registry : camera_motion -> lora filename (extensible)
+        self._camera_lora_registry: dict[str, str] = {
+            "dolly-in": "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
+        }
+
+        # Runtime state
+        self._active_lora: str | None = None
+        self._lora_deltas: dict[str, dict[str, torch.Tensor]] = {}
 
         # Embeddings cache (prompt/key -> (video_ctx, audio_ctx))
         self._embeddings_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -465,6 +484,141 @@ class MedusaPipeline:
             return mod._orig_mod
         return mod
 
+    # ------------------------------------------------------------------
+    # Camera LoRA : load / fuse / unfuse / ensure
+    # ------------------------------------------------------------------
+
+    def _load_lora_deltas(self, name: str) -> None:
+        """Pre-calcule les deltas LoRA (B @ A * strength) pour un camera motion.
+
+        Charge le safetensors, renomme les cles si necessaire, et stocke
+        les deltas pre-calcules sur CPU pour fuse/unfuse rapide.
+        """
+        filename = self._camera_lora_registry.get(name)
+        if not filename:
+            return
+        lora_path = os.path.join(self._lora_dir, filename)
+        if not os.path.isfile(lora_path):
+            log.warning("LoRA '%s' introuvable: %s", name, lora_path)
+            return
+
+        log.info(
+            "Chargement LoRA '%s': %s (strength=%.2f)",
+            name, filename, self._camera_lora_strength,
+        )
+        lora_sd = load_safetensors(lora_path, device="cpu")
+
+        # Renommer les cles (Comfy -> ltx-core) si renaming map disponible
+        if LTXV_LORA_COMFY_RENAMING_MAP:
+            renamed_sd: dict[str, torch.Tensor] = {}
+            for key, tensor in lora_sd.items():
+                new_key = key
+                for old_prefix, new_prefix in LTXV_LORA_COMFY_RENAMING_MAP.items():
+                    if key.startswith(old_prefix):
+                        new_key = new_prefix + key[len(old_prefix):]
+                        break
+                renamed_sd[new_key] = tensor
+            lora_sd = renamed_sd
+
+        # Log les cles pour diagnostic (debug)
+        if log.isEnabledFor(logging.DEBUG):
+            sample_keys = list(lora_sd.keys())[:10]
+            log.debug("LoRA '%s' sample keys: %s", name, sample_keys)
+
+        # Grouper par parametre cible : paires lora_A / lora_B
+        param_groups: dict[str, dict[str, torch.Tensor]] = {}
+        for key, tensor in lora_sd.items():
+            if ".lora_A" in key:
+                base = key.replace(".lora_A", "")
+                param_groups.setdefault(base, {})["A"] = tensor
+            elif ".lora_B" in key:
+                base = key.replace(".lora_B", "")
+                param_groups.setdefault(base, {})["B"] = tensor
+
+        # Calculer delta = (B @ A) * strength pour chaque parametre
+        deltas: dict[str, torch.Tensor] = {}
+        for param_name, ab in param_groups.items():
+            if "A" in ab and "B" in ab:
+                delta = (ab["B"].float() @ ab["A"].float()) * self._camera_lora_strength
+                deltas[param_name + ".weight"] = delta.to(torch.bfloat16)
+
+        if not deltas:
+            log.warning("LoRA '%s': aucun delta compute (format inconnu ?)", name)
+            return
+
+        self._lora_deltas[name] = deltas
+        log.info("LoRA '%s': %d parametres affectes", name, len(deltas))
+
+    def _apply_lora_delta(self, param: torch.nn.Parameter, delta: torch.Tensor, add: bool) -> None:
+        """Applique un delta LoRA in-place, en gerant le dtype (FP8 cast safe)."""
+        device_delta = delta.to(self.device)
+        original_dtype = param.data.dtype
+        if original_dtype != torch.bfloat16:
+            # Dequantize → apply delta en BF16 → re-quantize
+            param_bf16 = param.data.to(torch.bfloat16)
+            if add:
+                param_bf16.add_(device_delta)
+            else:
+                param_bf16.sub_(device_delta)
+            param.data.copy_(param_bf16.to(original_dtype))
+        else:
+            if add:
+                param.data.add_(device_delta)
+            else:
+                param.data.sub_(device_delta)
+
+    def _fuse_lora(self, name: str) -> None:
+        """Fuse un LoRA dans le transformer (add deltas in-place)."""
+        deltas = self._lora_deltas.get(name)
+        if not deltas:
+            return
+        transformer = self._get_orig_module()
+        state_dict = dict(transformer.named_parameters())
+        applied = 0
+        for param_name, delta in deltas.items():
+            if param_name in state_dict:
+                self._apply_lora_delta(state_dict[param_name], delta, add=True)
+                applied += 1
+            elif log.isEnabledFor(logging.DEBUG):
+                log.debug("LoRA fuse skip: %s (pas dans le transformer)", param_name)
+        log.info("LoRA '%s' fused: %d/%d params", name, applied, len(deltas))
+        if applied == 0 and deltas:
+            log.warning(
+                "LoRA '%s': AUCUN parametre fuse — verifier nommage "
+                "(renaming_map=%s)", name, "loaded" if LTXV_LORA_COMFY_RENAMING_MAP else "absent",
+            )
+        self._active_lora = name
+
+    def _unfuse_lora(self, name: str) -> None:
+        """Retire un LoRA du transformer (subtract deltas in-place)."""
+        deltas = self._lora_deltas.get(name)
+        if not deltas:
+            return
+        transformer = self._get_orig_module()
+        state_dict = dict(transformer.named_parameters())
+        applied = 0
+        for param_name, delta in deltas.items():
+            if param_name in state_dict:
+                self._apply_lora_delta(state_dict[param_name], delta, add=False)
+                applied += 1
+        log.info("LoRA '%s' unfused: %d/%d params", name, applied, len(deltas))
+        self._active_lora = None
+
+    def ensure_lora(self, camera_motion: str | None) -> None:
+        """Active le LoRA correspondant au camera_motion (ou aucun).
+
+        No-op si le LoRA demande est deja fuse (~90% des cas avec dolly-in).
+        """
+        if not self._camera_lora_enabled:
+            return
+        needed = camera_motion if camera_motion in self._lora_deltas else None
+        if needed == self._active_lora:
+            return
+        if self._active_lora is not None:
+            self._unfuse_lora(self._active_lora)
+        if needed is not None:
+            self._fuse_lora(needed)
+
     def _cache_fingerprint(self) -> str:
         """Hash d'invalidation pour le cache transformer pre-fusionne.
 
@@ -566,6 +720,15 @@ class MedusaPipeline:
 
             if cache_enabled:
                 self._save_transformer_cache(cache_path)
+
+        # --- Camera LoRA : charger deltas et fuser le defaut (dolly-in) ---
+        if self._camera_lora_enabled:
+            for name in self._camera_lora_registry:
+                if name not in self._lora_deltas:
+                    self._load_lora_deltas(name)
+            default_lora = "dolly-in"
+            if default_lora in self._lora_deltas:
+                self._fuse_lora(default_lora)
 
         # torch.compile sur les blocs transformer
         if os.environ.get("TORCH_COMPILE", "1") == "1":

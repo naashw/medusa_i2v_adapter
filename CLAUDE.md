@@ -38,6 +38,9 @@ Voir `src/handler.py` pour le schema complet. Points cles :
 - `huggingface-cli` absent de l'image Docker → utiliser `huggingface_hub.snapshot_download()`
 - `start.sh` lance le warmup avec `LD_PRELOAD=""` (desactive tcmalloc sur process ephemere)
 - Checkpoint FP8 scaled (`ltx-2.3-22b-dev-fp8.safetensors`) INCOMPATIBLE avec fusion LoRA → utiliser distilled BF16 + `fp8_cast()`
+- Camera LoRA 19B compatible avec checkpoint 22B (confirme par communaute ltx-pipelines)
+- LoRA fuse/unfuse dynamiquement en ~0.1s, compatible `torch.compile mode=default`
+- `COMPILE_MODE=reduce-overhead` potentiellement incompatible avec swap LoRA dynamique
 
 ## Variables d'environnement
 
@@ -58,6 +61,8 @@ Voir `src/handler.py` pour le schema complet. Points cles :
 | `S3_ENDPOINT_URL` | OVH SBG | Endpoint S3 |
 | `ENCODE_PRESET` | `veryfast` | Preset x264 (`ultrafast`, `veryfast`, `medium`, etc.) |
 | `ENCODE_CRF` | `23` | CRF qualite (0-51, lower = meilleur) |
+| `CAMERA_LORA` | `1` | Camera LoRA dynamique (`0` desactive) |
+| `CAMERA_LORA_STRENGTH` | `0.8` | Strength fusion LoRA (0.0-1.0) |
 
 ## Documentation
 

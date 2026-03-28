@@ -407,6 +407,10 @@ def handler(job: dict) -> dict:
         results_by_index: dict[int, tuple] = {}  # index → (future, id)
 
         for prompt_text, group_items in groups.items():
+            # Activer/desactiver le LoRA camera pour ce groupe
+            group_camera = group_items[0].get("camera_motion", "static")
+            pipeline.ensure_lora(group_camera)
+
             sub_batches = [
                 group_items[i:i + MAX_BATCH]
                 for i in range(0, len(group_items), MAX_BATCH)
