@@ -19,10 +19,22 @@ Inference directe Python, sans ComfyUI. Output H264 MP4, 3 tiers : 540p (1-stage
 
 3 formats retro-compatibles : `image` (single), `images[]` (batch), `items[]` (multi-client).
 Voir `src/handler.py` pour le schema complet. Points cles :
-- `camera_motion` : preset (`dolly-in`, `dolly-out`, `dolly-left`, `dolly-right`, `jib-up`, `jib-down`, `static`) ou texte libre. Alias `camera`
+- `camera_motion` : `"depth"` pour IC-LoRA depth dolly-in. Presets texte (`dolly-in`, `dolly-out`, `dolly-left`, `dolly-right`, `jib-up`, `jib-down`, `static`) gardes pour futur rendu trajectoires depth. Alias `camera`
 - `resolution` : `"540p"` (1-stage preview), `"720p"` (defaut, 2-stage), `"1080p"` (2-stage). Suffixe `-portrait` pour 9:16
 - `last_image` + `last_image_strength` : optionnels, guidage derniere frame
 - `items[]` : regroupes par prompt pour batching GPU, resultats reordonnes par `_original_index`
+
+## Depth IC-LoRA (controle camera 3D)
+
+Le mouvement de camera est controle par depth estimation + IC-LoRA Union Control, pas par des camera LoRAs individuels.
+
+**Flow** : image source → DA3-LARGE-1.1 (depth map) → mesh 3D → rasterise N depth frames (trajectoire dolly-in GPU) → VAE encode a 0.5× resolution Stage 1 → `VideoConditionByReferenceLatent(downscale_factor=2)` → conditioning Stage 1 uniquement.
+
+**Modeles** :
+- `depth-anything/DA3-LARGE-1.1` : estimation profondeur (~1.64GB, offloadable CPU)
+- `Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control` : IC-LoRA fuse permanent dans transformer (654MB)
+
+**Mecanisme** : le IC-LoRA reste fuse en permanence (pas de swap). `ensure_lora()` est un no-op. Le `camera_motion` servira a terme a choisir la trajectoire de rendu depth (dolly-in, pan, etc.).
 
 ## Commits Git (override global)
 
@@ -38,12 +50,10 @@ Voir `src/handler.py` pour le schema complet. Points cles :
 - `huggingface-cli` absent de l'image Docker → utiliser `huggingface_hub.snapshot_download()`
 - `start.sh` lance le warmup avec `LD_PRELOAD=""` (desactive tcmalloc sur process ephemere)
 - Checkpoint FP8 scaled (`ltx-2.3-22b-dev-fp8.safetensors`) INCOMPATIBLE avec fusion LoRA → utiliser distilled BF16 + `fp8_cast()`
-- Camera LoRA 19B compatible avec checkpoint 22B (confirme par communaute ltx-pipelines)
-- LoRA fuse/unfuse dynamiquement en ~0.1s, compatible `torch.compile mode=default`
-- `COMPILE_MODE=reduce-overhead` potentiellement incompatible avec swap LoRA dynamique
-- IC-LoRA Union Control (depth/canny/pose) : meme mecanisme fuse/unfuse que camera LoRA, plus un guide latent (depth map encode par VAE)
-- DA3-LARGE-1.1 (depth estimation) : ~0.4GB VRAM, install depuis GitHub `ByteDance-Seed/depth-anything-3`
-- IC-LoRA guide latent injecte a `frame_idx=1` comme `ImageConditioningInput` — eviter conflits avec image source a `frame_idx=0`
+- IC-LoRA fuse permanent dans transformer, pas de swap dynamique
+- DA3-LARGE-1.1 : 1.64GB (pas 0.4GB), install depuis GitHub `ByteDance-Seed/depth-anything-3`
+- `VideoConditionByReferenceLatent` : conditioning Stage 1 only, Stage 2 sans depth
+- Depth conditioning ajoute des tokens reference a la sequence d'attention → impact VRAM quadratique
 
 ## Variables d'environnement
 
@@ -64,10 +74,9 @@ Voir `src/handler.py` pour le schema complet. Points cles :
 | `S3_ENDPOINT_URL` | OVH SBG | Endpoint S3 |
 | `ENCODE_PRESET` | `veryfast` | Preset x264 (`ultrafast`, `veryfast`, `medium`, etc.) |
 | `ENCODE_CRF` | `23` | CRF qualite (0-51, lower = meilleur) |
-| `CAMERA_LORA` | `1` | Camera LoRA dynamique (`0` desactive) |
-| `CAMERA_LORA_STRENGTH` | `0.8` | Strength fusion LoRA (0.0-1.0) |
 | `DEPTH_LORA` | `1` | IC-LoRA depth control + DA3 estimation (`0` desactive) |
-| `DEPTH_LORA_STRENGTH` | `0.8` | Strength du guide latent depth (0.0-1.0) |
+| `DEPTH_LORA_STRENGTH` | `1.0` | Strength du VideoConditionByReferenceLatent (0.0-1.0) |
+| `DEPTH_DOLLY_DISPLACEMENT` | `0.15` | Amplitude deplacement camera dolly-in (fraction du depth range) |
 
 ## Documentation
 
