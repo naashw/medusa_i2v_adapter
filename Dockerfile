@@ -113,7 +113,7 @@ COPY src/warmup_embeddings.py /app/warmup_embeddings.py
 COPY src/audit_volume.py /app/audit_volume.py
 
 # Hash du build (source + packages) pour versionner le cache Inductor
-RUN (cat /app/*.py /start.sh && pip freeze) | md5sum | cut -c1-12 > /app/.build_hash
+RUN pip freeze | md5sum | cut -c1-12 > /app/.build_hash
 
 WORKDIR /app
 
