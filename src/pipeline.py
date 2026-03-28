@@ -842,15 +842,15 @@ class MedusaPipeline:
             torch.cuda.empty_cache()
         log.info("Gemma cleanup done")
 
-        # Sauvegarder en cache RAM (CPU) + volume
-        v_cpu, a_cpu = v_ctx.cpu(), a_ctx.cpu()
-        self._embeddings_cache[prompt_hash] = (v_cpu, a_cpu)
+        # Sauvegarder en cache RAM (GPU) + volume (CPU)
+        v_gpu, a_gpu = v_ctx.to(self.device), a_ctx.to(self.device)
+        self._embeddings_cache[prompt_hash] = (v_gpu, a_gpu)
         if self._embeddings_cache_dir:
             cache_path = os.path.join(self._embeddings_cache_dir, f"prompt_{prompt_hash}.pt")
-            torch.save({"video": v_cpu, "audio": a_cpu}, cache_path)
+            torch.save({"video": v_ctx.cpu(), "audio": a_ctx.cpu()}, cache_path)
             log.info("Prompt cached (RAM + volume): %s", prompt[:40])
 
-        return v_cpu.to(self.device), a_cpu.to(self.device)
+        return v_gpu, a_gpu
 
     def _get_negative_embeddings(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Retourne les embeddings du negative prompt (toujours pre-cache)."""
