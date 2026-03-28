@@ -296,6 +296,25 @@ if [[ "${CAMERA_LORA:-1}" == "1" ]]; then
         "${MODELS_DIR}/loras"
 fi
 
+# --- IC-LoRA Union Control: Depth/Canny/Pose (~654MB) ---
+if [[ "${DEPTH_LORA:-1}" == "1" ]]; then
+    download_model "Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control" \
+        "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors" \
+        "${MODELS_DIR}/loras"
+fi
+
+# --- DA3-LARGE-1.1: Depth Estimation (~400MB) ---
+if [[ "${DEPTH_LORA:-1}" == "1" ]]; then
+    echo "[medusa] Telechargement: DA3-LARGE-1.1 (~400MB)..."
+    python -c "
+from huggingface_hub import snapshot_download
+snapshot_download(
+    'depth-anything/DA3-LARGE-1.1',
+    local_dir='${MODELS_DIR}/da3-large',
+)
+"
+fi
+
 echo "[medusa] Tous les modeles sont prets."
 
 # -----------------------------------------------

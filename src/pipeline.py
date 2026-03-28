@@ -22,9 +22,12 @@ import warnings
 from collections.abc import Callable, Iterator
 
 import json
+import tempfile
 
+import numpy as np
 import safetensors
 import torch
+from PIL import Image
 
 # Supprimer les warnings internes torch.compile/dynamo (pas de bug, juste du bruit)
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module=r"torch\._dynamo")
@@ -117,6 +120,13 @@ class MedusaPipeline:
         self._camera_lora_registry: dict[str, str] = {
             "dolly-in": "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
         }
+
+        # --- Depth IC-LoRA config ---
+        self._depth_lora_enabled = os.environ.get("DEPTH_LORA", "1") == "1"
+        self._depth_lora_strength = float(os.environ.get("DEPTH_LORA_STRENGTH", "0.8"))
+        self._depth_lora_name = "depth"
+        self._depth_lora_file = "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
+        self._depth_model: torch.nn.Module | None = None
 
         # Runtime state
         self._active_lora: str | None = None
@@ -625,6 +635,62 @@ class MedusaPipeline:
         if needed is not None:
             self._fuse_lora(needed)
 
+    # --- Depth estimation (DA3) ---
+
+    def load_depth_model(self) -> None:
+        """Charge DA3-LARGE-1.1 sur GPU (~0.4GB VRAM)."""
+        if not self._depth_lora_enabled:
+            return
+        da3_path = os.path.join(self.models_dir, "da3-large")
+        if not os.path.isdir(da3_path):
+            log.warning("DA3 model introuvable: %s — depth disabled", da3_path)
+            self._depth_lora_enabled = False
+            return
+
+        from depth_anything_3.api import DepthAnything3
+
+        t0 = time.perf_counter()
+        self._depth_model = DepthAnything3.from_pretrained(da3_path)
+        self._depth_model = self._depth_model.to(device=self.device)
+        dt = time.perf_counter() - t0
+        log.info("DA3-LARGE-1.1 charge en %.1fs (VRAM ~0.4GB)", dt)
+
+    def estimate_depth(self, image_path: str, target_h: int, target_w: int) -> str:
+        """Genere une depth map depuis l'image, retourne le path PNG temporaire.
+
+        La depth map est redimensionnee a 0.5x resolution (ref0.5 du IC-LoRA)
+        et convertie en RGB grayscale (darker = closer, lighter = farther).
+        """
+        prediction = self._depth_model.inference([image_path])
+        depth = prediction.depth[0]  # [H, W] float32
+
+        # Normaliser en grayscale [0, 255]
+        if isinstance(depth, torch.Tensor):
+            depth_np = depth.cpu().numpy()
+        else:
+            depth_np = np.asarray(depth)
+        d_min, d_max = depth_np.min(), depth_np.max()
+        if d_max - d_min > 1e-6:
+            depth_norm = ((depth_np - d_min) / (d_max - d_min) * 255).astype(np.uint8)
+        else:
+            depth_norm = np.zeros_like(depth_np, dtype=np.uint8)
+        depth_img = Image.fromarray(depth_norm, mode="L")
+
+        # Resize a 0.5x resolution (ref0.5)
+        guide_h, guide_w = target_h // 2, target_w // 2
+        # Assurer multiples de 32 pour le VAE
+        guide_h = (guide_h // 32) * 32
+        guide_w = (guide_w // 32) * 32
+        depth_img = depth_img.resize((guide_w, guide_h), Image.BILINEAR)
+
+        # Convertir en RGB (le VAE attend du RGB)
+        depth_rgb = Image.merge("RGB", [depth_img, depth_img, depth_img])
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False, prefix="depth_")
+        depth_rgb.save(tmp.name)
+        log.debug("Depth map: %s → %dx%d", tmp.name, guide_w, guide_h)
+        return tmp.name
+
     def _cache_fingerprint(self) -> str:
         """Hash d'invalidation pour le cache transformer pre-fusionne.
 
@@ -727,14 +793,29 @@ class MedusaPipeline:
             if cache_enabled:
                 self._save_transformer_cache(cache_path)
 
-        # --- Camera LoRA : charger deltas et fuser le defaut (dolly-in) ---
+        # --- Depth IC-LoRA : enregistrer dans le registry et fuser par defaut ---
+        if self._depth_lora_enabled:
+            self._camera_lora_registry[self._depth_lora_name] = self._depth_lora_file
+            # Sauvegarder le strength original camera, utiliser celui du depth
+            orig_strength = self._camera_lora_strength
+            self._camera_lora_strength = self._depth_lora_strength
+            if self._depth_lora_name not in self._lora_deltas:
+                self._load_lora_deltas(self._depth_lora_name)
+            self._camera_lora_strength = orig_strength
+
+        # --- Camera LoRA : charger deltas et fuser le defaut ---
         if self._camera_lora_enabled:
             for name in self._camera_lora_registry:
                 if name not in self._lora_deltas:
                     self._load_lora_deltas(name)
+
+        # Fuser le LoRA par defaut (depth si active, sinon dolly-in)
+        if self._depth_lora_enabled and self._depth_lora_name in self._lora_deltas:
+            default_lora = self._depth_lora_name
+        else:
             default_lora = "dolly-in"
-            if default_lora in self._lora_deltas:
-                self._fuse_lora(default_lora)
+        if default_lora in self._lora_deltas:
+            self._fuse_lora(default_lora)
 
         # torch.compile sur les blocs transformer
         if os.environ.get("TORCH_COMPILE", "1") == "1":
@@ -1217,6 +1298,17 @@ class MedusaPipeline:
                     last_idx = (num_frames - 1) // 8
                     last_str = item.get("last_image_strength", 1.0)
                     images_i.append(ImageConditioningInput(path=last_img, frame_idx=last_idx, strength=last_str))
+
+                # Depth guide : ajouter la depth map comme conditioning supplementaire
+                # frame_idx=1 sauf si last_image occupe deja cet index (num_frames < 17)
+                depth_path = item.get("depth_map_path")
+                if depth_path and self._depth_lora_enabled:
+                    last_idx_used = (num_frames - 1) // 8 if last_img else -1
+                    depth_idx = 2 if last_idx_used == 1 else 1
+                    images_i.append(ImageConditioningInput(
+                        path=depth_path, frame_idx=depth_idx,
+                        strength=self._depth_lora_strength,
+                    ))
 
                 conds_i = image_conditionings_by_replacing_latent(
                     images=images_i,

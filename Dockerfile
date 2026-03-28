@@ -58,6 +58,11 @@ RUN cd /tmp/LTX-2/packages/ltx-pipelines && pip install --no-cache-dir .
 # Cleanup repo clone
 RUN rm -rf /tmp/LTX-2
 
+# --- Depth Anything 3 (DA3) ---
+RUN git clone --filter=blob:none --quiet https://github.com/ByteDance-Seed/depth-anything-3.git /tmp/depth-anything-3 && \
+    cd /tmp/depth-anything-3 && pip install --no-cache-dir . && \
+    rm -rf /tmp/depth-anything-3
+
 # H100 sm_90
 ENV TORCH_CUDA_ARCH_LIST="9.0"
 
@@ -68,6 +73,7 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 # Verification builder : ltx_core et ltx_pipelines importables
 RUN python -c "import ltx_core; print('ltx_core OK:', ltx_core.__file__)" && \
     python -c "import ltx_pipelines; print('ltx_pipelines OK')" && \
+    python -c "import depth_anything_3; print('DA3 OK')" && \
     pip list | grep -i ltx
 
 # ============================================================

@@ -41,6 +41,9 @@ Voir `src/handler.py` pour le schema complet. Points cles :
 - Camera LoRA 19B compatible avec checkpoint 22B (confirme par communaute ltx-pipelines)
 - LoRA fuse/unfuse dynamiquement en ~0.1s, compatible `torch.compile mode=default`
 - `COMPILE_MODE=reduce-overhead` potentiellement incompatible avec swap LoRA dynamique
+- IC-LoRA Union Control (depth/canny/pose) : meme mecanisme fuse/unfuse que camera LoRA, plus un guide latent (depth map encode par VAE)
+- DA3-LARGE-1.1 (depth estimation) : ~0.4GB VRAM, install depuis GitHub `ByteDance-Seed/depth-anything-3`
+- IC-LoRA guide latent injecte a `frame_idx=1` comme `ImageConditioningInput` — eviter conflits avec image source a `frame_idx=0`
 
 ## Variables d'environnement
 
@@ -63,6 +66,8 @@ Voir `src/handler.py` pour le schema complet. Points cles :
 | `ENCODE_CRF` | `23` | CRF qualite (0-51, lower = meilleur) |
 | `CAMERA_LORA` | `1` | Camera LoRA dynamique (`0` desactive) |
 | `CAMERA_LORA_STRENGTH` | `0.8` | Strength fusion LoRA (0.0-1.0) |
+| `DEPTH_LORA` | `1` | IC-LoRA depth control + DA3 estimation (`0` desactive) |
+| `DEPTH_LORA_STRENGTH` | `0.8` | Strength du guide latent depth (0.0-1.0) |
 
 ## Documentation
 
