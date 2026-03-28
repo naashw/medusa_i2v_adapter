@@ -945,29 +945,24 @@ class MedusaPipeline:
             if cache_enabled:
                 self._save_transformer_cache(cache_path)
 
-        # --- Depth IC-LoRA : enregistrer dans le registry et fuser par defaut ---
+        # --- LoRA : charger depth OU camera, pas les deux ---
         if self._depth_lora_enabled:
-            self._camera_lora_registry[self._depth_lora_name] = self._depth_lora_file
-            # Sauvegarder le strength original camera, utiliser celui du depth
+            # Mode depth : charger uniquement le IC-LoRA depth
+            self._camera_lora_registry = {
+                self._depth_lora_name: self._depth_lora_file,
+            }
             orig_strength = self._camera_lora_strength
             self._camera_lora_strength = self._depth_lora_strength
-            if self._depth_lora_name not in self._lora_deltas:
-                self._load_lora_deltas(self._depth_lora_name)
+            self._load_lora_deltas(self._depth_lora_name)
             self._camera_lora_strength = orig_strength
-
-        # --- Camera LoRA : charger deltas et fuser le defaut ---
-        if self._camera_lora_enabled:
+            self._fuse_lora(self._depth_lora_name)
+        elif self._camera_lora_enabled:
+            # Mode camera : charger uniquement dolly-in (comportement original)
             for name in self._camera_lora_registry:
                 if name not in self._lora_deltas:
                     self._load_lora_deltas(name)
-
-        # Fuser le LoRA par defaut (depth si active, sinon dolly-in)
-        if self._depth_lora_enabled and self._depth_lora_name in self._lora_deltas:
-            default_lora = self._depth_lora_name
-        else:
-            default_lora = "dolly-in"
-        if default_lora in self._lora_deltas:
-            self._fuse_lora(default_lora)
+            if "dolly-in" in self._lora_deltas:
+                self._fuse_lora("dolly-in")
 
         # torch.compile sur les blocs transformer
         if os.environ.get("TORCH_COMPILE", "1") == "1":
