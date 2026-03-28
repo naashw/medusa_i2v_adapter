@@ -540,7 +540,8 @@ class MedusaPipeline:
                 delta = delta * (alpha_val / rank)
 
             delta = delta * self._camera_lora_strength
-            deltas[f"{base_key}.weight"] = delta
+            # Prepend velocity_model. pour matcher named_parameters() du X0Model
+            deltas[f"velocity_model.{base_key}.weight"] = delta
             del a_tensor, b_tensor
 
         if not deltas:
