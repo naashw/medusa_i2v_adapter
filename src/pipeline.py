@@ -114,15 +114,9 @@ class MedusaPipeline:
         # Transformer distilled en VRAM (FP8 cast via QuantizationPolicy)
         self._transformer: torch.nn.Module | None = None
 
-        # --- Camera LoRA config ---
-        self._camera_lora_enabled = os.environ.get("CAMERA_LORA", "1") == "1"
-        self._camera_lora_strength = float(os.environ.get("CAMERA_LORA_STRENGTH", "0.8"))
+        # --- LoRA config ---
         self._lora_dir = os.path.join(models_dir, "loras")
-
-        # Registry : camera_motion -> lora filename (extensible)
-        self._camera_lora_registry: dict[str, str] = {
-            "dolly-in": "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
-        }
+        self._camera_lora_registry: dict[str, str] = {}
 
         # --- Depth IC-LoRA config ---
         self._depth_lora_enabled = os.environ.get("DEPTH_LORA", "1") == "1"
@@ -626,19 +620,11 @@ class MedusaPipeline:
         self._active_lora = None
 
     def ensure_lora(self, camera_motion: str | None) -> None:
-        """Active le LoRA correspondant au camera_motion (ou aucun).
+        """No-op — le depth IC-LoRA reste fuse en permanence.
 
-        No-op si le LoRA demande est deja fuse (~90% des cas avec dolly-in).
+        Garde la signature pour compatibilite avec handler.py.
+        Le camera_motion est utilise pour le rendu depth, pas pour switcher de LoRA.
         """
-        if not self._camera_lora_enabled:
-            return
-        needed = camera_motion if camera_motion in self._lora_deltas else None
-        if needed == self._active_lora:
-            return
-        if self._active_lora is not None:
-            self._unfuse_lora(self._active_lora)
-        if needed is not None:
-            self._fuse_lora(needed)
 
     # --- Depth estimation (DA3) + IC-LoRA conditioning ---
 
@@ -945,24 +931,14 @@ class MedusaPipeline:
             if cache_enabled:
                 self._save_transformer_cache(cache_path)
 
-        # --- LoRA : charger depth OU camera, pas les deux ---
+        # --- Depth IC-LoRA ---
         if self._depth_lora_enabled:
-            # Mode depth : charger uniquement le IC-LoRA depth
-            self._camera_lora_registry = {
-                self._depth_lora_name: self._depth_lora_file,
-            }
+            self._camera_lora_registry[self._depth_lora_name] = self._depth_lora_file
             orig_strength = self._camera_lora_strength
             self._camera_lora_strength = self._depth_lora_strength
             self._load_lora_deltas(self._depth_lora_name)
             self._camera_lora_strength = orig_strength
             self._fuse_lora(self._depth_lora_name)
-        elif self._camera_lora_enabled:
-            # Mode camera : charger uniquement dolly-in (comportement original)
-            for name in self._camera_lora_registry:
-                if name not in self._lora_deltas:
-                    self._load_lora_deltas(name)
-            if "dolly-in" in self._lora_deltas:
-                self._fuse_lora("dolly-in")
 
         # torch.compile sur les blocs transformer
         if os.environ.get("TORCH_COMPILE", "1") == "1":

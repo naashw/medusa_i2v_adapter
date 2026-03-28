@@ -289,13 +289,6 @@ snapshot_download(
 "
 fi
 
-# --- Camera LoRA: Dolly-In (~200MB) ---
-if [[ "${CAMERA_LORA:-1}" == "1" ]]; then
-    download_model "Lightricks/LTX-2-19b-LoRA-Camera-Control-Dolly-In" \
-        "ltx-2-19b-lora-camera-control-dolly-in.safetensors" \
-        "${MODELS_DIR}/loras"
-fi
-
 # --- IC-LoRA Union Control: Depth/Canny/Pose (~654MB) ---
 if [[ "${DEPTH_LORA:-1}" == "1" ]]; then
     download_model "Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control" \
