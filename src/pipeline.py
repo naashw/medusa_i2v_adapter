@@ -22,22 +22,25 @@ import warnings
 from collections.abc import Callable, Iterator
 
 import json
-import tempfile
 
-import numpy as np
 import safetensors
 import torch
-from PIL import Image
+import torch.nn.functional as F
 
 # Supprimer les warnings internes torch.compile/dynamo (pas de bug, juste du bruit)
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module=r"torch\._dynamo")
 warnings.filterwarnings("ignore", message=".*To copy construct from a tensor.*", module=r"torch\.")
+from safetensors import safe_open
 from safetensors.torch import load_file as load_safetensors
 from safetensors.torch import save_file as save_safetensors
 
 from ltx_core.components.diffusion_steps import EulerDiffusionStep, Res2sDiffusionStep
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
+from ltx_core.conditioning import (
+    ConditioningItem,
+    VideoConditionByReferenceLatent,
+)
 from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import TilingConfig, decode_video as vae_decode_video
 
@@ -123,10 +126,12 @@ class MedusaPipeline:
 
         # --- Depth IC-LoRA config ---
         self._depth_lora_enabled = os.environ.get("DEPTH_LORA", "1") == "1"
-        self._depth_lora_strength = float(os.environ.get("DEPTH_LORA_STRENGTH", "0.8"))
+        self._depth_lora_strength = float(os.environ.get("DEPTH_LORA_STRENGTH", "1.0"))
         self._depth_lora_name = "depth"
         self._depth_lora_file = "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
         self._depth_model: torch.nn.Module | None = None
+        self._depth_downscale_factor: int = 1  # lu depuis metadata LoRA au chargement
+        self._depth_displacement = float(os.environ.get("DEPTH_DOLLY_DISPLACEMENT", "0.15"))
 
         # Runtime state
         self._active_lora: str | None = None
@@ -635,7 +640,7 @@ class MedusaPipeline:
         if needed is not None:
             self._fuse_lora(needed)
 
-    # --- Depth estimation (DA3) ---
+    # --- Depth estimation (DA3) + IC-LoRA conditioning ---
 
     def load_depth_model(self) -> None:
         """Charge DA3-LARGE-1.1 sur GPU (~0.4GB VRAM)."""
@@ -655,41 +660,188 @@ class MedusaPipeline:
         dt = time.perf_counter() - t0
         log.info("DA3-LARGE-1.1 charge en %.1fs (VRAM ~0.4GB)", dt)
 
-    def estimate_depth(self, image_path: str, target_h: int, target_w: int) -> str:
-        """Genere une depth map depuis l'image, retourne le path PNG temporaire.
+        # Lire reference_downscale_factor depuis metadata du LoRA
+        lora_path = os.path.join(self._lora_dir, self._depth_lora_file)
+        if os.path.isfile(lora_path):
+            self._depth_downscale_factor = self._read_lora_downscale_factor(lora_path)
+            log.info("IC-LoRA downscale_factor=%d", self._depth_downscale_factor)
 
-        La depth map est redimensionnee a 0.5x resolution (ref0.5 du IC-LoRA)
-        et convertie en RGB grayscale (darker = closer, lighter = farther).
-        """
+    @staticmethod
+    def _read_lora_downscale_factor(lora_path: str) -> int:
+        """Lit reference_downscale_factor depuis les metadata du safetensors."""
+        try:
+            with safe_open(lora_path, framework="pt") as f:
+                metadata = f.metadata() or {}
+                return int(metadata.get("reference_downscale_factor", 1))
+        except Exception as e:
+            log.warning("Echec lecture metadata LoRA '%s': %s", lora_path, e)
+            return 1
+
+    def estimate_depth_tensor(self, image_path: str) -> torch.Tensor:
+        """DA3 inference → depth map tensor [H, W] float32 sur GPU."""
         prediction = self._depth_model.inference([image_path])
         depth = prediction.depth[0]  # [H, W] float32
+        if not isinstance(depth, torch.Tensor):
+            depth = torch.from_numpy(depth)
+        return depth.to(device=self.device, dtype=torch.float32)
 
-        # Normaliser en grayscale [0, 255]
-        if isinstance(depth, torch.Tensor):
-            depth_np = depth.cpu().numpy()
-        else:
-            depth_np = np.asarray(depth)
-        d_min, d_max = depth_np.min(), depth_np.max()
+    def render_depth_dolly_in(
+        self,
+        depth: torch.Tensor,
+        num_frames: int,
+        total_displacement: float,
+        target_h: int,
+        target_w: int,
+    ) -> torch.Tensor:
+        """Rasterise num_frames depth maps avec trajectoire dolly-in sur GPU.
+
+        Unproject pixels → 3D via intrinseques estimes, translate camera en Z
+        progressivement, re-project en 2D avec z-buffer (scatter_reduce).
+
+        Args:
+            depth: [H, W] float32 depth map (valeurs relatives)
+            num_frames: nombre de frames (ex: 49)
+            total_displacement: deplacement relatif camera (fraction du depth range)
+            target_h: hauteur cible (0.5× Stage 1, multiple de 32)
+            target_w: largeur cible (0.5× Stage 1, multiple de 32)
+
+        Returns:
+            [1, 3, F, target_h, target_w] tensor normalise [-1, 1] (RGB grayscale)
+        """
+        H, W = depth.shape
+        device = depth.device
+
+        # Normaliser depth en [0, 1] pour calculs relatifs
+        d_min, d_max = depth.min(), depth.max()
         if d_max - d_min > 1e-6:
-            depth_norm = ((depth_np - d_min) / (d_max - d_min) * 255).astype(np.uint8)
+            depth_norm = (depth - d_min) / (d_max - d_min)
         else:
-            depth_norm = np.zeros_like(depth_np, dtype=np.uint8)
-        depth_img = Image.fromarray(depth_norm, mode="L")
+            depth_norm = torch.zeros_like(depth)
 
-        # Resize a 0.5x resolution (ref0.5)
-        guide_h, guide_w = target_h // 2, target_w // 2
-        # Assurer multiples de 32 pour le VAE
-        guide_h = (guide_h // 32) * 32
-        guide_w = (guide_w // 32) * 32
-        depth_img = depth_img.resize((guide_w, guide_h), Image.BILINEAR)
+        # Intrinseques camera estimes (approximation photo standard)
+        fx = fy = float(max(H, W))
+        cx, cy = W / 2.0, H / 2.0
 
-        # Convertir en RGB (le VAE attend du RGB)
-        depth_rgb = Image.merge("RGB", [depth_img, depth_img, depth_img])
+        # Pixel grid
+        v_coords, u_coords = torch.meshgrid(
+            torch.arange(H, device=device, dtype=torch.float32),
+            torch.arange(W, device=device, dtype=torch.float32),
+            indexing="ij",
+        )
 
-        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False, prefix="depth_")
-        depth_rgb.save(tmp.name)
-        log.debug("Depth map: %s → %dx%d", tmp.name, guide_w, guide_h)
-        return tmp.name
+        # Unproject en 3D : X = (u - cx) * Z / fx, Y = (v - cy) * Z / fy, Z = depth
+        Z = depth_norm + 0.01  # eviter division par zero
+        X = (u_coords - cx) * Z / fx
+        Y = (v_coords - cy) * Z / fy
+
+        # Deplacement total en unites de profondeur
+        max_dz = total_displacement * (d_max - d_min).item() if (d_max - d_min) > 1e-6 else total_displacement
+
+        frames = []
+        for t in range(num_frames):
+            # Camera translate forward (dolly-in)
+            dz = max_dz * t / max(num_frames - 1, 1)
+            Z_new = Z - dz
+
+            # Masquer les points derriere la camera
+            valid = Z_new > 0.01
+
+            # Re-projeter en 2D
+            u_new = (fx * X / Z_new + cx).long()
+            v_new = (fy * Y / Z_new + cy).long()
+
+            # Clamp aux bornes image
+            u_clamped = u_new.clamp(0, W - 1)
+            v_clamped = v_new.clamp(0, H - 1)
+
+            # Z-buffer via scatter_reduce (garder le point le plus proche)
+            target_depth = torch.full((H * W,), float("inf"), device=device)
+            flat_idx = (v_clamped * W + u_clamped).view(-1)
+            z_vals = Z_new.view(-1)
+            valid_flat = valid.view(-1)
+
+            # Scatter avec min pour z-buffer
+            target_depth.scatter_reduce_(
+                0, flat_idx[valid_flat], z_vals[valid_flat], reduce="amin",
+            )
+
+            frame = target_depth.view(H, W)
+            # Remplacer inf par 0 (background / trous)
+            frame = torch.where(frame == float("inf"), torch.zeros_like(frame), frame)
+
+            # Hole-filling par dilatation (max_pool2d sur l'inverse)
+            frame_4d = frame.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+            # Dilater : remplacer les zeros par le max des voisins
+            for _ in range(3):
+                dilated = F.max_pool2d(frame_4d, kernel_size=3, stride=1, padding=1)
+                mask = frame_4d == 0
+                frame_4d = torch.where(mask, dilated, frame_4d)
+            frame = frame_4d.squeeze()
+
+            frames.append(frame)
+
+        # Stack et normaliser
+        depth_video = torch.stack(frames)  # [F, H, W]
+
+        # Normaliser en [0, 1] sur tout le volume
+        dv_min, dv_max = depth_video.min(), depth_video.max()
+        if dv_max - dv_min > 1e-6:
+            depth_video = (depth_video - dv_min) / (dv_max - dv_min)
+
+        # Resize a la resolution cible
+        depth_video = depth_video.unsqueeze(1)  # [F, 1, H, W]
+        depth_video = F.interpolate(depth_video, size=(target_h, target_w), mode="bilinear", align_corners=False)
+
+        # [0,1] → [-1,1] et repeter 3 channels RGB
+        depth_video = depth_video * 2.0 - 1.0  # [-1, 1]
+        depth_video = depth_video.expand(-1, 3, -1, -1)  # [F, 3, H, W]
+
+        # Reshape en [1, 3, F, H, W] (batch=1, format video)
+        depth_video = depth_video.permute(1, 0, 2, 3).unsqueeze(0)  # [1, 3, F, target_h, target_w]
+        return depth_video.to(dtype=self.dtype)
+
+    def create_depth_conditioning(
+        self,
+        image_path: str,
+        stage1_h: int,
+        stage1_w: int,
+        num_frames: int,
+    ) -> ConditioningItem:
+        """Cree le conditioning IC-LoRA depth pour Stage 1.
+
+        Pipeline complet : DA3 → depth → render dolly-in 49 frames →
+        VAE encode → VideoConditionByReferenceLatent
+        """
+        t0 = time.perf_counter()
+
+        # 1. Depth estimation
+        depth = self.estimate_depth_tensor(image_path)
+
+        # 2. Render depth sequence dolly-in
+        scale = self._depth_downscale_factor
+        ref_h = (stage1_h // scale // 32) * 32  # multiples de 32
+        ref_w = (stage1_w // scale // 32) * 32
+        depth_video = self.render_depth_dolly_in(
+            depth, num_frames, self._depth_displacement,
+            target_h=ref_h, target_w=ref_w,
+        )  # [1, 3, F, ref_h, ref_w]
+
+        # 3. VAE encode
+        encoded = self._video_encoder(depth_video)
+
+        # 4. Wrap en conditioning IC-LoRA
+        cond = VideoConditionByReferenceLatent(
+            latent=encoded,
+            downscale_factor=scale,
+            strength=self._depth_lora_strength,
+        )
+
+        dt = time.perf_counter() - t0
+        log.info(
+            "Depth conditioning: DA3+render+VAE en %.2fs (%dx%d, %d frames, scale=%d)",
+            dt, ref_w, ref_h, num_frames, scale,
+        )
+        return cond
 
     def _cache_fingerprint(self) -> str:
         """Hash d'invalidation pour le cache transformer pre-fusionne.
@@ -1283,6 +1435,7 @@ class MedusaPipeline:
             initial_video_latents: torch.Tensor | None = None,
             initial_audio_latents: torch.Tensor | None = None,
             noise_scale: float = 1.0,
+            extra_conditionings: list[ConditioningItem] | None = None,
         ) -> tuple[LatentState, LatentState, tuple]:
             video_states: list[LatentState] = []
             audio_states: list[LatentState] = []
@@ -1299,17 +1452,6 @@ class MedusaPipeline:
                     last_str = item.get("last_image_strength", 1.0)
                     images_i.append(ImageConditioningInput(path=last_img, frame_idx=last_idx, strength=last_str))
 
-                # Depth guide : ajouter la depth map comme conditioning supplementaire
-                # frame_idx=1 sauf si last_image occupe deja cet index (num_frames < 17)
-                depth_path = item.get("depth_map_path")
-                if depth_path and self._depth_lora_enabled:
-                    last_idx_used = (num_frames - 1) // 8 if last_img else -1
-                    depth_idx = 2 if last_idx_used == 1 else 1
-                    images_i.append(ImageConditioningInput(
-                        path=depth_path, frame_idx=depth_idx,
-                        strength=self._depth_lora_strength,
-                    ))
-
                 conds_i = image_conditionings_by_replacing_latent(
                     images=images_i,
                     height=h,
@@ -1318,6 +1460,10 @@ class MedusaPipeline:
                     dtype=self.dtype,
                     device=self.device,
                 )
+
+                # IC-LoRA conditionings (depth) — Stage 1 only
+                if extra_conditionings:
+                    conds_i = conds_i + extra_conditionings
 
                 shape_i = VideoPixelShape(
                     batch=1, frames=num_frames, width=w, height=h, fps=frame_rate,
@@ -1436,9 +1582,20 @@ class MedusaPipeline:
             # --- 2-stage batch pipeline ---
             half_h, half_w = height // 2, width // 2
 
+            # IC-LoRA depth conditioning (Stage 1 only)
+            depth_conds: list[ConditioningItem] | None = None
+            if self._depth_lora_enabled and self._depth_model is not None:
+                # Utiliser l'image du premier item pour le depth conditioning partage
+                depth_cond = self.create_depth_conditioning(
+                    items[0]["image_path"], half_h, half_w, num_frames,
+                )
+                depth_conds = [depth_cond]
+
             # Stage 1 — half-res batch denoise
             log.info("Batch Stage 1: denoise %dx%d (half-res, 8 steps)...", half_w, half_h)
-            bv_s1, ba_s1, (vtools_s1, atools_s1) = create_batched_states(half_h, half_w)
+            bv_s1, ba_s1, (vtools_s1, atools_s1) = create_batched_states(
+                half_h, half_w, extra_conditionings=depth_conds,
+            )
 
             bv_s1, ba_s1 = denoising_loop_guided(self._sigmas, bv_s1, ba_s1, stepper)
             bv_s1 = vtools_s1.clear_conditioning(bv_s1)
@@ -1507,8 +1664,18 @@ class MedusaPipeline:
 
         else:
             # --- 1-stage batch pipeline ---
+            # IC-LoRA depth conditioning
+            depth_conds_1s: list[ConditioningItem] | None = None
+            if self._depth_lora_enabled and self._depth_model is not None:
+                depth_cond_1s = self.create_depth_conditioning(
+                    items[0]["image_path"], height, width, num_frames,
+                )
+                depth_conds_1s = [depth_cond_1s]
+
             log.info("Batch 1-stage: denoise %dx%d (8 steps)...", width, height)
-            batched_video, batched_audio, (vtools, atools) = create_batched_states(height, width)
+            batched_video, batched_audio, (vtools, atools) = create_batched_states(
+                height, width, extra_conditionings=depth_conds_1s,
+            )
 
             batched_video, batched_audio = denoising_loop_guided(
                 self._sigmas, batched_video, batched_audio, stepper,

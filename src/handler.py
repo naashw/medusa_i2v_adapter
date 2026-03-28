@@ -410,18 +410,6 @@ def handler(job: dict) -> dict:
             group_camera = group_items[0].get("camera_motion", "static")
             pipeline.ensure_lora(group_camera)
 
-            # Depth estimation : generer depth maps pour chaque item du groupe
-            if pipeline._depth_lora_enabled and pipeline._depth_model is not None:
-                t0_depth = time.time()
-                for item in group_items:
-                    item["_depth_map_path"] = pipeline.estimate_depth(
-                        item["_image_path"], height, width,
-                    )
-                log.info(
-                    "Depth maps: %d items en %.1fs",
-                    len(group_items), time.time() - t0_depth,
-                )
-
             sub_batches = [
                 group_items[i:i + MAX_BATCH]
                 for i in range(0, len(group_items), MAX_BATCH)
@@ -438,8 +426,6 @@ def handler(job: dict) -> dict:
                     if item.get("_last_image_path"):
                         pi["last_image_path"] = item["_last_image_path"]
                         pi["last_image_strength"] = item.get("last_image_strength", 1.0)
-                    if item.get("_depth_map_path"):
-                        pi["depth_map_path"] = item["_depth_map_path"]
                     pipeline_items.append(pi)
 
                 # Callback : soumettre le MP4 encode + S3 upload des que
@@ -502,11 +488,6 @@ def handler(job: dict) -> dict:
         return {"error": str(e)}
 
     finally:
-        # Cleanup depth maps temporaires
-        for item in normalized:
-            depth_tmp = item.get("_depth_map_path")
-            if depth_tmp and os.path.isfile(depth_tmp):
-                os.unlink(depth_tmp)
         # Cleanup toutes les images temporaires
         for tmp in tmp_files:
             if os.path.isfile(tmp):
