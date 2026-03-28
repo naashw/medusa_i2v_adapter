@@ -528,8 +528,8 @@ class MedusaPipeline:
         for base_key, pair in pairs.items():
             if "A" not in pair or "B" not in pair:
                 continue
-            a_tensor = pair["A"].float()
-            b_tensor = pair["B"].float()
+            a_tensor = pair["A"].to(dtype=self.dtype, device=self.device)
+            b_tensor = pair["B"].to(dtype=self.dtype, device=self.device)
             delta = b_tensor @ a_tensor
 
             if "alpha" in pair:
@@ -538,7 +538,8 @@ class MedusaPipeline:
                 delta = delta * (alpha_val / rank)
 
             delta = delta * self._camera_lora_strength
-            deltas[f"{base_key}.weight"] = delta.to(torch.bfloat16)
+            deltas[f"{base_key}.weight"] = delta.cpu()
+            del a_tensor, b_tensor, delta
 
         if not deltas:
             log.warning("LoRA '%s': aucun delta compute (format inconnu ?)", name)
