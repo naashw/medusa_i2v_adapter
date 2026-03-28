@@ -76,7 +76,7 @@ Le mouvement de camera est controle par depth estimation + IC-LoRA Union Control
 | `ENCODE_CRF` | `23` | CRF qualite (0-51, lower = meilleur) |
 | `DEPTH_LORA` | `1` | IC-LoRA depth control + DA3 estimation (`0` desactive) |
 | `DEPTH_LORA_STRENGTH` | `1.0` | Strength du VideoConditionByReferenceLatent (0.0-1.0) |
-| `DEPTH_DOLLY_DISPLACEMENT` | `0.15` | Amplitude deplacement camera dolly-in (fraction du depth range) |
+| `DEPTH_DISPLACEMENT` | `0.07` | Amplitude deplacement camera (fraction du depth range, ex: 0.03=subtil, 0.15=agressif) |
 
 ## Documentation
 

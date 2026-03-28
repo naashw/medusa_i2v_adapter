@@ -125,7 +125,7 @@ class MedusaPipeline:
         self._depth_lora_file = "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
         self._depth_model: torch.nn.Module | None = None
         self._depth_downscale_factor: int = 1  # lu depuis metadata LoRA au chargement
-        self._depth_displacement = float(os.environ.get("DEPTH_DOLLY_DISPLACEMENT", "0.15"))
+        self._depth_displacement = float(os.environ.get("DEPTH_DISPLACEMENT", "0.07"))
 
         # Runtime state
         self._active_lora: str | None = None
