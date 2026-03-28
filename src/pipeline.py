@@ -56,11 +56,6 @@ from video_encoder import encode_video_fast
 from ltx_pipelines.utils.types import PipelineComponents
 from ltx_core.quantization import QuantizationPolicy
 
-try:
-    from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP
-except ImportError:
-    LTXV_LORA_COMFY_RENAMING_MAP = {}
-
 from prompts import CAMERA_PRESETS, DEFAULT_NEGATIVE_PROMPT
 
 log = logging.getLogger("medusa")
@@ -508,22 +503,9 @@ class MedusaPipeline:
         )
         lora_sd = load_safetensors(lora_path, device="cpu")
 
-        # Renommer les cles (Comfy -> ltx-core) si renaming map disponible
-        if LTXV_LORA_COMFY_RENAMING_MAP:
-            renamed_sd: dict[str, torch.Tensor] = {}
-            for key, tensor in lora_sd.items():
-                new_key = key
-                for old_prefix, new_prefix in LTXV_LORA_COMFY_RENAMING_MAP.items():
-                    if key.startswith(old_prefix):
-                        new_key = new_prefix + key[len(old_prefix):]
-                        break
-                renamed_sd[new_key] = tensor
-            lora_sd = renamed_sd
-
-        # Log les cles pour diagnostic (debug)
-        if log.isEnabledFor(logging.DEBUG):
-            sample_keys = list(lora_sd.keys())[:10]
-            log.debug("LoRA '%s' sample keys: %s", name, sample_keys)
+        # Log les cles pour diagnostic
+        sample_keys = list(lora_sd.keys())[:5]
+        log.info("LoRA '%s' sample keys: %s", name, sample_keys)
 
         # Grouper par parametre cible : paires lora_A / lora_B
         param_groups: dict[str, dict[str, torch.Tensor]] = {}
@@ -583,9 +565,12 @@ class MedusaPipeline:
                 log.debug("LoRA fuse skip: %s (pas dans le transformer)", param_name)
         log.info("LoRA '%s' fused: %d/%d params", name, applied, len(deltas))
         if applied == 0 and deltas:
+            # Log les cles attendues vs disponibles pour diagnostic
+            expected = list(deltas.keys())[:3]
+            available = list(state_dict.keys())[:3]
             log.warning(
-                "LoRA '%s': AUCUN parametre fuse — verifier nommage "
-                "(renaming_map=%s)", name, "loaded" if LTXV_LORA_COMFY_RENAMING_MAP else "absent",
+                "LoRA '%s': AUCUN parametre fuse — cles LoRA: %s, transformer: %s",
+                name, expected, available,
             )
         self._active_lora = name
 
