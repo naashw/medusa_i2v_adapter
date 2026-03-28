@@ -501,32 +501,44 @@ class MedusaPipeline:
             "Chargement LoRA '%s': %s (strength=%.2f)",
             name, filename, self._camera_lora_strength,
         )
-        lora_sd = load_safetensors(lora_path, device="cpu")
+        raw = load_safetensors(lora_path, device="cpu")
 
         # Log les cles pour diagnostic
-        sample_keys = list(lora_sd.keys())[:5]
+        sample_keys = list(raw.keys())[:5]
         log.info("LoRA '%s' sample keys: %s", name, sample_keys)
 
-        # Grouper par parametre cible : paires lora_A / lora_B
-        param_groups: dict[str, dict[str, torch.Tensor]] = {}
-        for key, tensor in lora_sd.items():
-            if ".lora_A" in key:
-                base = key.replace(".lora_A", "")
-                param_groups.setdefault(base, {})["A"] = tensor
-            elif ".lora_B" in key:
-                base = key.replace(".lora_B", "")
-                param_groups.setdefault(base, {})["B"] = tensor
+        # Grouper les paires lora_A/lora_B par cle de base
+        # Convention : strip "diffusion_model." prefix (renaming Comfy → ltx-core interne)
+        pairs: dict[str, dict[str, torch.Tensor]] = {}
+        for key, tensor in raw.items():
+            clean = key.replace("diffusion_model.", "", 1) if key.startswith("diffusion_model.") else key
 
-        # Calculer delta = (B @ A) * strength pour chaque parametre
-        # Remapper diffusion_model.* → velocity_model.* (convention ltx-core interne)
+            if ".lora_A.weight" in clean:
+                base = clean.replace(".lora_A.weight", "")
+                pairs.setdefault(base, {})["A"] = tensor
+            elif ".lora_B.weight" in clean:
+                base = clean.replace(".lora_B.weight", "")
+                pairs.setdefault(base, {})["B"] = tensor
+            elif ".alpha" in clean:
+                base = clean.replace(".alpha", "")
+                pairs.setdefault(base, {})["alpha"] = tensor
+
+        # Calculer delta = (B @ A) * (alpha/rank) * strength
         deltas: dict[str, torch.Tensor] = {}
-        for param_name, ab in param_groups.items():
-            if "A" in ab and "B" in ab:
-                delta = (ab["B"].float() @ ab["A"].float()) * self._camera_lora_strength
-                # Le base a deja .weight (vient de lora_A.weight → .weight apres remove)
-                # Remapper le prefix pour matcher named_parameters()
-                mapped_name = param_name.replace("diffusion_model.", "velocity_model.", 1)
-                deltas[mapped_name] = delta.to(torch.bfloat16)
+        for base_key, pair in pairs.items():
+            if "A" not in pair or "B" not in pair:
+                continue
+            a_tensor = pair["A"].float()
+            b_tensor = pair["B"].float()
+            delta = b_tensor @ a_tensor
+
+            if "alpha" in pair:
+                rank = a_tensor.shape[0]
+                alpha_val = pair["alpha"].item()
+                delta = delta * (alpha_val / rank)
+
+            delta = delta * self._camera_lora_strength
+            deltas[f"{base_key}.weight"] = delta.to(torch.bfloat16)
 
         if not deltas:
             log.warning("LoRA '%s': aucun delta compute (format inconnu ?)", name)
