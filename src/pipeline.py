@@ -234,7 +234,9 @@ class MedusaPipeline:
             filepath = os.path.join(cache_dir, filename)
             try:
                 data = torch.load(filepath, map_location="cpu", weights_only=True)
-                self._embeddings_cache[prompt_hash] = (data["video"], data["audio"])
+                self._embeddings_cache[prompt_hash] = (
+                    data["video"].to(self.device), data["audio"].to(self.device),
+                )
                 count += 1
             except Exception as e:
                 log.warning("Skip custom embedding %s: %s", filename, e)
@@ -802,19 +804,18 @@ class MedusaPipeline:
         prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:16]
         if prompt_hash in self._embeddings_cache:
             log.info("Prompt cache hit (RAM): %s", prompt[:40])
-            v, a = self._embeddings_cache[prompt_hash]
-            return v.to(self.device), a.to(self.device)
+            return self._embeddings_cache[prompt_hash]
 
         # 3. Check volume cache (fichier individuel, peut venir d'un autre worker)
         if self._embeddings_cache_dir:
             cache_path = os.path.join(self._embeddings_cache_dir, f"prompt_{prompt_hash}.pt")
             if os.path.isfile(cache_path):
                 try:
-                    data = torch.load(cache_path, map_location="cpu", weights_only=True)
-                    v_cpu, a_cpu = data["video"], data["audio"]
-                    self._embeddings_cache[prompt_hash] = (v_cpu, a_cpu)
+                    data = torch.load(cache_path, map_location=self.device, weights_only=True)
+                    v_gpu, a_gpu = data["video"], data["audio"]
+                    self._embeddings_cache[prompt_hash] = (v_gpu, a_gpu)
                     log.info("Prompt cache hit (volume): %s", prompt[:40])
-                    return v_cpu.to(self.device), a_cpu.to(self.device)
+                    return v_gpu, a_gpu
                 except Exception as e:
                     log.warning("Cache volume corrompu %s: %s", cache_path, e)
 
