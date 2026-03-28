@@ -501,7 +501,7 @@ class MedusaPipeline:
             "Chargement LoRA '%s': %s (strength=%.2f)",
             name, filename, self._camera_lora_strength,
         )
-        raw = load_safetensors(lora_path, device="cpu")
+        raw = load_safetensors(lora_path, device=str(self.device))
 
         # Log les cles pour diagnostic
         sample_keys = list(raw.keys())[:5]
@@ -528,8 +528,8 @@ class MedusaPipeline:
         for base_key, pair in pairs.items():
             if "A" not in pair or "B" not in pair:
                 continue
-            a_tensor = pair["A"].to(dtype=self.dtype, device=self.device)
-            b_tensor = pair["B"].to(dtype=self.dtype, device=self.device)
+            a_tensor = pair["A"].to(dtype=self.dtype)
+            b_tensor = pair["B"].to(dtype=self.dtype)
             delta = b_tensor @ a_tensor
 
             if "alpha" in pair:
