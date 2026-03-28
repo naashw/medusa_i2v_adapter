@@ -518,11 +518,15 @@ class MedusaPipeline:
                 param_groups.setdefault(base, {})["B"] = tensor
 
         # Calculer delta = (B @ A) * strength pour chaque parametre
+        # Remapper diffusion_model.* → velocity_model.* (convention ltx-core interne)
         deltas: dict[str, torch.Tensor] = {}
         for param_name, ab in param_groups.items():
             if "A" in ab and "B" in ab:
                 delta = (ab["B"].float() @ ab["A"].float()) * self._camera_lora_strength
-                deltas[param_name + ".weight"] = delta.to(torch.bfloat16)
+                # Le base a deja .weight (vient de lora_A.weight → .weight apres remove)
+                # Remapper le prefix pour matcher named_parameters()
+                mapped_name = param_name.replace("diffusion_model.", "velocity_model.", 1)
+                deltas[mapped_name] = delta.to(torch.bfloat16)
 
         if not deltas:
             log.warning("LoRA '%s': aucun delta compute (format inconnu ?)", name)
