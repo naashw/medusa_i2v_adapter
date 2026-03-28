@@ -206,7 +206,7 @@ download_model() {
                 local file_size
                 file_size=$(stat -c%s "$filepath" 2>/dev/null || echo "?")
                 echo "[medusa] CORROMPU: $filename (${file_size} bytes) — suppression et re-telechargement"
-                trash-put "$filepath"
+                rm -f "$filepath"
             fi
         else
             echo "[medusa] Deja present: $filename"
