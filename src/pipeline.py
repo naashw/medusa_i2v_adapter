@@ -538,8 +538,8 @@ class MedusaPipeline:
                 delta = delta * (alpha_val / rank)
 
             delta = delta * self._camera_lora_strength
-            deltas[f"{base_key}.weight"] = delta.cpu()
-            del a_tensor, b_tensor, delta
+            deltas[f"{base_key}.weight"] = delta
+            del a_tensor, b_tensor
 
         if not deltas:
             log.warning("LoRA '%s': aucun delta compute (format inconnu ?)", name)
@@ -549,22 +549,23 @@ class MedusaPipeline:
         log.info("LoRA '%s': %d parametres affectes", name, len(deltas))
 
     def _apply_lora_delta(self, param: torch.nn.Parameter, delta: torch.Tensor, add: bool) -> None:
-        """Applique un delta LoRA in-place, en gerant le dtype (FP8 cast safe)."""
-        device_delta = delta.to(self.device)
+        """Applique un delta LoRA in-place, en gerant le dtype (FP8 cast safe).
+
+        Les deltas sont deja sur GPU (meme device que les params).
+        """
         original_dtype = param.data.dtype
         if original_dtype != torch.bfloat16:
-            # Dequantize → apply delta en BF16 → re-quantize
             param_bf16 = param.data.to(torch.bfloat16)
             if add:
-                param_bf16.add_(device_delta)
+                param_bf16.add_(delta)
             else:
-                param_bf16.sub_(device_delta)
+                param_bf16.sub_(delta)
             param.data.copy_(param_bf16.to(original_dtype))
         else:
             if add:
-                param.data.add_(device_delta)
+                param.data.add_(delta)
             else:
-                param.data.sub_(device_delta)
+                param.data.sub_(delta)
 
     def _fuse_lora(self, name: str) -> None:
         """Fuse un LoRA dans le transformer (add deltas in-place)."""
