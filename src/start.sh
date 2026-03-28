@@ -155,11 +155,17 @@ if [[ "${CLEAN_OLD_CACHE:-1}" == "1" ]] && [[ -d "${WORKSPACE}/cache/compile_art
     done
 fi
 if [[ "${CLEAN_OLD_CACHE:-1}" == "1" ]] && [[ -d "${WORKSPACE}/cache/triton" ]]; then
-    echo "[medusa] Purge cache triton (rebuild avec nouveau build)"
-    rm -rf "${WORKSPACE}/cache/triton"
+    for old_dir in "${WORKSPACE}/cache/triton"/*/; do
+        [[ -d "$old_dir" ]] || continue
+        if [[ "$(basename "$old_dir")" != "${INDUCTOR_CACHE_V}" ]]; then
+            echo "[medusa] Purge ancien cache triton: $(basename "$old_dir")"
+            rm -rf "$old_dir"
+        fi
+    done
 fi
 
 mkdir -p "${WORKSPACE}/cache/inductor/${INDUCTOR_CACHE_V}"
+mkdir -p "${WORKSPACE}/cache/triton/${INDUCTOR_CACHE_V}"
 mkdir -p "${WORKSPACE}/cache/compile_artifacts"
 mkdir -p "${WORKSPACE}/output"
 
@@ -168,7 +174,7 @@ export MODELS_DIR="$MODELS_DIR"
 export VOLUME_ROOT="$WORKSPACE"
 export CACHE_DIR="${WORKSPACE}/cache"
 export OUTPUT_VOLUME_DIR="${WORKSPACE}/output"
-export TRITON_CACHE_DIR="${WORKSPACE}/cache/triton"
+export TRITON_CACHE_DIR="${WORKSPACE}/cache/triton/${INDUCTOR_CACHE_V}"
 export TORCHINDUCTOR_CACHE_DIR="${WORKSPACE}/cache/inductor/${INDUCTOR_CACHE_V}"
 export TORCHINDUCTOR_FX_GRAPH_CACHE=1
 export TORCHINDUCTOR_AUTOGRAD_CACHE=1

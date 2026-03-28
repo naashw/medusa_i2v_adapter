@@ -315,7 +315,6 @@ def normalize_items(job_input: dict) -> tuple[list[dict], str | None]:
 # --- Handler ---
 
 pipeline: MedusaPipeline | None = None
-_artifacts_saved: bool = False
 
 
 def handler(job: dict) -> dict:
@@ -482,12 +481,6 @@ def handler(job: dict) -> dict:
         disk_after = get_disk_usage_mb()
         log.info("Disque apres: %.0f MB (libere: %.0f MB)", disk_after, disk_before - disk_after)
 
-        # Sauvegarder compile artifacts apres le 1er job reussi (Mega Cache)
-        global _artifacts_saved
-        if not _artifacts_saved:
-            pipeline.save_compile_artifacts()
-            _artifacts_saved = True
-
         return {"images": ordered_results}
 
     except Exception as e:
@@ -529,6 +522,10 @@ def init_pipeline() -> MedusaPipeline:
     # 4. Warmup compile — pre-compile transformer pour toutes les shapes
     # (720p 2-stage + 1080p 2-stage, landscape + portrait) pour eviter les recompilations du 1er job
     p.warmup_compile()
+
+    # 5. Sauvegarder compile artifacts (Mega Cache) immediatement apres warmup
+    # Avant : sauvegarde seulement apres le 1er job — perdu si crash avant completion
+    p.save_compile_artifacts()
 
     log.info("Pipeline pret.")
     return p
