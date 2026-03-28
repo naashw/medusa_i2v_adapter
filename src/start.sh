@@ -303,16 +303,22 @@ if [[ "${DEPTH_LORA:-1}" == "1" ]]; then
         "${MODELS_DIR}/loras"
 fi
 
-# --- DA3-LARGE-1.1: Depth Estimation (~400MB) ---
+# --- DA3-LARGE-1.1: Depth Estimation (~1.64GB) ---
 if [[ "${DEPTH_LORA:-1}" == "1" ]]; then
-    echo "[medusa] Telechargement: DA3-LARGE-1.1 (~400MB)..."
-    python -c "
-from huggingface_hub import snapshot_download
-snapshot_download(
-    'depth-anything/DA3-LARGE-1.1',
+    download_model "depth-anything/DA3-LARGE-1.1" \
+        "model.safetensors" \
+        "${MODELS_DIR}/da3-large"
+    # config.json necessaire pour from_pretrained
+    if [[ ! -f "${MODELS_DIR}/da3-large/config.json" ]]; then
+        python -c "
+from huggingface_hub import hf_hub_download
+hf_hub_download(
+    repo_id='depth-anything/DA3-LARGE-1.1',
+    filename='config.json',
     local_dir='${MODELS_DIR}/da3-large',
 )
 "
+    fi
 fi
 
 echo "[medusa] Tous les modeles sont prets."
