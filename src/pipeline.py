@@ -117,6 +117,7 @@ class MedusaPipeline:
         # --- LoRA config ---
         self._lora_dir = os.path.join(models_dir, "loras")
         self._camera_lora_registry: dict[str, str] = {}
+        self._camera_lora_strength: float = 1.0  # utilise par _load_lora_deltas
 
         # --- Depth IC-LoRA config ---
         self._depth_lora_enabled = os.environ.get("DEPTH_LORA", "1") == "1"
@@ -603,28 +604,6 @@ class MedusaPipeline:
                 name, expected, available,
             )
         self._active_lora = name
-
-    def _unfuse_lora(self, name: str) -> None:
-        """Retire un LoRA du transformer (subtract deltas in-place)."""
-        deltas = self._lora_deltas.get(name)
-        if not deltas:
-            return
-        transformer = self._get_orig_module()
-        state_dict = dict(transformer.named_parameters())
-        applied = 0
-        for param_name, delta in deltas.items():
-            if param_name in state_dict:
-                self._apply_lora_delta(state_dict[param_name], delta, add=False)
-                applied += 1
-        log.info("LoRA '%s' unfused: %d/%d params", name, applied, len(deltas))
-        self._active_lora = None
-
-    def ensure_lora(self, camera_motion: str | None) -> None:
-        """No-op — le depth IC-LoRA reste fuse en permanence.
-
-        Garde la signature pour compatibilite avec handler.py.
-        Le camera_motion est utilise pour le rendu depth, pas pour switcher de LoRA.
-        """
 
     # --- Depth estimation (DA3) + IC-LoRA conditioning ---
 
