@@ -724,13 +724,33 @@ class MedusaPipeline:
         output.scatter_reduce_(0, flat_idx, flat_d, reduce="amin")
         output = output.view(H, W)
 
-        # Remplir les trous (zones desoccludees) avec max depth foreground
+        # Remplir les trous par dilatation morphologique (avg pondere des voisins)
+        # Les trous du splatting forment un pattern regulier que le modele hallucine
         holes = output.isinf()
-        if fg.any():
-            fill_val = depth[fg].max()
-        else:
-            fill_val = depth.max()
-        output[holes] = fill_val
+        if holes.any():
+            clean = output.clone()
+            clean[holes] = 0.0
+            mask = (~holes).float()
+            clean_4d = clean.unsqueeze(0).unsqueeze(0)
+            mask_4d = mask.unsqueeze(0).unsqueeze(0)
+
+            for _ in range(5):
+                sum_v = F.avg_pool2d(clean_4d, 3, 1, 1) * 9
+                sum_m = F.avg_pool2d(mask_4d, 3, 1, 1) * 9
+                avg = sum_v / torch.clamp(sum_m, min=1)
+                fill_mask = (mask_4d == 0) & (sum_m > 0)
+                clean_4d = torch.where(fill_mask, avg, clean_4d)
+                mask_4d = torch.where(fill_mask, torch.ones_like(mask_4d), mask_4d)
+                if mask_4d.all():
+                    break
+
+            output = clean_4d.squeeze(0).squeeze(0)
+
+            # Fallback : pixels encore vides (gaps > 5px) → max foreground
+            still_empty = output == 0.0
+            if still_empty.any():
+                fill_val = depth[fg].max() if fg.any() else depth.max()
+                output[still_empty] = fill_val
 
         # Sky → max depth (pixels ciel non warpes)
         if sky_mask.any():
