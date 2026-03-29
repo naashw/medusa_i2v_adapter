@@ -251,6 +251,7 @@ def normalize_items(job_input: dict) -> tuple[list[dict], str | None]:
     raw_image = job_input.get("image")
 
     shared_camera = job_input.get("camera_motion", job_input.get("camera", "static"))
+    shared_camera_speed_ms = job_input.get("camera_speed_ms")
     shared_seed = job_input.get("seed")
     shared_last_image = job_input.get("last_image")
     shared_last_image_strength = job_input.get("last_image_strength", 1.0)
@@ -269,6 +270,7 @@ def normalize_items(job_input: dict) -> tuple[list[dict], str | None]:
                 "id": raw.get("id"),
                 "image": image,
                 "camera_motion": raw.get("camera_motion", raw.get("camera", shared_camera)),
+                "camera_speed_ms": raw.get("camera_speed_ms", shared_camera_speed_ms),
                 "seed": raw.get("seed", random.randint(0, 2**32 - 1)),
                 "last_image": raw.get("last_image"),
                 "last_image_strength": raw.get("last_image_strength", shared_last_image_strength),
@@ -286,6 +288,7 @@ def normalize_items(job_input: dict) -> tuple[list[dict], str | None]:
                 "id": None,
                 "image": img,
                 "camera_motion": shared_camera,
+                "camera_speed_ms": shared_camera_speed_ms,
                 "seed": base_seed + i,
                 "last_image": shared_last_image,
                 "last_image_strength": shared_last_image_strength,
@@ -301,6 +304,7 @@ def normalize_items(job_input: dict) -> tuple[list[dict], str | None]:
             "id": None,
             "image": raw_image,
             "camera_motion": shared_camera,
+            "camera_speed_ms": shared_camera_speed_ms,
             "seed": seed,
             "last_image": shared_last_image,
             "last_image_strength": shared_last_image_strength,
@@ -422,6 +426,8 @@ def handler(job: dict) -> dict:
                     if item.get("_last_image_path"):
                         pi["last_image_path"] = item["_last_image_path"]
                         pi["last_image_strength"] = item.get("last_image_strength", 1.0)
+                    if item.get("camera_speed_ms") is not None:
+                        pi["camera_speed_ms"] = float(item["camera_speed_ms"])
                     pipeline_items.append(pi)
 
                 # Callback : soumettre le MP4 encode + S3 upload des que

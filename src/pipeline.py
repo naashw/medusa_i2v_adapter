@@ -124,7 +124,7 @@ class MedusaPipeline:
         self._depth_lora_file = "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
         self._depth_model: torch.nn.Module | None = None
         self._depth_downscale_factor: int = 1  # lu depuis metadata LoRA au chargement
-        self._depth_displacement = float(os.environ.get("DEPTH_DISPLACEMENT", "0.05"))
+        self._camera_speed_ms_default = float(os.environ.get("CAMERA_SPEED_MS", "0.5"))
 
         # Embeddings cache (prompt/key -> (video_ctx, audio_ctx))
         self._embeddings_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -586,12 +586,12 @@ class MedusaPipeline:
     # --- Depth estimation (DA3) + IC-LoRA conditioning ---
 
     def load_depth_model(self) -> None:
-        """Charge DA3-LARGE-1.1 sur GPU (~1.64GB VRAM)."""
+        """Charge DA3METRIC-LARGE sur GPU (~1.64GB VRAM)."""
         if not self._depth_lora_enabled:
             return
-        da3_path = os.path.join(self.models_dir, "da3-large")
+        da3_path = os.path.join(self.models_dir, "da3-metric")
         if not os.path.isdir(da3_path):
-            log.warning("DA3 model introuvable: %s — depth disabled", da3_path)
+            log.warning("DA3METRIC model introuvable: %s — depth disabled", da3_path)
             self._depth_lora_enabled = False
             return
 
@@ -601,7 +601,7 @@ class MedusaPipeline:
         self._depth_model = DepthAnything3.from_pretrained(da3_path)
         self._depth_model = self._depth_model.to(device=self.device)
         dt = time.perf_counter() - t0
-        log.info("DA3-LARGE-1.1 charge en %.1fs (VRAM ~1.64GB)", dt)
+        log.info("DA3METRIC-LARGE charge en %.1fs (VRAM ~1.64GB)", dt)
 
         # Lire reference_downscale_factor depuis metadata du LoRA
         lora_path = os.path.join(self._lora_dir, self._depth_lora_file)
@@ -620,129 +620,117 @@ class MedusaPipeline:
             log.warning("Echec lecture metadata LoRA '%s': %s", lora_path, e)
             return 1
 
-    def estimate_depth_tensor(self, image_path: str) -> torch.Tensor:
-        """DA3 inference → depth map tensor [H, W] float32 sur GPU."""
-        prediction = self._depth_model.inference([image_path])
-        depth = prediction.depth[0]  # [H, W] float32
-        if not isinstance(depth, torch.Tensor):
-            depth = torch.from_numpy(depth)
-        return depth.to(device=self.device, dtype=torch.float32)
+    def estimate_depth_metric(self, image_path: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """DA3METRIC inference → (depth_meters [H,W], sky_mask [H,W]) sur GPU.
 
-    def render_depth_dolly_in(
+        Convertit la prediction brute en metres via les intrinsics estimes.
+        """
+        prediction = self._depth_model.inference([image_path])
+
+        # Depth brute [H, W] float32
+        depth_raw = prediction.depth[0]
+        if not isinstance(depth_raw, torch.Tensor):
+            depth_raw = torch.from_numpy(depth_raw)
+        depth_raw = depth_raw.to(device=self.device, dtype=torch.float32)
+
+        # Intrinsics [1, 3, 3] → focale moyenne
+        intrinsics = prediction.intrinsics
+        if not isinstance(intrinsics, torch.Tensor):
+            intrinsics = torch.from_numpy(intrinsics)
+        intrinsics = intrinsics.to(device=self.device, dtype=torch.float32)
+        focal = (intrinsics[0, 0, 0] + intrinsics[0, 1, 1]) / 2.0
+
+        # Conversion en metres : depth_meters = focal * depth_raw / 300.0
+        depth_meters = focal * depth_raw / 300.0
+
+        # Sky mask (fallback: pas de masque)
+        sky_mask = getattr(prediction, "sky_mask", None)
+        if sky_mask is None:
+            sky_mask = torch.zeros_like(depth_raw, dtype=torch.bool)
+        else:
+            if not isinstance(sky_mask, torch.Tensor):
+                sky_mask = torch.from_numpy(sky_mask)
+            sky_mask = sky_mask.to(device=self.device, dtype=torch.bool)
+
+        log.debug(
+            "DA3METRIC: depth %.1f-%.1f m, focal %.0f px, sky %.1f%%",
+            depth_meters.min(), depth_meters.max(), focal,
+            sky_mask.float().mean() * 100,
+        )
+        return depth_meters, sky_mask
+
+    def render_depth_sequence(
         self,
-        depth: torch.Tensor,
+        depth_meters: torch.Tensor,
+        sky_mask: torch.Tensor,
         num_frames: int,
-        total_displacement: float,
+        camera_speed_ms: float,
+        frame_rate: float,
         target_h: int,
         target_w: int,
     ) -> torch.Tensor:
-        """Rasterise num_frames depth maps avec trajectoire dolly-in sur GPU.
+        """Genere une sequence depth par shift lineaire (sans reprojection).
 
-        Unproject pixels → 3D via intrinseques estimes, translate camera en Z
-        progressivement, re-project en 2D avec z-buffer (scatter_reduce).
+        La camera avance lineairement en Z a camera_speed_ms m/s.
+        Chaque frame est normalisee individuellement [0, 1] (compatible IC-LoRA).
 
         Args:
-            depth: [H, W] float32 depth map (valeurs relatives)
-            num_frames: nombre de frames (ex: 49)
-            total_displacement: deplacement relatif camera (fraction du point le plus proche)
-            target_h: hauteur cible (0.5× Stage 1, multiple de 32)
-            target_w: largeur cible (0.5× Stage 1, multiple de 32)
+            depth_meters: [H, W] profondeur metrique en metres
+            sky_mask: [H, W] bool (True = pixels ciel)
+            num_frames: nombre de frames a generer
+            camera_speed_ms: vitesse camera en m/s
+            frame_rate: fps (pour calculer la duree)
+            target_h, target_w: resolution de sortie (multiples de 32)
 
         Returns:
-            [1, 3, F, target_h, target_w] tensor normalise [-1, 1] (RGB grayscale)
+            [1, 3, F, target_h, target_w] tensor normalise [-1, 1]
         """
-        H, W = depth.shape
-        device = depth.device
+        device = depth_meters.device
 
-        # Normalisation logarithmique : etale les profondeurs perceptuellement
-        depth_safe = depth.clamp(min=1e-6)
-        log_depth = torch.log(depth_safe)
-        ld_min, ld_max = log_depth.min(), log_depth.max()
-        if ld_max - ld_min > 1e-6:
-            depth_norm = (log_depth - ld_min) / (ld_max - ld_min)
-        else:
-            depth_norm = torch.zeros_like(depth)
-
-        # Intrinseques camera estimes (approximation photo standard)
-        fx = fy = float(max(H, W))
-        cx, cy = W / 2.0, H / 2.0
-
-        # Pixel grid
-        v_coords, u_coords = torch.meshgrid(
-            torch.arange(H, device=device, dtype=torch.float32),
-            torch.arange(W, device=device, dtype=torch.float32),
-            indexing="ij",
-        )
-
-        # Unproject en 3D : X = (u - cx) * Z / fx, Y = (v - cy) * Z / fy, Z = depth
-        Z = depth_norm + 0.01  # eviter division par zero
-        X = (u_coords - cx) * Z / fx
-        Y = (v_coords - cy) * Z / fy
-
-        # Deplacement direct en espace log-normalise
-        max_dz = total_displacement
+        # Deplacement total en metres
+        duration_s = (num_frames - 1) / frame_rate
+        max_displacement = camera_speed_ms * duration_s
 
         frames = []
-        for t in range(num_frames):
-            # Camera translate forward (dolly-in)
-            dz = max_dz * t / max(num_frames - 1, 1)
-            Z_new = Z - dz
+        for i in range(num_frames):
+            t = i / max(num_frames - 1, 1)
+            delta = max_displacement * t
 
-            # Masquer les points derriere la camera
-            valid = Z_new > 0.01
+            # Shift depth (dolly-in : objets se rapprochent)
+            depth_frame = depth_meters - delta
 
-            # Re-projeter en 2D
-            u_new = (fx * X / Z_new + cx).long()
-            v_new = (fy * Y / Z_new + cy).long()
+            # Clamp objets derriere la camera
+            depth_frame = torch.clamp(depth_frame, min=0.01)
 
-            # Clamp aux bornes image
-            u_clamped = u_new.clamp(0, W - 1)
-            v_clamped = v_new.clamp(0, H - 1)
+            # Sky → max depth (evite valeurs incoherentes pour le ciel)
+            if sky_mask.any():
+                depth_frame = torch.where(sky_mask, depth_frame.max(), depth_frame)
 
-            # Z-buffer via scatter_reduce (garder le point le plus proche)
-            target_depth = torch.full((H * W,), float("inf"), device=device)
-            flat_idx = (v_clamped * W + u_clamped).view(-1)
-            z_vals = Z_new.view(-1)
-            valid_flat = valid.view(-1)
+            # Per-frame min-max normalisation [0, 1]
+            d_min, d_max = depth_frame.min(), depth_frame.max()
+            if (d_max - d_min) > 1e-6:
+                depth_norm = (depth_frame - d_min) / (d_max - d_min)
+            else:
+                depth_norm = torch.zeros_like(depth_frame)
 
-            # Scatter avec min pour z-buffer
-            target_depth.scatter_reduce_(
-                0, flat_idx[valid_flat], z_vals[valid_flat], reduce="amin",
-            )
+            frames.append(depth_norm)
 
-            frame = target_depth.view(H, W)
-            # Remplacer inf par 0 (background / trous)
-            frame = torch.where(frame == float("inf"), torch.zeros_like(frame), frame)
+        # Stack [F, H, W]
+        depth_video = torch.stack(frames)
 
-            # Hole-filling par dilatation (max_pool2d sur l'inverse)
-            frame_4d = frame.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
-            # Dilater : remplacer les zeros par le max des voisins
-            for _ in range(3):
-                dilated = F.max_pool2d(frame_4d, kernel_size=3, stride=1, padding=1)
-                mask = frame_4d == 0
-                frame_4d = torch.where(mask, dilated, frame_4d)
-            frame = frame_4d.squeeze()
-
-            frames.append(frame)
-
-        # Stack et normaliser
-        depth_video = torch.stack(frames)  # [F, H, W]
-
-        # Normaliser en [0, 1] sur tout le volume
-        dv_min, dv_max = depth_video.min(), depth_video.max()
-        if dv_max - dv_min > 1e-6:
-            depth_video = (depth_video - dv_min) / (dv_max - dv_min)
-
-        # Resize a la resolution cible
+        # Resize vers resolution cible
         depth_video = depth_video.unsqueeze(1)  # [F, 1, H, W]
-        depth_video = F.interpolate(depth_video, size=(target_h, target_w), mode="bilinear", align_corners=False)
+        depth_video = F.interpolate(
+            depth_video, size=(target_h, target_w),
+            mode="bilinear", align_corners=False,
+        )
 
-        # [0,1] → [-1,1] et repeter 3 channels RGB
-        depth_video = depth_video * 2.0 - 1.0  # [-1, 1]
+        # [0,1] → [-1,1] et expand 3 channels RGB
+        depth_video = depth_video * 2.0 - 1.0
         depth_video = depth_video.expand(-1, 3, -1, -1)  # [F, 3, H, W]
 
-        # Reshape en [1, 3, F, H, W] (batch=1, format video)
-        depth_video = depth_video.permute(1, 0, 2, 3).unsqueeze(0)  # [1, 3, F, target_h, target_w]
+        # Reshape [1, 3, F, H, W] (batch=1, format video)
+        depth_video = depth_video.permute(1, 0, 2, 3).unsqueeze(0)
         return depth_video.to(dtype=self.dtype)
 
     def create_depth_conditioning(
@@ -751,23 +739,27 @@ class MedusaPipeline:
         stage1_h: int,
         stage1_w: int,
         num_frames: int,
+        frame_rate: float,
+        camera_speed_ms: float,
     ) -> ConditioningItem:
         """Cree le conditioning IC-LoRA depth pour Stage 1.
 
-        Pipeline complet : DA3 → depth → render dolly-in 49 frames →
+        Pipeline : DA3METRIC → depth metres + sky mask → shift lineaire N frames →
         VAE encode → VideoConditionByReferenceLatent
         """
         t0 = time.perf_counter()
 
-        # 1. Depth estimation
-        depth = self.estimate_depth_tensor(image_path)
+        # 1. Depth estimation metrique
+        depth_meters, sky_mask = self.estimate_depth_metric(image_path)
 
-        # 2. Render depth sequence dolly-in
+        # 2. Render depth sequence (shift lineaire)
         scale = self._depth_downscale_factor
         ref_h = (stage1_h // scale // 32) * 32  # multiples de 32
         ref_w = (stage1_w // scale // 32) * 32
-        depth_video = self.render_depth_dolly_in(
-            depth, num_frames, self._depth_displacement,
+        depth_video = self.render_depth_sequence(
+            depth_meters, sky_mask, num_frames,
+            camera_speed_ms=camera_speed_ms,
+            frame_rate=frame_rate,
             target_h=ref_h, target_w=ref_w,
         )  # [1, 3, F, ref_h, ref_w]
 
@@ -783,8 +775,9 @@ class MedusaPipeline:
 
         dt = time.perf_counter() - t0
         log.info(
-            "Depth conditioning: DA3+render+VAE en %.2fs (%dx%d, %d frames, scale=%d)",
-            dt, ref_w, ref_h, num_frames, scale,
+            "Depth conditioning: DA3METRIC+render+VAE en %.2fs "
+            "(%dx%d, %d frames, scale=%d, speed=%.2f m/s)",
+            dt, ref_w, ref_h, num_frames, scale, camera_speed_ms,
         )
         return cond
 
@@ -1514,9 +1507,10 @@ class MedusaPipeline:
             # IC-LoRA depth conditioning (Stage 1 only)
             depth_conds: list[ConditioningItem] | None = None
             if self._depth_lora_enabled and self._depth_model is not None:
-                # Utiliser l'image du premier item pour le depth conditioning partage
+                camera_speed = items[0].get("camera_speed_ms", self._camera_speed_ms_default)
                 depth_cond = self.create_depth_conditioning(
                     items[0]["image_path"], half_h, half_w, num_frames,
+                    frame_rate=frame_rate, camera_speed_ms=camera_speed,
                 )
                 depth_conds = [depth_cond]
 
@@ -1596,8 +1590,10 @@ class MedusaPipeline:
             # IC-LoRA depth conditioning
             depth_conds_1s: list[ConditioningItem] | None = None
             if self._depth_lora_enabled and self._depth_model is not None:
+                camera_speed = items[0].get("camera_speed_ms", self._camera_speed_ms_default)
                 depth_cond_1s = self.create_depth_conditioning(
                     items[0]["image_path"], height, width, num_frames,
+                    frame_rate=frame_rate, camera_speed_ms=camera_speed,
                 )
                 depth_conds_1s = [depth_cond_1s]
 

@@ -19,22 +19,23 @@ Inference directe Python, sans ComfyUI. Output H264 MP4, 3 tiers : 540p (1-stage
 
 3 formats retro-compatibles : `image` (single), `images[]` (batch), `items[]` (multi-client).
 Voir `src/handler.py` pour le schema complet. Points cles :
-- `camera_motion` : `"depth"` pour IC-LoRA depth dolly-in. Presets texte (`dolly-in`, `dolly-out`, `dolly-left`, `dolly-right`, `jib-up`, `jib-down`, `static`) gardes pour futur rendu trajectoires depth. Alias `camera`
+- `camera_motion` : presets texte (`dolly-in`, `dolly-out`, `dolly-left`, `dolly-right`, `jib-up`, `jib-down`, `static`) pour prompt camera. Alias `camera`
+- `camera_speed_ms` : vitesse camera en m/s (optionnel, defaut env `CAMERA_SPEED_MS=0.5`). Per-item ou shared
 - `resolution` : `"540p"` (1-stage preview), `"720p"` (defaut, 2-stage), `"1080p"` (2-stage). Suffixe `-portrait` pour 9:16
 - `last_image` + `last_image_strength` : optionnels, guidage derniere frame
 - `items[]` : regroupes par prompt pour batching GPU, resultats reordonnes par `_original_index`
 
 ## Depth IC-LoRA (controle camera 3D)
 
-Le mouvement de camera est controle par depth estimation + IC-LoRA Union Control, pas par des camera LoRAs individuels.
+Le mouvement de camera est controle par depth estimation metrique + IC-LoRA Union Control, pas par des camera LoRAs individuels.
 
-**Flow** : image source → DA3-LARGE-1.1 (depth map) → mesh 3D → rasterise N depth frames (trajectoire dolly-in GPU) → VAE encode a 0.5× resolution Stage 1 → `VideoConditionByReferenceLatent(downscale_factor=2)` → conditioning Stage 1 uniquement.
+**Flow** : image source → DA3METRIC-LARGE (depth metres + sky mask) → shift lineaire N depth frames (camera_speed_ms m/s) → normalisation per-frame [0,1] → VAE encode a 0.5× resolution Stage 1 → `VideoConditionByReferenceLatent(downscale_factor=2)` → conditioning Stage 1 uniquement.
 
 **Modeles** :
-- `depth-anything/DA3-LARGE-1.1` : estimation profondeur (~1.64GB, offloadable CPU)
+- `depth-anything/DA3METRIC-LARGE` : estimation profondeur metrique + sky segmentation (~1.64GB, offloadable CPU)
 - `Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control` (`ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors`) : IC-LoRA fuse permanent dans transformer (654MB)
 
-**Mecanisme** : le IC-LoRA est fuse une seule fois au demarrage (pas de swap, pas de unfuse). Le `camera_motion` servira a terme a choisir la trajectoire de rendu depth (dolly-in, pan, etc.).
+**Mecanisme** : le IC-LoRA est fuse une seule fois au demarrage (pas de swap, pas de unfuse). Le depth conditioning utilise un shift lineaire des valeurs depth (pas de reprojection 3D). Chaque frame est normalisee individuellement [0,1] (compatible IC-LoRA). Le ciel est masque (sky_mask → max depth).
 
 ## Commits Git (override global)
 
@@ -51,7 +52,7 @@ Le mouvement de camera est controle par depth estimation + IC-LoRA Union Control
 - `start.sh` lance le warmup avec `LD_PRELOAD=""` (desactive tcmalloc sur process ephemere)
 - Checkpoint FP8 scaled (`ltx-2.3-22b-dev-fp8.safetensors`) INCOMPATIBLE avec fusion LoRA → utiliser distilled BF16 + `fp8_cast()`
 - IC-LoRA fuse permanent dans transformer, pas de swap dynamique
-- DA3-LARGE-1.1 : 1.64GB (pas 0.4GB), install depuis GitHub `ByteDance-Seed/depth-anything-3`
+- DA3METRIC-LARGE : ~1.64GB, install depuis GitHub `ByteDance-Seed/depth-anything-3`
 - `VideoConditionByReferenceLatent` : conditioning Stage 1 only, Stage 2 sans depth
 - Depth conditioning ajoute des tokens reference a la sequence d'attention → impact VRAM quadratique
 
@@ -74,9 +75,9 @@ Le mouvement de camera est controle par depth estimation + IC-LoRA Union Control
 | `S3_REGION` | `sbg` | Region S3 |
 | `ENCODE_PRESET` | `veryfast` | Preset x264 (`ultrafast`, `veryfast`, `medium`, etc.) |
 | `ENCODE_CRF` | `23` | CRF qualite (0-51, lower = meilleur) |
-| `DEPTH_LORA` | `1` | IC-LoRA depth control + DA3 estimation (`0` desactive) |
+| `DEPTH_LORA` | `1` | IC-LoRA depth control + DA3METRIC estimation (`0` desactive) |
 | `DEPTH_LORA_STRENGTH` | `1.0` | Strength du VideoConditionByReferenceLatent (0.0-1.0) |
-| `DEPTH_DISPLACEMENT` | `0.05` | Fraction de la profondeur log-normalisee (0.02=subtil, 0.05=modere, 0.1=agressif) |
+| `CAMERA_SPEED_MS` | `0.5` | Vitesse camera defaut en m/s (0.3=subtil, 0.5=modere, 1.0=rapide) |
 
 ## Documentation
 
