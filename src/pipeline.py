@@ -663,6 +663,81 @@ class MedusaPipeline:
         )
         return depth_meters, sky_mask
 
+    @staticmethod
+    def _warp_depth_dolly(
+        depth: torch.Tensor,
+        delta: float,
+        sky_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Forward splatting parallax warp pour dolly-in.
+
+        Chaque pixel se deplace du centre proportionnellement a sa profondeur :
+        scale = d / (d - delta). Les proches bougent plus que les lointains.
+        La focale s'annule dans la derivation (pas besoin d'intrinsics).
+
+        Args:
+            depth: [H, W] profondeur metrique en metres (GPU)
+            delta: deplacement camera en metres (>0 = dolly-in)
+            sky_mask: [H, W] bool (True = ciel, pas warpe)
+
+        Returns:
+            [H, W] depth warpee en metres
+        """
+        if delta < 1e-6:
+            return depth.clone()
+
+        H, W = depth.shape
+        device = depth.device
+        cx, cy = (W - 1) / 2.0, (H - 1) / 2.0
+
+        # Grilles de coordonnees pixels
+        v_grid, u_grid = torch.meshgrid(
+            torch.arange(H, device=device, dtype=torch.float32),
+            torch.arange(W, device=device, dtype=torch.float32),
+            indexing="ij",
+        )
+
+        # Foreground : pas ciel ET pas derriere la camera apres deplacement
+        fg = ~sky_mask & (depth > delta + 0.01)
+
+        # Scale de parallaxe par pixel (proches > 1, lointains ≈ 1)
+        scale = torch.ones(H, W, device=device, dtype=torch.float32)
+        scale[fg] = depth[fg] / (depth[fg] - delta)
+
+        # Nouvelles positions pixels (forward warp)
+        u_new = cx + (u_grid - cx) * scale
+        v_new = cy + (v_grid - cy) * scale
+
+        # Depth apres avancee camera
+        d_new = torch.clamp(depth - delta, min=0.01)
+
+        # Filtrer : foreground + dans les limites de l'image
+        valid = fg & (u_new >= 0) & (u_new < W) & (v_new >= 0) & (v_new < H)
+
+        # Z-buffer splatting (scatter_reduce amin = garder le plus proche)
+        u_idx = torch.round(u_new[valid]).long()
+        v_idx = torch.round(v_new[valid]).long()
+        flat_idx = v_idx * W + u_idx
+        flat_d = d_new[valid]
+
+        output = torch.full((H * W,), float("inf"), device=device, dtype=torch.float32)
+        output.scatter_reduce_(0, flat_idx, flat_d, reduce="amin")
+        output = output.view(H, W)
+
+        # Remplir les trous (zones desoccludees) avec max depth foreground
+        holes = output.isinf()
+        if fg.any():
+            fill_val = depth[fg].max()
+        else:
+            fill_val = depth.max()
+        output[holes] = fill_val
+
+        # Sky → max depth (pixels ciel non warpes)
+        if sky_mask.any():
+            output[sky_mask] = output[~sky_mask].max() if (~sky_mask).any() else fill_val
+
+        return output
+
     def render_depth_sequence(
         self,
         depth_meters: torch.Tensor,
@@ -673,10 +748,11 @@ class MedusaPipeline:
         target_h: int,
         target_w: int,
     ) -> torch.Tensor:
-        """Genere une sequence depth par shift lineaire (sans reprojection).
+        """Genere une sequence depth par parallax warp 2D (forward splatting).
 
-        La camera avance lineairement en Z a camera_speed_ms m/s.
-        Chaque frame est normalisee individuellement [0, 1] (compatible IC-LoRA).
+        La camera avance en Z a camera_speed_ms m/s. Les objets proches
+        se deplacent plus du centre que les lointains (parallaxe).
+        Normalisation per-frame [0,1] (fonctionne car le pattern spatial change).
 
         Args:
             depth_meters: [H, W] profondeur metrique en metres
@@ -689,34 +765,37 @@ class MedusaPipeline:
         Returns:
             [1, 3, F, target_h, target_w] tensor normalise [-1, 1]
         """
-        device = depth_meters.device
-
         # Deplacement total en metres
         duration_s = (num_frames - 1) / frame_rate
         max_displacement = camera_speed_ms * duration_s
+        has_sky = sky_mask.any()
 
         frames = []
         for i in range(num_frames):
             t = i / max(num_frames - 1, 1)
             delta = max_displacement * t
 
-            # Shift depth (dolly-in : objets se rapprochent)
-            depth_frame = depth_meters - delta
+            # Parallax warp 2D (proches bougent plus que lointains)
+            depth_frame = self._warp_depth_dolly(depth_meters, delta, sky_mask)
 
-            # Clamp objets derriere la camera
-            depth_frame = torch.clamp(depth_frame, min=0.01)
+            # Per-frame normalisation [0,1] sur foreground uniquement
+            fg_vals = depth_frame[~sky_mask] if has_sky else depth_frame
+            if fg_vals.numel() > 0:
+                f_min, f_max = fg_vals.min(), fg_vals.max()
+            else:
+                f_min, f_max = depth_frame.min(), depth_frame.max()
+            f_range = f_max - f_min
 
-            # Sky → max depth (evite valeurs incoherentes pour le ciel)
-            if sky_mask.any():
-                depth_frame = torch.where(sky_mask, depth_frame.max(), depth_frame)
-
-            # Per-frame min-max normalisation [0, 1]
-            d_min, d_max = depth_frame.min(), depth_frame.max()
-            if (d_max - d_min) > 1e-6:
-                depth_norm = (depth_frame - d_min) / (d_max - d_min)
+            if f_range > 1e-6:
+                depth_norm = (depth_frame - f_min) / f_range
             else:
                 depth_norm = torch.zeros_like(depth_frame)
 
+            # Ciel → 1.0 (profondeur maximale)
+            if has_sky:
+                depth_norm = torch.where(sky_mask, torch.ones_like(depth_norm), depth_norm)
+
+            depth_norm = torch.clamp(depth_norm, 0.0, 1.0)
             frames.append(depth_norm)
 
         # Stack [F, H, W]

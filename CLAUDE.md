@@ -29,13 +29,13 @@ Voir `src/handler.py` pour le schema complet. Points cles :
 
 Le mouvement de camera est controle par depth estimation metrique + IC-LoRA Union Control, pas par des camera LoRAs individuels.
 
-**Flow** : image source → DA3METRIC-LARGE (depth metres + sky mask) → shift lineaire N depth frames (camera_speed_ms m/s) → normalisation per-frame [0,1] → VAE encode a 0.5× resolution Stage 1 → `VideoConditionByReferenceLatent(downscale_factor=2)` → conditioning Stage 1 uniquement.
+**Flow** : image source → DA3METRIC-LARGE (depth metres + sky mask) → parallax warp 2D N depth frames (forward splatting, camera_speed_ms m/s) → normalisation per-frame [0,1] → VAE encode a 0.5× resolution Stage 1 → `VideoConditionByReferenceLatent(downscale_factor=2)` → conditioning Stage 1 uniquement.
 
 **Modeles** :
 - `depth-anything/DA3METRIC-LARGE` : estimation profondeur metrique + sky segmentation (~1.64GB, offloadable CPU)
 - `Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control` (`ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors`) : IC-LoRA fuse permanent dans transformer (654MB)
 
-**Mecanisme** : le IC-LoRA est fuse une seule fois au demarrage (pas de swap, pas de unfuse). Le depth conditioning utilise un shift lineaire des valeurs depth (pas de reprojection 3D). Chaque frame est normalisee individuellement [0,1] (compatible IC-LoRA). Le ciel est masque (sky_mask → max depth).
+**Mecanisme** : le IC-LoRA est fuse une seule fois au demarrage (pas de swap, pas de unfuse). Le depth conditioning utilise un parallax warp 2D (forward splatting + z-buffer) : scale = d/(d-δ), les objets proches se deplacent plus du centre que les lointains. La focale s'annule dans la formule. Normalisation per-frame [0,1] (fonctionne car le pattern spatial change entre frames). Le ciel n'est pas warpe (sky_mask → 1.0 apres normalisation).
 
 ## Commits Git (override global)
 
