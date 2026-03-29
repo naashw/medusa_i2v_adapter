@@ -302,6 +302,30 @@ class MedusaPipeline:
         except Exception as e:
             log.warning("save_compile_artifacts failed: %s", e)
 
+    def _create_dummy_depth_conditioning(
+        self, stage1_h: int, stage1_w: int, num_frames: int,
+    ) -> ConditioningItem:
+        """Cree un dummy depth conditioning pour le warmup compile.
+
+        Meme shape que create_depth_conditioning() mais sans DA3METRIC —
+        juste un tensor zero de la bonne dimension, VAE-encode, pour que
+        Dynamo compile le graph avec reference latents.
+        """
+        scale = self._depth_downscale_factor
+        ref_h = (stage1_h // scale // 32) * 32
+        ref_w = (stage1_w // scale // 32) * 32
+        # Dummy depth video : [1, 3, F, ref_h, ref_w] float32
+        dummy_video = torch.zeros(
+            1, 3, num_frames, ref_h, ref_w,
+            dtype=torch.float32, device=self.device,
+        )
+        encoded = self._video_encoder(dummy_video)
+        return VideoConditionByReferenceLatent(
+            latent=encoded,
+            downscale_factor=scale,
+            strength=self._depth_lora_strength,
+        )
+
     @torch.inference_mode()
     def warmup_compile(self, num_frames: int = 25, frame_rate: float = 24) -> None:
         """Pre-compile le transformer pour toutes les shapes (720p + 1080p 2-stage, landscape + portrait).
@@ -309,6 +333,9 @@ class MedusaPipeline:
         Lance un forward dummy par resolution pour declencher la compilation
         Dynamo de toutes les variantes attention/shapes. Elimine les recompilations
         couteuses (~30s) du premier job reel.
+
+        Pour les shapes s1, un second forward avec depth conditioning est effectue
+        pour couvrir le chemin IC-LoRA (reference latents → sequence d'attention elargie).
         """
         from PIL import Image
 
@@ -316,6 +343,7 @@ class MedusaPipeline:
         t0_total = time.perf_counter()
 
         transformer = self.get_transformer()
+        depth_enabled = self._depth_lora_enabled and self._depth_model is not None
 
         # Image dummy (blank, sera remplacee par le conditioning latent)
         tmp_path = "/tmp/warmup_compile_dummy.png"
@@ -332,21 +360,22 @@ class MedusaPipeline:
         # audio.enabled=False partout (on ne genere pas d'audio) → un seul chemin Dynamo par shape.
         # Portrait = landscape transpose (memes megapixels, sequences de tokens differentes)
         # Note : 540p (544×960) = meme shape que 1080p-s1, pas de warmup supplementaire
-        configs: list[tuple[str, int, int, torch.Tensor]] = [
+        # is_s1 = True pour les shapes Stage 1 qui recoivent du depth conditioning
+        configs: list[tuple[str, int, int, torch.Tensor, bool]] = [
             # Tier 2 — Standard 720p 2-stage
-            ("720p-s1",              352,  640,  self._sigmas),
-            ("720p-s2",              704,  1280, self._stage2_sigmas),
+            ("720p-s1",              352,  640,  self._sigmas,         True),
+            ("720p-s2",              704,  1280, self._stage2_sigmas,  False),
             # Tier 3 — Production 1080p 2-stage
-            ("1080p-s1",             544,  960,  self._sigmas),
-            ("1080p-s2",             1088, 1920, self._stage2_sigmas),
+            ("1080p-s1",             544,  960,  self._sigmas,         True),
+            ("1080p-s2",             1088, 1920, self._stage2_sigmas,  False),
             # Portrait 9:16
-            ("720p-portrait-s1",     640,  352,  self._sigmas),
-            ("720p-portrait-s2",     1280, 704,  self._stage2_sigmas),
-            ("1080p-portrait-s1",    960,  544,  self._sigmas),
-            ("1080p-portrait-s2",    1920, 1088, self._stage2_sigmas),
+            ("720p-portrait-s1",     640,  352,  self._sigmas,         True),
+            ("720p-portrait-s2",     1280, 704,  self._stage2_sigmas,  False),
+            ("1080p-portrait-s1",    960,  544,  self._sigmas,         True),
+            ("1080p-portrait-s2",    1920, 1088, self._stage2_sigmas,  False),
         ]
 
-        for label, h, w, sigmas in configs:
+        for label, h, w, sigmas, is_s1 in configs:
             t0 = time.perf_counter()
 
             images = [ImageConditioningInput(path=tmp_path, frame_idx=0, strength=1.0)]
@@ -386,6 +415,44 @@ class MedusaPipeline:
 
             del vs, as_, vid_mod, aud_mod, conds
             torch.cuda.empty_cache()
+
+            # Second pass avec depth conditioning pour les shapes s1
+            if is_s1 and depth_enabled:
+                t0_d = time.perf_counter()
+
+                depth_cond = self._create_dummy_depth_conditioning(h, w, num_frames)
+
+                images_d = [ImageConditioningInput(path=tmp_path, frame_idx=0, strength=1.0)]
+                conds_d = image_conditionings_by_replacing_latent(
+                    images=images_d, height=h, width=w,
+                    video_encoder=self._video_encoder,
+                    dtype=self.dtype, device=self.device,
+                )
+                conds_d = conds_d + [depth_cond]
+
+                vs_d, _ = noise_video_state(
+                    output_shape=shape, noiser=noiser, conditionings=conds_d,
+                    components=self._components, dtype=self.dtype, device=self.device,
+                )
+                as_d, _ = noise_audio_state(
+                    output_shape=shape, noiser=noiser, conditionings=[],
+                    components=self._components, dtype=self.dtype, device=self.device,
+                )
+
+                vid_mod_d = modality_from_latent_state(vs_d, v_ctx, sigma, enabled=True)
+                aud_mod_d = modality_from_latent_state(as_d, a_ctx, sigma, enabled=False)
+                vid_mod_d = dataclasses.replace(vid_mod_d, sigma=sigma_b)
+                aud_mod_d = dataclasses.replace(aud_mod_d, sigma=sigma_b)
+
+                torch.compiler.cudagraph_mark_step_begin()
+                transformer(video=vid_mod_d, audio=aud_mod_d, perturbations=None)
+                torch.cuda.synchronize()
+
+                dt_d = time.perf_counter() - t0_d
+                log.info("Warmup %s+depth (%dx%d): %.1fs", label, w, h, dt_d)
+
+                del vs_d, as_d, vid_mod_d, aud_mod_d, conds_d, depth_cond
+                torch.cuda.empty_cache()
 
         try:
             os.unlink(tmp_path)
