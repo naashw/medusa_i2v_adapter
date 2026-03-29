@@ -116,8 +116,6 @@ class MedusaPipeline:
 
         # --- LoRA config ---
         self._lora_dir = os.path.join(models_dir, "loras")
-        self._camera_lora_registry: dict[str, str] = {}
-        self._camera_lora_strength: float = 1.0  # utilise par _load_lora_deltas
 
         # --- Depth IC-LoRA config ---
         self._depth_lora_enabled = os.environ.get("DEPTH_LORA", "1") == "1"
@@ -127,10 +125,6 @@ class MedusaPipeline:
         self._depth_model: torch.nn.Module | None = None
         self._depth_downscale_factor: int = 1  # lu depuis metadata LoRA au chargement
         self._depth_displacement = float(os.environ.get("DEPTH_DISPLACEMENT", "0.07"))
-
-        # Runtime state
-        self._active_lora: str | None = None
-        self._lora_deltas: dict[str, dict[str, torch.Tensor]] = {}
 
         # Embeddings cache (prompt/key -> (video_ctx, audio_ctx))
         self._embeddings_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -492,26 +486,23 @@ class MedusaPipeline:
         return mod
 
     # ------------------------------------------------------------------
-    # Camera LoRA : load / fuse / unfuse / ensure
+    # Depth IC-LoRA : load / fuse
     # ------------------------------------------------------------------
 
-    def _load_lora_deltas(self, name: str) -> None:
-        """Pre-calcule les deltas LoRA (B @ A * strength) pour un camera motion.
+    def _load_lora_deltas(self, name: str, filename: str, strength: float) -> dict[str, torch.Tensor]:
+        """Pre-calcule les deltas LoRA (B @ A * strength).
 
-        Charge le safetensors, renomme les cles si necessaire, et stocke
-        les deltas pre-calcules sur CPU pour fuse/unfuse rapide.
+        Charge le safetensors, renomme les cles si necessaire, et retourne
+        les deltas pre-calcules pour fusion immediate.
         """
-        filename = self._camera_lora_registry.get(name)
-        if not filename:
-            return
         lora_path = os.path.join(self._lora_dir, filename)
         if not os.path.isfile(lora_path):
             log.warning("LoRA '%s' introuvable: %s", name, lora_path)
-            return
+            return {}
 
         log.info(
             "Chargement LoRA '%s': %s (strength=%.2f)",
-            name, filename, self._camera_lora_strength,
+            name, filename, strength,
         )
         raw = load_safetensors(lora_path, device=str(self.device))
 
@@ -549,40 +540,29 @@ class MedusaPipeline:
                 alpha_val = pair["alpha"].item()
                 delta = delta * (alpha_val / rank)
 
-            delta = delta * self._camera_lora_strength
+            delta = delta * strength
             # Prepend velocity_model. pour matcher named_parameters() du X0Model
             deltas[f"velocity_model.{base_key}.weight"] = delta
             del a_tensor, b_tensor
 
         if not deltas:
             log.warning("LoRA '%s': aucun delta compute (format inconnu ?)", name)
-            return
 
-        self._lora_deltas[name] = deltas
         log.info("LoRA '%s': %d parametres affectes", name, len(deltas))
+        return deltas
 
-    def _apply_lora_delta(self, param: torch.nn.Parameter, delta: torch.Tensor, add: bool) -> None:
-        """Applique un delta LoRA in-place, en gerant le dtype (FP8 cast safe).
-
-        Les deltas sont deja sur GPU (meme device que les params).
-        """
+    def _apply_lora_delta(self, param: torch.nn.Parameter, delta: torch.Tensor) -> None:
+        """Applique un delta LoRA in-place (add), en gerant le dtype (FP8 cast safe)."""
         original_dtype = param.data.dtype
         if original_dtype != torch.bfloat16:
             param_bf16 = param.data.to(torch.bfloat16)
-            if add:
-                param_bf16.add_(delta)
-            else:
-                param_bf16.sub_(delta)
+            param_bf16.add_(delta)
             param.data.copy_(param_bf16.to(original_dtype))
         else:
-            if add:
-                param.data.add_(delta)
-            else:
-                param.data.sub_(delta)
+            param.data.add_(delta)
 
-    def _fuse_lora(self, name: str) -> None:
+    def _fuse_lora(self, name: str, deltas: dict[str, torch.Tensor]) -> None:
         """Fuse un LoRA dans le transformer (add deltas in-place)."""
-        deltas = self._lora_deltas.get(name)
         if not deltas:
             return
         transformer = self._get_orig_module()
@@ -590,25 +570,23 @@ class MedusaPipeline:
         applied = 0
         for param_name, delta in deltas.items():
             if param_name in state_dict:
-                self._apply_lora_delta(state_dict[param_name], delta, add=True)
+                self._apply_lora_delta(state_dict[param_name], delta)
                 applied += 1
             elif log.isEnabledFor(logging.DEBUG):
                 log.debug("LoRA fuse skip: %s (pas dans le transformer)", param_name)
         log.info("LoRA '%s' fused: %d/%d params", name, applied, len(deltas))
         if applied == 0 and deltas:
-            # Log les cles attendues vs disponibles pour diagnostic
             expected = list(deltas.keys())[:3]
             available = list(state_dict.keys())[:3]
             log.warning(
                 "LoRA '%s': AUCUN parametre fuse — cles LoRA: %s, transformer: %s",
                 name, expected, available,
             )
-        self._active_lora = name
 
     # --- Depth estimation (DA3) + IC-LoRA conditioning ---
 
     def load_depth_model(self) -> None:
-        """Charge DA3-LARGE-1.1 sur GPU (~0.4GB VRAM)."""
+        """Charge DA3-LARGE-1.1 sur GPU (~1.64GB VRAM)."""
         if not self._depth_lora_enabled:
             return
         da3_path = os.path.join(self.models_dir, "da3-large")
@@ -623,7 +601,7 @@ class MedusaPipeline:
         self._depth_model = DepthAnything3.from_pretrained(da3_path)
         self._depth_model = self._depth_model.to(device=self.device)
         dt = time.perf_counter() - t0
-        log.info("DA3-LARGE-1.1 charge en %.1fs (VRAM ~0.4GB)", dt)
+        log.info("DA3-LARGE-1.1 charge en %.1fs (VRAM ~1.64GB)", dt)
 
         # Lire reference_downscale_factor depuis metadata du LoRA
         lora_path = os.path.join(self._lora_dir, self._depth_lora_file)
@@ -912,12 +890,11 @@ class MedusaPipeline:
 
         # --- Depth IC-LoRA ---
         if self._depth_lora_enabled:
-            self._camera_lora_registry[self._depth_lora_name] = self._depth_lora_file
-            orig_strength = self._camera_lora_strength
-            self._camera_lora_strength = self._depth_lora_strength
-            self._load_lora_deltas(self._depth_lora_name)
-            self._camera_lora_strength = orig_strength
-            self._fuse_lora(self._depth_lora_name)
+            deltas = self._load_lora_deltas(
+                self._depth_lora_name, self._depth_lora_file, self._depth_lora_strength,
+            )
+            self._fuse_lora(self._depth_lora_name, deltas)
+            del deltas
 
         # torch.compile sur les blocs transformer
         if os.environ.get("TORCH_COMPILE", "1") == "1":

@@ -32,9 +32,9 @@ Le mouvement de camera est controle par depth estimation + IC-LoRA Union Control
 
 **Modeles** :
 - `depth-anything/DA3-LARGE-1.1` : estimation profondeur (~1.64GB, offloadable CPU)
-- `Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control` : IC-LoRA fuse permanent dans transformer (654MB)
+- `Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control` (`ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors`) : IC-LoRA fuse permanent dans transformer (654MB)
 
-**Mecanisme** : le IC-LoRA reste fuse en permanence (pas de swap). `ensure_lora()` est un no-op. Le `camera_motion` servira a terme a choisir la trajectoire de rendu depth (dolly-in, pan, etc.).
+**Mecanisme** : le IC-LoRA est fuse une seule fois au demarrage (pas de swap, pas de unfuse). Le `camera_motion` servira a terme a choisir la trajectoire de rendu depth (dolly-in, pan, etc.).
 
 ## Commits Git (override global)
 
@@ -66,12 +66,12 @@ Le mouvement de camera est controle par depth estimation + IC-LoRA Union Control
 | `TRANSFORMER_CACHE` | `1` | Cache transformer pre-fusionne sur volume |
 | `SAMPLER` | `euler` | `res2s` pour Res2sDiffusionStep (second ordre) |
 | `VAE_TILING` | `0` | Tiled VAE decode (reduit VRAM 1080p, risque ghosting) |
-| `BATCH_SIZE` | `5` | Max items par sub-batch denoising |
 | `MAX_BATCH` | `9` | Plafond items par sub-batch handler |
 | `CLEAN_OLD_CACHE` | `1` | Purge cache inductor/triton/artifacts des builds precedents au demarrage (`0` desactive) |
 | `LOG_LEVEL` | `info` | `debug` active les logs Inductor verbose |
 | `S3_BUCKET` | _(vide)_ | Active S3 upload OVH si defini |
-| `S3_ENDPOINT_URL` | OVH SBG | Endpoint S3 |
+| `S3_ENDPOINT_URL` | `https://s3.sbg.io.cloud.ovh.net` | Endpoint S3 |
+| `S3_REGION` | `sbg` | Region S3 |
 | `ENCODE_PRESET` | `veryfast` | Preset x264 (`ultrafast`, `veryfast`, `medium`, etc.) |
 | `ENCODE_CRF` | `23` | CRF qualite (0-51, lower = meilleur) |
 | `DEPTH_LORA` | `1` | IC-LoRA depth control + DA3 estimation (`0` desactive) |
@@ -88,7 +88,7 @@ Le mouvement de camera est controle par depth estimation + IC-LoRA Union Control
 ## Conventions
 
 - Prefixe output : `medusa_i2v`
-- Reponse API : `images[]` avec `s3_key`, `volume_path`, `s3_url`, `id`
+- Reponse API : `images[]` avec `filename`, `content_type`, `size_mb`, `s3_key`, `s3_url` (si S3), `volume_path` (si volume), `id` (si fourni)
 - Output videos : `/runpod-volume/output/{job_id}/`
 - S3 path : `generated/videos/{filename}`
 - Caches volume : `cache/dedup/`, `cache/embeddings/`, `cache/transformer/`, `cache/inductor/{build_hash}/`, `cache/triton/`
