@@ -314,10 +314,10 @@ class MedusaPipeline:
         scale = self._depth_downscale_factor
         ref_h = (stage1_h // scale // 32) * 32
         ref_w = (stage1_w // scale // 32) * 32
-        # Dummy depth video : [1, 3, F, ref_h, ref_w] float32
+        # Dummy depth video : [1, 3, F, ref_h, ref_w] meme dtype que le VAE encoder
         dummy_video = torch.zeros(
             1, 3, num_frames, ref_h, ref_w,
-            dtype=torch.float32, device=self.device,
+            dtype=self.dtype, device=self.device,
         )
         encoded = self._video_encoder(dummy_video)
         return VideoConditionByReferenceLatent(
