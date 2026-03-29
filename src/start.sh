@@ -262,6 +262,7 @@ for p in sys.argv[1:]:
     "${MODELS_DIR}/checkpoints/ltx-2.3-22b-distilled.safetensors" \
     "${MODELS_DIR}/upscalers/ltx-2.3-spatial-upscaler-x2-1.0.safetensors" \
     "${MODELS_DIR}/upscalers/ltx-2.3-temporal-upscaler-x2-1.0.safetensors" \
+    "${MODELS_DIR}/loras/ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors" \
     2>/dev/null || true)
 
 # --- Checkpoint distilled BF16 (~46GB) — le plus gros, echouer tot ---
