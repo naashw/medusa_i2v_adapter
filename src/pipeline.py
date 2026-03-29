@@ -715,8 +715,8 @@ class MedusaPipeline:
         valid = fg & (u_new >= 0) & (u_new < W) & (v_new >= 0) & (v_new < H)
 
         # Z-buffer splatting (scatter_reduce amin = garder le plus proche)
-        u_idx = torch.round(u_new[valid]).long()
-        v_idx = torch.round(v_new[valid]).long()
+        u_idx = torch.clamp(torch.round(u_new[valid]).long(), 0, W - 1)
+        v_idx = torch.clamp(torch.round(v_new[valid]).long(), 0, H - 1)
         flat_idx = v_idx * W + u_idx
         flat_d = d_new[valid]
 
