@@ -633,12 +633,16 @@ class MedusaPipeline:
             depth_raw = torch.from_numpy(depth_raw)
         depth_raw = depth_raw.to(device=self.device, dtype=torch.float32)
 
-        # Intrinsics [1, 3, 3] → focale moyenne
+        # Intrinsics [1, 3, 3] → focale moyenne (fallback: max(H,W))
         intrinsics = prediction.intrinsics
-        if not isinstance(intrinsics, torch.Tensor):
-            intrinsics = torch.from_numpy(intrinsics)
-        intrinsics = intrinsics.to(device=self.device, dtype=torch.float32)
-        focal = (intrinsics[0, 0, 0] + intrinsics[0, 1, 1]) / 2.0
+        if intrinsics is not None:
+            if not isinstance(intrinsics, torch.Tensor):
+                intrinsics = torch.from_numpy(intrinsics)
+            intrinsics = intrinsics.to(device=self.device, dtype=torch.float32)
+            focal = (intrinsics[0, 0, 0] + intrinsics[0, 1, 1]) / 2.0
+        else:
+            focal = float(max(depth_raw.shape[-2], depth_raw.shape[-1]))
+            log.warning("DA3METRIC: intrinsics=None, fallback focal=%.0f px", focal)
 
         # Conversion en metres : depth_meters = focal * depth_raw / 300.0
         depth_meters = focal * depth_raw / 300.0
