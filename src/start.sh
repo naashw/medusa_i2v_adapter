@@ -214,6 +214,7 @@ download_model() {
         fi
     fi
 
+    mkdir -p "$dest_dir"
     local disk_avail mem_avail
     disk_avail=$(df -h "$dest_dir" | awk 'NR==2{print $4}')
     mem_avail=$(awk '/MemAvailable/{printf "%.0fM", $2/1024}' /proc/meminfo 2>/dev/null || echo "?")
