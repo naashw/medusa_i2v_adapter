@@ -124,7 +124,7 @@ class MedusaPipeline:
         self._depth_lora_file = "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"
         self._depth_model: torch.nn.Module | None = None
         self._depth_downscale_factor: int = 1  # lu depuis metadata LoRA au chargement
-        self._depth_displacement = float(os.environ.get("DEPTH_DISPLACEMENT", "0.07"))
+        self._depth_displacement = float(os.environ.get("DEPTH_DISPLACEMENT", "0.05"))
 
         # Embeddings cache (prompt/key -> (video_ctx, audio_ctx))
         self._embeddings_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -644,7 +644,7 @@ class MedusaPipeline:
         Args:
             depth: [H, W] float32 depth map (valeurs relatives)
             num_frames: nombre de frames (ex: 49)
-            total_displacement: deplacement relatif camera (fraction du depth range)
+            total_displacement: deplacement relatif camera (fraction du point le plus proche)
             target_h: hauteur cible (0.5× Stage 1, multiple de 32)
             target_w: largeur cible (0.5× Stage 1, multiple de 32)
 
@@ -654,10 +654,12 @@ class MedusaPipeline:
         H, W = depth.shape
         device = depth.device
 
-        # Normaliser depth en [0, 1] pour calculs relatifs
-        d_min, d_max = depth.min(), depth.max()
-        if d_max - d_min > 1e-6:
-            depth_norm = (depth - d_min) / (d_max - d_min)
+        # Normalisation logarithmique : etale les profondeurs perceptuellement
+        depth_safe = depth.clamp(min=1e-6)
+        log_depth = torch.log(depth_safe)
+        ld_min, ld_max = log_depth.min(), log_depth.max()
+        if ld_max - ld_min > 1e-6:
+            depth_norm = (log_depth - ld_min) / (ld_max - ld_min)
         else:
             depth_norm = torch.zeros_like(depth)
 
@@ -677,8 +679,8 @@ class MedusaPipeline:
         X = (u_coords - cx) * Z / fx
         Y = (v_coords - cy) * Z / fy
 
-        # Deplacement total en unites de profondeur
-        max_dz = total_displacement * (d_max - d_min).item() if (d_max - d_min) > 1e-6 else total_displacement
+        # Deplacement direct en espace log-normalise
+        max_dz = total_displacement
 
         frames = []
         for t in range(num_frames):
