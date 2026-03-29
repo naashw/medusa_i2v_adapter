@@ -203,7 +203,7 @@ class MedusaPipeline:
         log.info("Chargement video decoder (persistent)...")
         self._video_decoder = self._base_ledger.video_decoder()
         if os.environ.get("VAE_COMPILE", "1") == "1":
-            vae_dynamic = os.environ.get("DYNAMIC_COMPILE", "0") == "1"
+            vae_dynamic = os.environ.get("VAE_DYNAMIC_COMPILE", os.environ.get("DYNAMIC_COMPILE", "0")) == "1"
             log.info("torch.compile video decoder (mode=default, dynamic=%s)...", vae_dynamic)
             self._video_decoder = torch.compile(
                 self._video_decoder, mode="default", fullgraph=False, dynamic=vae_dynamic,
