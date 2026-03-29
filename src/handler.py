@@ -212,7 +212,7 @@ def collect_output(source_file: str, job_id: str) -> dict:
 
 # --- Post-processing pool (MP4 encode + S3 upload en parallele du GPU) ---
 
-postprocess_pool = ThreadPoolExecutor(max_workers=MAX_BATCH)
+postprocess_pool = ThreadPoolExecutor(max_workers=5)
 
 
 def postprocess_and_upload(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from collections.abc import Iterator
 
@@ -14,6 +15,9 @@ log = logging.getLogger("video_encoder")
 
 ENCODE_PRESET = os.environ.get("ENCODE_PRESET", "veryfast")
 ENCODE_CRF = os.environ.get("ENCODE_CRF", "23")
+
+# PyAV/libx264 n'est pas thread-safe pour encode/cleanup concurrent
+_encode_lock = threading.Lock()
 
 
 def encode_video_fast(
@@ -36,32 +40,33 @@ def encode_video_fast(
     first_chunk = next(video)
     _, height, width, _ = first_chunk.shape
 
-    container = av.open(output_path, mode="w")
-    stream = container.add_stream(
-        "libx264",
-        rate=int(fps),
-        options={"preset": ENCODE_PRESET, "crf": ENCODE_CRF},
-    )
-    stream.width = width
-    stream.height = height
-    stream.pix_fmt = "yuv420p"
+    with _encode_lock:
+        container = av.open(output_path, mode="w")
+        stream = container.add_stream(
+            "libx264",
+            rate=int(fps),
+            options={"preset": ENCODE_PRESET, "crf": ENCODE_CRF},
+        )
+        stream.width = width
+        stream.height = height
+        stream.pix_fmt = "yuv420p"
 
-    def _write_chunk(chunk: torch.Tensor) -> None:
-        chunk_np = chunk.to("cpu").numpy()
-        for frame_array in chunk_np:
-            frame = av.VideoFrame.from_ndarray(frame_array, format="rgb24")
-            for packet in stream.encode(frame):
-                container.mux(packet)
+        def _write_chunk(chunk: torch.Tensor) -> None:
+            chunk_np = chunk.to("cpu").numpy()
+            for frame_array in chunk_np:
+                frame = av.VideoFrame.from_ndarray(frame_array, format="rgb24")
+                for packet in stream.encode(frame):
+                    container.mux(packet)
 
-    _write_chunk(first_chunk)
-    for chunk in video:
-        _write_chunk(chunk)
+        _write_chunk(first_chunk)
+        for chunk in video:
+            _write_chunk(chunk)
 
-    # Flush encoder
-    for packet in stream.encode():
-        container.mux(packet)
+        # Flush encoder
+        for packet in stream.encode():
+            container.mux(packet)
 
-    container.close()
+        container.close()
 
     elapsed = time.perf_counter() - t0
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
