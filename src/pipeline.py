@@ -1486,9 +1486,9 @@ class MedusaPipeline:
                     device=self.device,
                 )
 
-                # IC-LoRA conditionings (depth) — Stage 1 only
+                # IC-LoRA conditionings (depth) — per-item, Stage 1 only
                 if extra_conditionings:
-                    conds_i = conds_i + extra_conditionings
+                    conds_i = conds_i + [extra_conditionings[i]]
 
                 shape_i = VideoPixelShape(
                     batch=1, frames=num_frames, width=w, height=h, fps=frame_rate,
@@ -1607,15 +1607,18 @@ class MedusaPipeline:
             # --- 2-stage batch pipeline ---
             half_h, half_w = height // 2, width // 2
 
-            # IC-LoRA depth conditioning (Stage 1 only)
+            # IC-LoRA depth conditioning per-item (Stage 1 only)
             depth_conds: list[ConditioningItem] | None = None
             if self._depth_lora_enabled and self._depth_model is not None:
-                camera_speed = items[0].get("camera_speed_ms", self._camera_speed_ms_default)
-                depth_cond = self.create_depth_conditioning(
-                    items[0]["image_path"], half_h, half_w, num_frames,
-                    frame_rate=frame_rate, camera_speed_ms=camera_speed,
-                )
-                depth_conds = [depth_cond]
+                t0_depth = time.perf_counter()
+                depth_conds = []
+                for item in items:
+                    camera_speed = item.get("camera_speed_ms", self._camera_speed_ms_default)
+                    depth_conds.append(self.create_depth_conditioning(
+                        item["image_path"], half_h, half_w, num_frames,
+                        frame_rate=frame_rate, camera_speed_ms=camera_speed,
+                    ))
+                log.info("Depth conditioning: %d items (%.1fs)", len(depth_conds), time.perf_counter() - t0_depth)
 
             # Stage 1 — half-res batch denoise
             log.info("Batch Stage 1: denoise %dx%d (half-res, 8 steps)...", half_w, half_h)
@@ -1690,15 +1693,18 @@ class MedusaPipeline:
 
         else:
             # --- 1-stage batch pipeline ---
-            # IC-LoRA depth conditioning
+            # IC-LoRA depth conditioning per-item
             depth_conds_1s: list[ConditioningItem] | None = None
             if self._depth_lora_enabled and self._depth_model is not None:
-                camera_speed = items[0].get("camera_speed_ms", self._camera_speed_ms_default)
-                depth_cond_1s = self.create_depth_conditioning(
-                    items[0]["image_path"], height, width, num_frames,
-                    frame_rate=frame_rate, camera_speed_ms=camera_speed,
-                )
-                depth_conds_1s = [depth_cond_1s]
+                t0_depth = time.perf_counter()
+                depth_conds_1s = []
+                for item in items:
+                    camera_speed = item.get("camera_speed_ms", self._camera_speed_ms_default)
+                    depth_conds_1s.append(self.create_depth_conditioning(
+                        item["image_path"], height, width, num_frames,
+                        frame_rate=frame_rate, camera_speed_ms=camera_speed,
+                    ))
+                log.info("Depth conditioning: %d items (%.1fs)", len(depth_conds_1s), time.perf_counter() - t0_depth)
 
             log.info("Batch 1-stage: denoise %dx%d (8 steps)...", width, height)
             batched_video, batched_audio, (vtools, atools) = create_batched_states(
