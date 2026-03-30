@@ -319,6 +319,7 @@ def normalize_items(job_input: dict) -> tuple[list[dict], str | None]:
 # --- Handler ---
 
 pipeline: MedusaPipeline | None = None
+_completed_jobs: set[str] = set()
 
 
 def handler(job: dict) -> dict:
@@ -335,6 +336,15 @@ def handler(job: dict) -> dict:
     global pipeline
 
     job_id = job.get("id", f"unknown-{int(time.time())}")
+
+    # Guard idempotence : RunPod SDK 1.8.2 re-delivre le meme job ~1s apres completion
+    if job_id in _completed_jobs:
+        log.warning("Job %s deja traite — skip (double delivery RunPod)", job_id)
+        return {"images": [], "skipped": True, "reason": "duplicate"}
+    _completed_jobs.add(job_id)
+    if len(_completed_jobs) > 1000:
+        _completed_jobs.clear()
+
     job_input = job.get("input", {})
 
     log.info("Job %s — input: %s", job_id, json.dumps(job_input, default=str))
