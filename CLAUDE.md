@@ -63,7 +63,10 @@ Le mouvement de camera est controle par depth estimation metrique + IC-LoRA Unio
 | `TORCH_COMPILE` | `1` | torch.compile transformer (`0` desactive) |
 | `VAE_COMPILE` | `1` | torch.compile VAE decoder (`0` desactive) |
 | `COMPILE_MODE` | `default` | `default`, `reduce-overhead`, `max-autotune`, `max-autotune-no-cudagraphs` |
+| `FULLGRAPH` | `1` | `1` active fullgraph torch.compile (graphe complet sans breaks, CUDAGraphs compatible) |
 | `DYNAMIC_COMPILE` | `0` | `1` active dynamic shapes transformer (defaut: static, optimal pour 8 shapes fixes) |
+| `VAE_COMPILE_MODE` | `COMPILE_MODE` | Mode compile VAE independant. Fallback sur `COMPILE_MODE` |
+| `VAE_FULLGRAPH` | `FULLGRAPH` | Fullgraph VAE independant. Fallback sur `FULLGRAPH` |
 | `VAE_DYNAMIC_COMPILE` | `DYNAMIC_COMPILE` | `1` active dynamic shapes VAE decoder independamment du transformer. Fallback sur `DYNAMIC_COMPILE` |
 | `TRANSFORMER_CACHE` | `1` | Cache transformer pre-fusionne sur volume |
 | `SAMPLER` | `euler` | `res2s` pour Res2sDiffusionStep (second ordre) |

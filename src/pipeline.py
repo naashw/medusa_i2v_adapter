@@ -302,9 +302,11 @@ class MedusaPipeline:
         self._video_decoder = self._build_model(VideoDecoderConfigurator, VAE_DECODER_COMFY_KEYS_FILTER)
         if os.environ.get("VAE_COMPILE", "1") == "1":
             vae_dynamic = os.environ.get("VAE_DYNAMIC_COMPILE", os.environ.get("DYNAMIC_COMPILE", "0")) == "1"
-            log.info("torch.compile video decoder (mode=default, dynamic=%s)...", vae_dynamic)
+            vae_fullgraph = os.environ.get("VAE_FULLGRAPH", os.environ.get("FULLGRAPH", "1")) == "1"
+            vae_mode = os.environ.get("VAE_COMPILE_MODE", os.environ.get("COMPILE_MODE", "default"))
+            log.info("torch.compile video decoder (mode=%s, fullgraph=%s, dynamic=%s)...", vae_mode, vae_fullgraph, vae_dynamic)
             self._video_decoder = torch.compile(
-                self._video_decoder, mode="default", fullgraph=False, dynamic=vae_dynamic,
+                self._video_decoder, mode=vae_mode, fullgraph=vae_fullgraph, dynamic=vae_dynamic,
             )
         self._log_vram("apres video decoder")
 
@@ -1203,13 +1205,15 @@ class MedusaPipeline:
             if compile_mode not in valid_modes:
                 log.warning("COMPILE_MODE=%s invalide, fallback default", compile_mode)
                 compile_mode = "default"
+            fullgraph = os.environ.get("FULLGRAPH", "1") == "1"
             blocks = self._transformer.velocity_model.transformer_blocks
-            log.info("torch.compile regional: %d blocs (mode=%s, dynamic=%s)...", len(blocks), compile_mode, dynamic_compile)
+            log.info("torch.compile regional: %d blocs (mode=%s, fullgraph=%s, dynamic=%s)...",
+                     len(blocks), compile_mode, fullgraph, dynamic_compile)
             for i, block in enumerate(blocks):
                 blocks[i] = torch.compile(
                     block,
                     mode=compile_mode,
-                    fullgraph=False,
+                    fullgraph=fullgraph,
                     dynamic=dynamic_compile,
                 )
 
