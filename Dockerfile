@@ -37,10 +37,10 @@ ENV PATH="/opt/venv/bin:$PATH" \
     VIRTUAL_ENV="/opt/venv"
 
 # --- PyTorch stable (CUDA 12.8) ---
-# Pin >=2.9,<3 : support torch.compile dynamic
+# Pin >=2.11,<3 : cuDNN Fused Flash Attention H100, combo-kernels Inductor
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir \
-        "torch>=2.9,<3" torchvision torchaudio \
+        "torch>=2.11,<3" torchvision torchaudio \
         --index-url https://download.pytorch.org/whl/cu128 \
         --extra-index-url https://pypi.org/simple/
 
