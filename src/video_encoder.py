@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import threading
@@ -41,32 +42,41 @@ def encode_video_fast(
     _, height, width, _ = first_chunk.shape
 
     with _encode_lock:
+        stream = None
         container = av.open(output_path, mode="w")
-        stream = container.add_stream(
-            "libx264",
-            rate=int(fps),
-            options={"preset": ENCODE_PRESET, "crf": ENCODE_CRF},
-        )
-        stream.width = width
-        stream.height = height
-        stream.pix_fmt = "yuv420p"
+        try:
+            stream = container.add_stream(
+                "libx264",
+                rate=int(fps),
+                options={"preset": ENCODE_PRESET, "crf": ENCODE_CRF},
+            )
+            stream.width = width
+            stream.height = height
+            stream.pix_fmt = "yuv420p"
 
-        def _write_chunk(chunk: torch.Tensor) -> None:
-            chunk_np = chunk.to("cpu").numpy()
+            chunk_np = first_chunk.to("cpu").numpy()
             for frame_array in chunk_np:
                 frame = av.VideoFrame.from_ndarray(frame_array, format="rgb24")
                 for packet in stream.encode(frame):
                     container.mux(packet)
 
-        _write_chunk(first_chunk)
-        for chunk in video:
-            _write_chunk(chunk)
+            for chunk in video:
+                chunk_np = chunk.to("cpu").numpy()
+                for frame_array in chunk_np:
+                    frame = av.VideoFrame.from_ndarray(frame_array, format="rgb24")
+                    for packet in stream.encode(frame):
+                        container.mux(packet)
 
-        # Flush encoder
-        for packet in stream.encode():
-            container.mux(packet)
-
-        container.close()
+            # Flush encoder
+            for packet in stream.encode():
+                container.mux(packet)
+        finally:
+            container.close()
+            # Casser le cycle stream↔container pour eviter que le GC cyclique
+            # ne detruise les objets C de PyAV dans un ordre arbitraire en idle
+            # (cause: abort dans avpriv_slicethread_free/pthread_cond_destroy)
+            del stream, container
+            gc.collect()
 
     elapsed = time.perf_counter() - t0
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
