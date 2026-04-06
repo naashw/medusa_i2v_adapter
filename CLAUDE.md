@@ -10,7 +10,7 @@ Inference directe Python, sans ComfyUI. Output H264 MP4, 3 tiers : 540p (1-stage
 | Composant | Version | Contraintes |
 |-----------|---------|-------------|
 | PyTorch | >=2.11 (cu128) | cuDNN Fused Flash Attention H100 |
-| ltx-core + ltx-pipelines | commit `9e8a28e` | |
+| ltx-core + ltx-pipelines | commit `59ca828` | Blocs lifecycle, Fp8CastLinear, layer streaming |
 | transformers | >=4.57, **<5.0** | v5 restructure API RoPE Gemma3 (breaking) |
 | SDPA | cuDNN Fused Flash Attention | Natif PyTorch, H100 sm_90 |
 | Docker | Multi-stage cuda:12.8.1 | devel builder -> runtime |

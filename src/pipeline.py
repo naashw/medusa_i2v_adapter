@@ -36,31 +36,37 @@ from safetensors.torch import save_file as save_safetensors
 
 from ltx_core.components.diffusion_steps import EulerDiffusionStep, Res2sDiffusionStep
 from ltx_core.components.noisers import GaussianNoiser
+from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.conditioning import (
     ConditioningItem,
     VideoConditionByReferenceLatent,
 )
-from ltx_core.model.upsampler import upsample_video
-from ltx_core.model.video_vae import TilingConfig, decode_video as vae_decode_video
+from ltx_core.loader.sd_ops import SDOps
+from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
+from ltx_core.model.transformer import LTXModelConfigurator, LTXV_MODEL_COMFY_RENAMING_MAP, X0Model
+from ltx_core.model.upsampler import LatentUpsamplerConfigurator, upsample_video
+from ltx_core.model.video_vae import (
+    TilingConfig,
+    VideoDecoderConfigurator,
+    VideoEncoderConfigurator,
+    VAE_DECODER_COMFY_KEYS_FILTER,
+    VAE_ENCODER_COMFY_KEYS_FILTER,
+)
+from ltx_core.quantization import QuantizationPolicy
+from ltx_core.tools import AudioLatentTools, VideoLatentTools
+from ltx_core.types import AudioLatentShape, LatentState, VideoLatentShape, VideoPixelShape
 
-from ltx_core.types import LatentState, VideoPixelShape
-from ltx_pipelines.utils import ModelLedger
 from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
 from ltx_pipelines.utils.args import ImageConditioningInput
 from ltx_pipelines.utils.helpers import (
     cleanup_memory,
-    denoise_audio_video,
-    encode_prompts,
+    create_noised_state,
     image_conditionings_by_replacing_latent,
     modality_from_latent_state,
-    noise_audio_state,
-    noise_video_state,
 )
 from ltx_pipelines.utils.samplers import euler_denoising_loop
 from video_encoder import encode_video_fast
-from ltx_pipelines.utils.types import PipelineComponents
-from ltx_core.quantization import QuantizationPolicy
 
 from prompts import CAMERA_PRESETS, DEFAULT_NEGATIVE_PROMPT
 
@@ -73,6 +79,95 @@ if torch.cuda.is_available():
 
 # Version du cache transformer (incrementer pour invalider tous les caches existants)
 CACHE_VERSION = "v4"
+
+
+class _MedusaDenoiser:
+    """Denoiser sans guidance (CFG=1, STG=0) compatible protocol Denoiser LTX-2.
+
+    Encapsule les embeddings video/audio et appelle le transformer directement.
+    Logs VRAM et timing au step 0, warning si recompilation detectee.
+    """
+
+    def __init__(self, v_context: torch.Tensor, a_context: torch.Tensor) -> None:
+        self.v_context = v_context
+        self.a_context = a_context
+
+    def __call__(
+        self,
+        transformer: torch.nn.Module,
+        video_state: LatentState | None,
+        audio_state: LatentState | None,
+        sigmas: torch.Tensor,
+        step_index: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        t0 = time.perf_counter()
+        sigma = sigmas[step_index]
+        vid_mod = modality_from_latent_state(video_state, self.v_context, sigma, enabled=True)
+        aud_mod = modality_from_latent_state(audio_state, self.a_context, sigma, enabled=False)
+        torch.compiler.cudagraph_mark_step_begin()
+        result = transformer(video=vid_mod, audio=aud_mod, perturbations=None)
+        torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+        if step_index == 0:
+            alloc = torch.cuda.memory_allocated() / 2**30
+            rsvd = torch.cuda.memory_reserved() / 2**30
+            log.info("step %d: %.2fs (sigma=%.4f) VRAM %.2fGB alloc %.2fGB rsvd",
+                     step_index, dt, sigma.item(), alloc, rsvd)
+        else:
+            log.debug("step %d: %.2fs (sigma=%.4f)", step_index, dt, sigma.item())
+        if dt > 10.0:
+            log.warning("step %d took %.1fs — possible Dynamo recompilation", step_index, dt)
+        return result
+
+
+class _MedusaBatchDenoiser:
+    """Denoiser batch — expand sigma pour batch_size > 1.
+
+    Logs VRAM, timing et Inductor cache counters au step 0.
+    """
+
+    def __init__(self, v_context: torch.Tensor, a_context: torch.Tensor, batch_size: int) -> None:
+        self.v_context = v_context
+        self.a_context = a_context
+        self.batch_size = batch_size
+
+    def __call__(
+        self,
+        transformer: torch.nn.Module,
+        video_state: LatentState | None,
+        audio_state: LatentState | None,
+        sigmas: torch.Tensor,
+        step_index: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        t0 = time.perf_counter()
+        sigma = sigmas[step_index]
+        vid_mod = modality_from_latent_state(video_state, self.v_context, sigma, enabled=True)
+        aud_mod = modality_from_latent_state(audio_state, self.a_context, sigma, enabled=False)
+        sigma_b = sigma.unsqueeze(0).expand(self.batch_size)
+        vid_mod = dataclasses.replace(vid_mod, sigma=sigma_b)
+        aud_mod = dataclasses.replace(aud_mod, sigma=sigma_b)
+        torch.compiler.cudagraph_mark_step_begin()
+        result = transformer(video=vid_mod, audio=aud_mod, perturbations=None)
+        torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+        if step_index == 0:
+            alloc = torch.cuda.memory_allocated() / 2**30
+            rsvd = torch.cuda.memory_reserved() / 2**30
+            log.info("batch step %d: %.2fs (sigma=%.4f) VRAM %.2fGB alloc %.2fGB rsvd",
+                     step_index, dt, sigma.item(), alloc, rsvd)
+            try:
+                from torch._dynamo.utils import counters
+                cache_counters = {k: v for k, v in counters["inductor"].items()
+                                  if "cache" in k.lower() or "autograd" in k.lower()}
+                if cache_counters:
+                    log.info("Inductor cache counters: %s", cache_counters)
+            except Exception:
+                pass
+        else:
+            log.debug("batch step %d: %.2fs (sigma=%.4f)", step_index, dt, sigma.item())
+        if dt > 10.0:
+            log.warning("batch step %d took %.1fs — possible Dynamo recompilation", step_index, dt)
+        return result
 
 
 class MedusaPipeline:
@@ -90,17 +185,6 @@ class MedusaPipeline:
         self._gemma_root = os.path.join(models_dir, "text_encoders", "gemma-3-12b-it")
         self._upsampler_path = os.path.join(models_dir, "upscalers", "ltx-2.3-spatial-upscaler-x2-1.0.safetensors")
         self._temporal_upsampler_path = os.path.join(models_dir, "upscalers", "ltx-2.3-temporal-upscaler-x2-1.0.safetensors")
-
-        # Pipeline components (patchifiers + scale factors)
-        self._components = PipelineComponents(dtype=self.dtype, device=self.device)
-
-        # Base ModelLedger SANS quantization — pour video_encoder, video_decoder (VAE) et spatial upsampler
-        self._base_ledger = ModelLedger(
-            dtype=self.dtype,
-            device=self.device,
-            checkpoint_path=self._checkpoint_path,
-            spatial_upsampler_path=self._upsampler_path,
-        )
 
         # Video encoder (persistent en VRAM)
         self._video_encoder: torch.nn.Module | None = None
@@ -141,6 +225,18 @@ class MedusaPipeline:
             STAGE_2_DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=self.device
         )
 
+    def _encode_prompts_with_gemma(self, prompts: list[str]) -> list:
+        """Encode prompts via PromptEncoder block (load Gemma → encode → free)."""
+        from ltx_pipelines.utils.blocks import PromptEncoder
+
+        encoder = PromptEncoder(
+            checkpoint_path=self._checkpoint_path,
+            gemma_root=self._gemma_root,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        return encoder(prompts)
+
     def warmup_embeddings(self, cache_dir: str) -> None:
         """Charge les embeddings depuis cache disque (genere par warmup_embeddings.py).
 
@@ -161,21 +257,12 @@ class MedusaPipeline:
 
         log.info("Pas de cache embeddings — generation avec text encoder sur GPU...")
 
-        # Creer un ledger dedie au text encoder
-        te_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        cpu_ledger = ModelLedger(
-            dtype=self.dtype,
-            device=te_device,
-            checkpoint_path=self._checkpoint_path,
-            gemma_root_path=self._gemma_root,
-        )
-
         # Encoder tous les prompts : 7 presets camera + 1 negative
         all_prompts = list(CAMERA_PRESETS.values()) + [DEFAULT_NEGATIVE_PROMPT]
         all_keys = list(CAMERA_PRESETS.keys()) + ["_negative"]
 
         log.info("Encoding %d prompts...", len(all_prompts))
-        results = encode_prompts(all_prompts, cpu_ledger)
+        results = self._encode_prompts_with_gemma(all_prompts)
 
         # Construire le cache
         cache_data: dict[str, dict[str, torch.Tensor]] = {}
@@ -189,19 +276,30 @@ class MedusaPipeline:
         torch.save(cache_data, cache_path)
         log.info("Embeddings sauvegardes: %s (%d prompts)", cache_path, len(cache_data))
 
-        del cpu_ledger
-        cleanup_memory()
+    def _build_model(
+        self,
+        configurator: type,
+        sd_ops: SDOps | None = None,
+        path: str | None = None,
+    ) -> torch.nn.Module:
+        """Build un modele avec SingleGPUModelBuilder (persistent en VRAM)."""
+        builder = SingleGPUModelBuilder(
+            model_path=path or self._checkpoint_path,
+            model_class_configurator=configurator,
+            model_sd_ops=sd_ops,
+        )
+        return builder.build(device=self.device, dtype=self.dtype).eval()
 
     def load_video_encoder(self) -> None:
         """Charge le video encoder en VRAM (~1GB). Appeler apres warmup_embeddings."""
         log.info("Chargement video encoder (persistent)...")
-        self._video_encoder = self._base_ledger.video_encoder()
+        self._video_encoder = self._build_model(VideoEncoderConfigurator, VAE_ENCODER_COMFY_KEYS_FILTER)
         self._log_vram("apres video encoder")
 
     def load_video_decoder(self) -> None:
         """Charge le video decoder en VRAM (~2GB). Persistent entre jobs."""
         log.info("Chargement video decoder (persistent)...")
-        self._video_decoder = self._base_ledger.video_decoder()
+        self._video_decoder = self._build_model(VideoDecoderConfigurator, VAE_DECODER_COMFY_KEYS_FILTER)
         if os.environ.get("VAE_COMPILE", "1") == "1":
             vae_dynamic = os.environ.get("VAE_DYNAMIC_COMPILE", os.environ.get("DYNAMIC_COMPILE", "0")) == "1"
             log.info("torch.compile video decoder (mode=default, dynamic=%s)...", vae_dynamic)
@@ -213,7 +311,9 @@ class MedusaPipeline:
     def load_spatial_upsampler(self) -> None:
         """Charge le spatial upsampler x2 en VRAM (~1GB). Persistent entre jobs."""
         log.info("Chargement spatial upsampler x2 (persistent)...")
-        self._spatial_upsampler = self._base_ledger.spatial_upsampler()
+        self._spatial_upsampler = self._build_model(
+            LatentUpsamplerConfigurator, path=self._upsampler_path,
+        )
         self._log_vram("apres spatial upsampler")
 
     def _load_embeddings_cache(self, cache_path: str) -> None:
@@ -254,6 +354,23 @@ class MedusaPipeline:
             alloc = torch.cuda.memory_allocated() / 2**30
             rsvd = torch.cuda.memory_reserved() / 2**30
             log.info("VRAM [%s]: %.2fGB alloc, %.2fGB reserved", label, alloc, rsvd)
+
+    @staticmethod
+    def _make_video_tools(shape: VideoPixelShape) -> VideoLatentTools:
+        """Cree les outils latent video (patchifier + shape) pour un output_shape donne."""
+        return VideoLatentTools(
+            patchifier=VideoLatentPatchifier(patch_size=1),
+            target_shape=VideoLatentShape.from_pixel_shape(shape),
+            fps=shape.fps,
+        )
+
+    @staticmethod
+    def _make_audio_tools(shape: VideoPixelShape) -> AudioLatentTools:
+        """Cree les outils latent audio pour un output_shape donne."""
+        return AudioLatentTools(
+            patchifier=AudioPatchifier(patch_size=1),
+            target_shape=AudioLatentShape.from_video_pixel_shape(shape),
+        )
 
     @staticmethod
     def _compile_artifacts_path() -> str:
@@ -389,14 +506,10 @@ class MedusaPipeline:
                 batch=1, frames=num_frames, width=w, height=h, fps=frame_rate,
             )
 
-            vs, _ = noise_video_state(
-                output_shape=shape, noiser=noiser, conditionings=conds,
-                components=self._components, dtype=self.dtype, device=self.device,
-            )
-            as_, _ = noise_audio_state(
-                output_shape=shape, noiser=noiser, conditionings=[],
-                components=self._components, dtype=self.dtype, device=self.device,
-            )
+            v_tools = self._make_video_tools(shape)
+            a_tools = self._make_audio_tools(shape)
+            vs = create_noised_state(v_tools, conds, noiser, self.dtype, self.device)
+            as_ = create_noised_state(a_tools, [], noiser, self.dtype, self.device)
 
             sigma = sigmas[0]
             vid_mod = modality_from_latent_state(vs, v_ctx, sigma, enabled=True)
@@ -430,14 +543,8 @@ class MedusaPipeline:
                 )
                 conds_d = conds_d + [depth_cond]
 
-                vs_d, _ = noise_video_state(
-                    output_shape=shape, noiser=noiser, conditionings=conds_d,
-                    components=self._components, dtype=self.dtype, device=self.device,
-                )
-                as_d, _ = noise_audio_state(
-                    output_shape=shape, noiser=noiser, conditionings=[],
-                    components=self._components, dtype=self.dtype, device=self.device,
-                )
+                vs_d = create_noised_state(v_tools, conds_d, noiser, self.dtype, self.device)
+                as_d = create_noised_state(a_tools, [], noiser, self.dtype, self.device)
 
                 vid_mod_d = modality_from_latent_state(vs_d, v_ctx, sigma, enabled=True)
                 aud_mod_d = modality_from_latent_state(as_d, a_ctx, sigma, enabled=False)
@@ -965,14 +1072,14 @@ class MedusaPipeline:
         """Sauvegarde le transformer fusionne (distilled) en format checkpoint.
 
         Extrait le state_dict du LTXModel interne, re-ajoute le prefixe
-        `model.diffusion_model.` pour compatibilite avec ModelLedger,
+        `model.diffusion_model.` pour compatibilite avec SingleGPUModelBuilder,
         et copie les metadonnees du checkpoint original.
         Ecriture atomique via .tmp + os.replace().
         """
         module = self._get_orig_module()
         raw_sd = module.velocity_model.state_dict()
 
-        # Re-ajouter le prefixe checkpoint (inverse du renaming fait par ModelLedger)
+        # Re-ajouter le prefixe checkpoint (inverse du renaming COMFY fait au chargement)
         sd = {f"model.diffusion_model.{k}": v.cpu() for k, v in raw_sd.items()}
 
         # Copier les metadonnees du checkpoint original (config architecture, etc.)
@@ -996,23 +1103,29 @@ class MedusaPipeline:
                 pass
             raise
 
-    def _load_transformer_cache(self, cache_path: str) -> torch.nn.Module:
-        """Charge le transformer pre-fusionne depuis le cache.
+    def _build_transformer_from_checkpoint(self, checkpoint_path: str) -> torch.nn.Module:
+        """Build le transformer avec SingleGPUModelBuilder + FP8 quantization.
 
-        Utilise ModelLedger sans LoRAs (le fichier contient deja les poids fusionnes).
-        Retourne un X0Model pret a l'emploi.
+        Reproduit la logique de DiffusionStage._build_transformer() (blocks.py:179-206).
         """
-        log.info("Chargement transformer depuis cache: %s", cache_path)
-        ledger = ModelLedger(
-            dtype=self.dtype,
-            device=self.device,
-            checkpoint_path=cache_path,
-            loras=[],
-            quantization=QuantizationPolicy.fp8_cast(),
+        quantization = QuantizationPolicy.fp8_cast()
+        base_sd_ops = LTXV_MODEL_COMFY_RENAMING_MAP
+        sd_ops = SDOps(
+            name=f"chain_{base_sd_ops.name}+{quantization.sd_ops.name}",
+            mapping=(*base_sd_ops.mapping, *quantization.sd_ops.mapping),
         )
-        transformer = ledger.transformer()
-        del ledger
-        return transformer
+        builder = SingleGPUModelBuilder(
+            model_path=checkpoint_path,
+            model_class_configurator=LTXModelConfigurator,
+            model_sd_ops=sd_ops,
+            module_ops=quantization.module_ops,
+        )
+        return X0Model(builder.build(device=self.device, dtype=self.dtype)).to(self.device).eval()
+
+    def _load_transformer_cache(self, cache_path: str) -> torch.nn.Module:
+        """Charge le transformer pre-fusionne depuis le cache."""
+        log.info("Chargement transformer depuis cache: %s", cache_path)
+        return self._build_transformer_from_checkpoint(cache_path)
 
     def get_transformer(self) -> torch.nn.Module:
         """Retourne le transformer distilled avec FP8 Cast.
@@ -1041,14 +1154,7 @@ class MedusaPipeline:
 
         if self._transformer is None:
             log.info("Build transformer distilled (FP8 cast)...")
-            ledger = ModelLedger(
-                dtype=self.dtype,
-                device=self.device,
-                checkpoint_path=self._checkpoint_path,
-                quantization=QuantizationPolicy.fp8_cast(),
-            )
-            self._transformer = ledger.transformer()
-            del ledger
+            self._transformer = self._build_transformer_from_checkpoint(self._checkpoint_path)
 
             if cache_enabled:
                 self._save_transformer_cache(cache_path)
@@ -1147,25 +1253,13 @@ class MedusaPipeline:
 
         # 4. On-demand : charger Gemma GPU et encoder
         log.info("Encoding prompt custom via Gemma GPU: %s", prompt[:80])
-        te_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        te_ledger = ModelLedger(
-            dtype=self.dtype,
-            device=te_device,
-            checkpoint_path=self._checkpoint_path,
-            gemma_root_path=self._gemma_root,
-        )
 
         prompts_to_encode = [prompt]
         if negative and negative != DEFAULT_NEGATIVE_PROMPT:
             prompts_to_encode.append(negative)
 
-        results = encode_prompts(prompts_to_encode, te_ledger)
+        results = self._encode_prompts_with_gemma(prompts_to_encode)
         v_ctx, a_ctx = results[0].video_encoding, results[0].audio_encoding
-
-        del te_ledger
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
         log.info("Gemma cleanup done")
 
         # Sauvegarder en cache RAM (GPU) + volume (CPU)
@@ -1224,54 +1318,8 @@ class MedusaPipeline:
             last_latent_idx = (num_frames - 1) // 8
             images.append(ImageConditioningInput(path=last_image_path, frame_idx=last_latent_idx, strength=last_image_strength))
 
-        # 5. Denoising loop — audio disabled (single CUDA graph, no guidance)
-        # CFG=1.0, STG=0.0 → guiders are no-ops, audio not used for video generation.
-        # Keeping audio.enabled constant across all steps avoids Dynamo recompilation.
-        def denoising_loop_guided(
-            sigmas: torch.Tensor,
-            video_state: LatentState,
-            audio_state: LatentState,
-            stepper_arg: DiffusionStepProtocol,
-        ) -> tuple[LatentState, LatentState]:
-
-            def denoise_step(
-                video_state: LatentState,
-                audio_state: LatentState,
-                sigmas: torch.Tensor,
-                step_index: int,
-            ) -> tuple[torch.Tensor, torch.Tensor]:
-                t0 = time.perf_counter()
-                sigma = sigmas[step_index]
-                vid_mod = modality_from_latent_state(
-                    video_state, v_context_p, sigma, enabled=True,
-                )
-                aud_mod = modality_from_latent_state(
-                    audio_state, a_context_p, sigma, enabled=False,
-                )
-                torch.compiler.cudagraph_mark_step_begin()
-                denoised_video, denoised_audio = transformer(
-                    video=vid_mod, audio=aud_mod, perturbations=None,
-                )
-                torch.cuda.synchronize()
-                dt = time.perf_counter() - t0
-                if step_index == 0:
-                    alloc = torch.cuda.memory_allocated() / 2**30
-                    rsvd = torch.cuda.memory_reserved() / 2**30
-                    log.info("step %d: %.2fs (sigma=%.4f) VRAM %.2fGB alloc %.2fGB rsvd",
-                             step_index, dt, sigma.item(), alloc, rsvd)
-                else:
-                    log.debug("step %d: %.2fs (sigma=%.4f)", step_index, dt, sigma.item())
-                if dt > 10.0:
-                    log.warning("step %d took %.1fs — possible Dynamo recompilation", step_index, dt)
-                return denoised_video, denoised_audio
-
-            return euler_denoising_loop(
-                sigmas=sigmas,
-                video_state=video_state,
-                audio_state=audio_state,
-                stepper=stepper_arg,
-                denoise_fn=denoise_step,
-            )
+        # 5. Denoiser (no guidance — CFG=1.0, STG=0.0)
+        denoiser = _MedusaDenoiser(v_context_p, a_context_p)
 
         if two_stage:
             # --- 2-stage pipeline (1080p) ---
@@ -1292,18 +1340,18 @@ class MedusaPipeline:
             output_shape_s1 = VideoPixelShape(
                 batch=1, frames=num_frames, width=half_w, height=half_h, fps=frame_rate,
             )
+            v_tools_s1 = self._make_video_tools(output_shape_s1)
+            a_tools_s1 = self._make_audio_tools(output_shape_s1)
+            video_state_s1 = create_noised_state(v_tools_s1, conditionings_s1, noiser, self.dtype, self.device)
+            audio_state_s1 = create_noised_state(a_tools_s1, [], noiser, self.dtype, self.device)
 
-            video_state_s1, audio_state_s1 = denoise_audio_video(
-                output_shape=output_shape_s1,
-                conditionings=conditionings_s1,
-                noiser=noiser,
-                sigmas=self._sigmas,
-                stepper=stepper,
-                denoising_loop_fn=denoising_loop_guided,
-                components=self._components,
-                dtype=self.dtype,
-                device=self.device,
+            video_state_s1, audio_state_s1 = euler_denoising_loop(
+                self._sigmas, video_state_s1, audio_state_s1, stepper, transformer, denoiser,
             )
+            video_state_s1 = v_tools_s1.clear_conditioning(video_state_s1)
+            video_state_s1 = v_tools_s1.unpatchify(video_state_s1)
+            audio_state_s1 = a_tools_s1.clear_conditioning(audio_state_s1)
+            audio_state_s1 = a_tools_s1.unpatchify(audio_state_s1)
             self._log_vram("apres stage 1")
             torch.cuda.empty_cache()
 
@@ -1328,54 +1376,26 @@ class MedusaPipeline:
                 device=self.device,
             )
 
-            def denoising_loop_s2(
-                sigmas: torch.Tensor,
-                video_state: LatentState,
-                audio_state: LatentState,
-                stepper_arg: DiffusionStepProtocol,
-            ) -> tuple[LatentState, LatentState]:
-                def denoise_step_s2(
-                    video_state: LatentState,
-                    audio_state: LatentState,
-                    sigmas: torch.Tensor,
-                    step_index: int,
-                ) -> tuple[torch.Tensor, torch.Tensor]:
-                    sigma = sigmas[step_index]
-                    vid_mod = modality_from_latent_state(
-                        video_state, v_context_p, sigma, enabled=True,
-                    )
-                    aud_mod = modality_from_latent_state(
-                        audio_state, a_context_p, sigma, enabled=False,
-                    )
-                    torch.compiler.cudagraph_mark_step_begin()
-                    return transformer(video=vid_mod, audio=aud_mod, perturbations=None)
-
-                return euler_denoising_loop(
-                    sigmas=sigmas,
-                    video_state=video_state,
-                    audio_state=audio_state,
-                    stepper=stepper_arg,
-                    denoise_fn=denoise_step_s2,
-                )
-
             output_shape_s2 = VideoPixelShape(
                 batch=1, frames=num_frames, width=width, height=height, fps=frame_rate,
             )
-
-            video_state, _audio_state = denoise_audio_video(
-                output_shape=output_shape_s2,
-                conditionings=conditionings_s2,
-                noiser=noiser,
-                sigmas=self._stage2_sigmas,
-                stepper=stepper,
-                denoising_loop_fn=denoising_loop_s2,
-                components=self._components,
-                dtype=self.dtype,
-                device=self.device,
-                noise_scale=self._stage2_sigmas[0].item(),
-                initial_video_latent=upscaled_latent,
-                initial_audio_latent=audio_state_s1.latent,
+            v_tools_s2 = self._make_video_tools(output_shape_s2)
+            a_tools_s2 = self._make_audio_tools(output_shape_s2)
+            noise_scale_s2 = self._stage2_sigmas[0].item()
+            video_state = create_noised_state(
+                v_tools_s2, conditionings_s2, noiser, self.dtype, self.device,
+                noise_scale=noise_scale_s2, initial_latent=upscaled_latent,
             )
+            _audio_state = create_noised_state(
+                a_tools_s2, [], noiser, self.dtype, self.device,
+                noise_scale=noise_scale_s2, initial_latent=audio_state_s1.latent,
+            )
+
+            video_state, _audio_state = euler_denoising_loop(
+                self._stage2_sigmas, video_state, _audio_state, stepper, transformer, denoiser,
+            )
+            video_state = v_tools_s2.clear_conditioning(video_state)
+            video_state = v_tools_s2.unpatchify(video_state)
             self._log_vram("apres stage 2")
 
         else:
@@ -1393,27 +1413,24 @@ class MedusaPipeline:
             output_shape = VideoPixelShape(
                 batch=1, frames=num_frames, width=width, height=height, fps=frame_rate,
             )
+            v_tools = self._make_video_tools(output_shape)
+            a_tools = self._make_audio_tools(output_shape)
+            video_state = create_noised_state(v_tools, conditionings, noiser, self.dtype, self.device)
+            _audio_state = create_noised_state(a_tools, [], noiser, self.dtype, self.device)
 
-            video_state, _audio_state = denoise_audio_video(
-                output_shape=output_shape,
-                conditionings=conditionings,
-                noiser=noiser,
-                sigmas=self._sigmas,
-                stepper=stepper,
-                denoising_loop_fn=denoising_loop_guided,
-                components=self._components,
-                dtype=self.dtype,
-                device=self.device,
+            video_state, _audio_state = euler_denoising_loop(
+                self._sigmas, video_state, _audio_state, stepper, transformer, denoiser,
             )
+            video_state = v_tools.clear_conditioning(video_state)
+            video_state = v_tools.unpatchify(video_state)
 
         torch.cuda.empty_cache()
 
         # 7. VAE decode (tiling optionnel pour 1080p)
         tiling = TilingConfig.default() if os.environ.get("VAE_TILING", "0") == "1" else None
         log.info("VAE decode%s...", " (tiled)" if tiling else "")
-        decoded_video: Iterator[torch.Tensor] = vae_decode_video(
+        decoded_video: Iterator[torch.Tensor] = self._video_decoder.decode_video(
             video_state.latent,
-            self._video_decoder,
             tiling,
             generator,
         )
@@ -1486,7 +1503,7 @@ class MedusaPipeline:
             last_image_strength: float (defaut 1.0)
 
         Le denoising tourne en batch=N sur un seul forward transformer.
-        Le VAE decode est sequentiel par item (limitation vae_decode_video).
+        Le VAE decode est sequentiel par item (limitation VideoDecoder).
 
         Returns:
             Liste de listes de frames CPU, une par item.
@@ -1528,10 +1545,13 @@ class MedusaPipeline:
             initial_audio_latents: torch.Tensor | None = None,
             noise_scale: float = 1.0,
             extra_conditionings: list[ConditioningItem] | None = None,
-        ) -> tuple[LatentState, LatentState, tuple]:
+        ) -> tuple[LatentState, LatentState, tuple[VideoLatentTools, AudioLatentTools]]:
             video_states: list[LatentState] = []
             audio_states: list[LatentState] = []
-            tools_ref = None
+
+            shape_ref = VideoPixelShape(batch=1, frames=num_frames, width=w, height=h, fps=frame_rate)
+            v_tools = self._make_video_tools(shape_ref)
+            a_tools = self._make_audio_tools(shape_ref)
 
             for i, item in enumerate(items):
                 noiser_i = GaussianNoiser(generator=generators[i])
@@ -1557,38 +1577,20 @@ class MedusaPipeline:
                 if extra_conditionings:
                     conds_i = conds_i + [extra_conditionings[i]]
 
-                shape_i = VideoPixelShape(
-                    batch=1, frames=num_frames, width=w, height=h, fps=frame_rate,
-                )
-
                 init_vid_i = initial_video_latents[i:i+1] if initial_video_latents is not None else None
                 init_aud_i = initial_audio_latents[i:i+1] if initial_audio_latents is not None else None
 
-                vs_i, vt_i = noise_video_state(
-                    output_shape=shape_i,
-                    noiser=noiser_i,
-                    conditionings=conds_i,
-                    components=self._components,
-                    dtype=self.dtype,
-                    device=self.device,
-                    noise_scale=noise_scale,
-                    initial_latent=init_vid_i,
+                vs_i = create_noised_state(
+                    v_tools, conds_i, noiser_i, self.dtype, self.device,
+                    noise_scale=noise_scale, initial_latent=init_vid_i,
                 )
-                as_i, at_i = noise_audio_state(
-                    output_shape=shape_i,
-                    noiser=noiser_i,
-                    conditionings=[],
-                    components=self._components,
-                    dtype=self.dtype,
-                    device=self.device,
-                    noise_scale=noise_scale,
-                    initial_latent=init_aud_i,
+                as_i = create_noised_state(
+                    a_tools, [], noiser_i, self.dtype, self.device,
+                    noise_scale=noise_scale, initial_latent=init_aud_i,
                 )
 
                 video_states.append(vs_i)
                 audio_states.append(as_i)
-                if tools_ref is None:
-                    tools_ref = (vt_i, at_i)
 
             # Concatener le long de batch dim
             batched_video = LatentState(
@@ -1603,72 +1605,10 @@ class MedusaPipeline:
                 positions=torch.cat([s.positions for s in audio_states], dim=0),
                 clean_latent=torch.cat([s.clean_latent for s in audio_states], dim=0),
             )
-            return batched_video, batched_audio, tools_ref
+            return batched_video, batched_audio, (v_tools, a_tools)
 
-        # --- Denoising loop avec context batche ---
-        def denoising_loop_guided(
-            sigmas: torch.Tensor,
-            video_state: LatentState,
-            audio_state: LatentState,
-            stepper_arg: DiffusionStepProtocol,
-        ) -> tuple[LatentState, LatentState]:
-
-            def denoise_step(
-                video_state: LatentState,
-                audio_state: LatentState,
-                sigmas: torch.Tensor,
-                step_index: int,
-            ) -> tuple[torch.Tensor, torch.Tensor]:
-                t0 = time.perf_counter()
-                sigma = sigmas[step_index]
-                vid_mod = modality_from_latent_state(
-                    video_state, v_ctx_batch, sigma, enabled=True,
-                )
-                aud_mod = modality_from_latent_state(
-                    audio_state, a_ctx_batch, sigma, enabled=False,
-                )
-                # Fix: expand scalar sigma to (batch_size,) for prompt_adaln
-                # in transformer._prepare_timestep (needs batch dim, not scalar)
-                sigma_b = sigma.unsqueeze(0).expand(batch_size)
-                vid_mod = dataclasses.replace(vid_mod, sigma=sigma_b)
-                aud_mod = dataclasses.replace(aud_mod, sigma=sigma_b)
-                torch.compiler.cudagraph_mark_step_begin()
-                denoised_video, denoised_audio = transformer(
-                    video=vid_mod, audio=aud_mod, perturbations=None,
-                )
-                torch.cuda.synchronize()
-                dt = time.perf_counter() - t0
-                if step_index == 0:
-                    alloc = torch.cuda.memory_allocated() / 2**30
-                    rsvd = torch.cuda.memory_reserved() / 2**30
-                    log.info(
-                        "batch step %d: %.2fs (sigma=%.4f) VRAM %.2fGB alloc %.2fGB rsvd",
-                        step_index, dt, sigma.item(), alloc, rsvd,
-                    )
-                    # Log Inductor cache counters apres premier step
-                    try:
-                        from torch._dynamo.utils import counters
-                        cache_counters = {k: v for k, v in counters["inductor"].items()
-                                          if "cache" in k.lower() or "autograd" in k.lower()}
-                        if cache_counters:
-                            log.info("Inductor cache counters: %s", cache_counters)
-                        else:
-                            log.info("Inductor cache counters: (empty — no cache activity reported)")
-                    except Exception as e:
-                        log.debug("Inductor cache counters unavailable: %s", e)
-                else:
-                    log.debug("batch step %d: %.2fs (sigma=%.4f)", step_index, dt, sigma.item())
-                if dt > 10.0:
-                    log.warning("batch step %d took %.1fs — possible Dynamo recompilation", step_index, dt)
-                return denoised_video, denoised_audio
-
-            return euler_denoising_loop(
-                sigmas=sigmas,
-                video_state=video_state,
-                audio_state=audio_state,
-                stepper=stepper_arg,
-                denoise_fn=denoise_step,
-            )
+        # Denoiser batch (expand sigma pour batch_size)
+        denoiser = _MedusaBatchDenoiser(v_ctx_batch, a_ctx_batch, batch_size)
 
         if two_stage:
             # --- 2-stage batch pipeline ---
@@ -1693,7 +1633,9 @@ class MedusaPipeline:
                 half_h, half_w, extra_conditionings=depth_conds,
             )
 
-            bv_s1, ba_s1 = denoising_loop_guided(self._sigmas, bv_s1, ba_s1, stepper)
+            bv_s1, ba_s1 = euler_denoising_loop(
+                self._sigmas, bv_s1, ba_s1, stepper, transformer, denoiser,
+            )
             bv_s1 = vtools_s1.clear_conditioning(bv_s1)
             bv_s1 = vtools_s1.unpatchify(bv_s1)
             ba_s1 = atools_s1.clear_conditioning(ba_s1)
@@ -1714,36 +1656,6 @@ class MedusaPipeline:
             # Stage 2 — full-res batch refine
             log.info("Batch Stage 2: refine %dx%d (full-res, 3 steps)...", width, height)
 
-            def denoising_loop_s2(
-                sigmas: torch.Tensor,
-                video_state: LatentState,
-                audio_state: LatentState,
-                stepper_arg: DiffusionStepProtocol,
-            ) -> tuple[LatentState, LatentState]:
-                def denoise_step_s2(
-                    video_state: LatentState,
-                    audio_state: LatentState,
-                    sigmas: torch.Tensor,
-                    step_index: int,
-                ) -> tuple[torch.Tensor, torch.Tensor]:
-                    sigma = sigmas[step_index]
-                    vid_mod = modality_from_latent_state(video_state, v_ctx_batch, sigma, enabled=True)
-                    aud_mod = modality_from_latent_state(audio_state, a_ctx_batch, sigma, enabled=False)
-                    # Fix: expand scalar sigma to (batch_size,) for prompt_adaln
-                    sigma_b = sigma.unsqueeze(0).expand(batch_size)
-                    vid_mod = dataclasses.replace(vid_mod, sigma=sigma_b)
-                    aud_mod = dataclasses.replace(aud_mod, sigma=sigma_b)
-                    torch.compiler.cudagraph_mark_step_begin()
-                    return transformer(video=vid_mod, audio=aud_mod, perturbations=None)
-
-                return euler_denoising_loop(
-                    sigmas=sigmas,
-                    video_state=video_state,
-                    audio_state=audio_state,
-                    stepper=stepper_arg,
-                    denoise_fn=denoise_step_s2,
-                )
-
             bv_s2, ba_s2, (vtools_s2, atools_s2) = create_batched_states(
                 height, width,
                 initial_video_latents=upscaled_batch,
@@ -1751,7 +1663,9 @@ class MedusaPipeline:
                 noise_scale=self._stage2_sigmas[0].item(),
             )
 
-            bv_s2, ba_s2 = denoising_loop_s2(self._stage2_sigmas, bv_s2, ba_s2, stepper)
+            bv_s2, ba_s2 = euler_denoising_loop(
+                self._stage2_sigmas, bv_s2, ba_s2, stepper, transformer, denoiser,
+            )
             bv_s2 = vtools_s2.clear_conditioning(bv_s2)
             video_state = vtools_s2.unpatchify(bv_s2)
             self._log_vram("apres batch stage 2")
@@ -1778,13 +1692,13 @@ class MedusaPipeline:
                 height, width, extra_conditionings=depth_conds_1s,
             )
 
-            batched_video, batched_audio = denoising_loop_guided(
-                self._sigmas, batched_video, batched_audio, stepper,
+            batched_video, batched_audio = euler_denoising_loop(
+                self._sigmas, batched_video, batched_audio, stepper, transformer, denoiser,
             )
             batched_video = vtools.clear_conditioning(batched_video)
             video_state = vtools.unpatchify(batched_video)
 
-        # VAE decode sequentiel par item (vae_decode_video ne supporte pas le batching)
+        # VAE decode sequentiel par item
         torch.cuda.empty_cache()
         tiling = TilingConfig.default() if os.environ.get("VAE_TILING", "0") == "1" else None
         log.info("Batch VAE decode (%d items, sequentiel)...", batch_size)
@@ -1792,7 +1706,7 @@ class MedusaPipeline:
         for i in range(batch_size):
             t0 = time.perf_counter()
             item_latent = video_state.latent[i:i+1].contiguous()
-            decoded = vae_decode_video(item_latent, self._video_decoder, tiling, generators[i])
+            decoded = self._video_decoder.decode_video(item_latent, tiling, generators[i])
             item_frames = [chunk.cpu() for chunk in decoded]
             dt = time.perf_counter() - t0
             if dt > 5.0:

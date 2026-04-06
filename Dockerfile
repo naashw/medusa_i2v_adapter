@@ -45,9 +45,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         --extra-index-url https://pypi.org/simple/
 
 # --- ltx-core + ltx-pipelines depuis le repo Lightricks/LTX-2 ---
-# Pin au commit 9e8a28e — LTX-2.3 support (FP8 cast, temporal upscaler, I2V natif)
+# Pin au commit 59ca828 — Refonte blocs lifecycle, torch.compile Fp8CastLinear, layer streaming
 RUN git clone --filter=blob:none --quiet https://github.com/Lightricks/LTX-2.git /tmp/LTX-2 && \
-    cd /tmp/LTX-2 && git checkout 9e8a28e17ac4dd9e49695223d50753a1ebda36fe
+    cd /tmp/LTX-2 && git checkout 59ca828d5ae24358832ffd7003c2306fbceeba3a
 
 # Installer ltx-core d'abord (dependance de ltx-pipelines)
 RUN cd /tmp/LTX-2/packages/ltx-core && pip install --no-cache-dir .
