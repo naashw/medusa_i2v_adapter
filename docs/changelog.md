@@ -1,5 +1,82 @@
 # Changelog — Medusa I2V
 
+## 2026-04-02 — Version stable : Depth IC-LoRA + perf pipeline + guard idempotence
+
+> **Tag stable** — Cette version est validee en production sur RunPod H100 80GB.
+> 37 commits depuis 2026-03-14. Resume par phase ci-dessous.
+
+### Phase 1 : Resolution tiers + static shapes + encodeur (mars 14-18)
+
+- **3 tiers de resolution** : 540p (1-stage preview), 720p (2-stage, defaut), 1080p (2-stage). Suffixe `-portrait` pour 9:16
+- **Static shapes par defaut** (`DYNAMIC_COMPILE=0`) : optimal pour les 8 shapes fixes du warmup, evite les recompilations Dynamo
+- **Warmup compile toutes shapes** + `force_parameter_static_shapes` pour couvrir les 8 configs (landscape + portrait, stage 1 + 2)
+- **Encodeur MP4 veryfast** (`video_encoder.py`) + pool post-processing aligne sur `MAX_BATCH` (encode + S3 upload en parallele du VAE decode)
+- **Purge automatique cache ancien build** au demarrage (`CLEAN_OLD_CACHE=1`)
+- **Audio.enabled=False unifie** partout (halve Dynamo specializations, deja documente)
+
+### Phase 2 : Camera LoRA → Depth IC-LoRA (mars 18-28)
+
+Migration complete du controle camera : abandon des camera LoRAs individuels (dolly-in, etc.) au profit du depth estimation + IC-LoRA Union Control.
+
+- **IC-LoRA depth control** : `LTX-2.3-22b-IC-LoRA-Union-Control` fuse permanent dans le transformer au demarrage (654MB, pas de swap dynamique)
+- **DA3METRIC-LARGE** : estimation profondeur metrique + sky segmentation (~1.64GB, offloadable CPU). Install depuis GitHub `ByteDance-Seed/depth-anything-3`
+- **Parallax warp 2D** : forward splatting + z-buffer, `scale = d/(d-δ)`, normalisation per-frame [0,1]. Le ciel n'est pas warpe (sky_mask → 1.0)
+- **Depth conditioning per-item** dans le batch : chaque item peut avoir son propre `camera_speed_ms`
+- **VideoConditionByReferenceLatent** (downscale_factor=2) : conditioning Stage 1 uniquement, Stage 2 sans depth
+- **Suppression systeme LoRA generique** : code mort (`ensure_lora`, `_unfuse_lora`, `LTXV_LORA_COMFY_RENAMING_MAP`) nettoye
+- **Migration DA3METRIC-LARGE** : shift lineaire remplace reprojection 3D et log norm (plus stable, pas de focale requise)
+
+Corrections depth :
+- Dilatation morphologique des trous du forward splatting
+- Clamp indices apres round dans scatter_reduce
+- Gestion `intrinsics=None` dans DA3METRIC
+- Normalisation log depth displacement → shift lineaire
+
+### Phase 3 : Optimisations GPU zero-copy (mars 20-25)
+
+- **load_safetensors direct GPU** : zero passage CPU pour les poids modele
+- **Deltas LoRA sur GPU** : calcul matmul BF16 H100 + stockage GPU permanent (zero transfert CPU-GPU par requete)
+- **Embeddings custom direct GPU** : cache RAM GPU, zero transfert par requete
+- **Embeddings Gemma stockes GPU** dans le cache RAM
+- **build_hash base sur pip freeze** uniquement (plus stable que file hash)
+- **Triton cache versionne** + mega cache sauvegarde au warmup (pas apres 1er job)
+
+### Phase 4 : Warmup depth + guard idempotence (mars 28 - avril 2)
+
+- **Warmup compile avec depth conditioning** pour les shapes Stage 1 (evite recompilation Dynamo au 1er job avec depth)
+- **VAE_DYNAMIC_COMPILE** : variable independante du transformer, fallback sur `DYNAMIC_COMPILE`
+- **Guard idempotence RunPod** : `_completed_jobs` set intercepte les double delivery du SDK 1.8.2 (at-least-once). Le SDK re-delivre le meme job ~1s apres completion lors des cold starts (job marine dans la queue sans ACK)
+- **Lock threading PyAV** pour eviter crash concurrent libx264 dans le pool post-processing
+- **dtype bf16 pour dummy depth video** du warmup (coherence avec inference reelle)
+
+### Fichiers principaux modifies
+
+| Fichier | Modifications |
+|---------|---------------|
+| `src/handler.py` | Guard idempotence, lock PyAV, resolution tiers, depth per-item batch, pool post-processing |
+| `src/pipeline.py` | Depth IC-LoRA, parallax warp 2D, DA3METRIC, static shapes, warmup depth, embeddings GPU, LoRA GPU |
+| `src/video_encoder.py` | Nouvel encodeur MP4 veryfast (x264) |
+| `src/start.sh` | Purge cache, VAE_DYNAMIC_COMPILE, rm -f |
+| `src/prompts.py` | Presets camera texte |
+| `Dockerfile` | video_encoder.py, DA3METRIC install |
+| `CLAUDE.md` | Depth IC-LoRA, env vars, gotchas |
+
+### Etat de la production (2026-04-02)
+
+- **RunPod H100 80GB** : stable, cold start ~4 min (warmup compile 8 shapes + depth)
+- **Performances warm** : ~7-8s/item 720p 25f, ~15s/item 720p 49f
+- **Batch** : jusqu'a 9 items/batch (MAX_BATCH), regroupe par prompt
+- **Depth conditioning** : parallax warp 2D stable, camera_speed_ms 0.3-1.0 m/s
+- **S3 upload** : OVH SBG, concurrent avec VAE decode via ThreadPool
+- **Guard idempotence** : double delivery RunPod intercepte sans impact
+
+### Problemes connus (non bloquants)
+
+- **Double delivery RunPod** : le SDK re-delivre le meme job ~1s apres completion sur cold start. Le guard `_completed_jobs` le skip, mais le 2nd `/job-done` envoie `{"images": []}` a RunPod. Si RunPod ecrase l'output reel, le polling Elixir (5s interval) peut recevoir le resultat vide. Fix envisage : cache du resultat reel dans le guard + `concurrency_modifier=2` pour prefetch (stash `prefetch concurrency + gpu_lock + cache idempotence`). Non deploye car necessite validation.
+- **Auto-scale down entre jobs** : avec `concurrency=1` (defaut SDK), la queue locale tombe a 0 entre chaque job, l'auto-scaler RunPod peut couper le worker. Workaround : configurer `Min Workers=1` sur l'endpoint RunPod ou appliquer le stash prefetch.
+
+---
+
 ## 2026-03-14 — Unification audio.enabled=False (halve Dynamo specializations)
 
 ### Contexte

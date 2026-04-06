@@ -354,6 +354,9 @@ def handler(job: dict) -> dict:
     if error:
         return {"error": error}
 
+    normalized_ids = [item.get("id") for item in normalized]
+    log.info("Job %s — normalized %d item(s), IDs=%s", job_id, len(normalized), normalized_ids)
+
     # --- Params partages (top-level) ---
     resolution = job_input.get("resolution", "720p")
     if resolution not in FIXED_RESOLUTIONS:
@@ -412,8 +415,9 @@ def handler(job: dict) -> dict:
             groups.setdefault(prompt_text, []).append(item)
 
         log.info(
-            "Groupes par prompt: %d groupe(s) — %s",
-            len(groups), {k[:30]: len(v) for k, v in groups.items()},
+            "Job %s — Groupes par prompt: %d groupe(s) — %s",
+            job_id, len(groups),
+            {k[:30]: [it.get("id") for it in v] for k, v in groups.items()},
         )
 
         # --- Generation par groupe ---
@@ -445,6 +449,11 @@ def handler(job: dict) -> dict:
                 def on_decoded(batch_idx: int, frames: list) -> None:
                     item = sub_batch[batch_idx]
                     orig_idx = item["_original_index"]
+                    item_id = item.get("id")
+                    log.info(
+                        "Job %s — on_decoded: batch_idx=%d, orig_idx=%d, item_id=%s, frames=%d",
+                        job_id, batch_idx, orig_idx, item_id, len(frames),
+                    )
                     output_dir = tempfile.mkdtemp(prefix="medusa_")
 
                     if item.get("id"):
@@ -460,7 +469,7 @@ def handler(job: dict) -> dict:
                         output_dir, output_filename,
                         job_id,
                     )
-                    results_by_index[orig_idx] = (fut, item.get("id"))
+                    results_by_index[orig_idx] = (fut, item_id)
 
                 pipeline.generate_batch_frames(
                     items=pipeline_items,
@@ -482,16 +491,37 @@ def handler(job: dict) -> dict:
                 )
 
         # --- Reordonner les resultats par _original_index ---
+        log.info(
+            "Job %s — collecting results: total_items=%d, results_by_index keys=%s",
+            job_id, total_items, sorted(results_by_index.keys()),
+        )
+
         ordered_results = []
         for idx in range(total_items):
+            if idx not in results_by_index:
+                log.error(
+                    "Job %s — MISSING index %d in results_by_index! keys=%s",
+                    job_id, idx, sorted(results_by_index.keys()),
+                )
+                raise KeyError(f"Index {idx} missing from results_by_index (keys: {sorted(results_by_index.keys())})")
+
             fut, item_id = results_by_index[idx]
             result = fut.result()
             if item_id is not None:
                 result["id"] = item_id
+
+            log.info(
+                "Job %s — result[%d]: id=%s, s3_key=%s, size_mb=%s",
+                job_id, idx, result.get("id"), result.get("s3_key"), result.get("size_mb"),
+            )
             ordered_results.append(result)
 
+        result_ids = [r.get("id") for r in ordered_results]
         disk_after = get_disk_usage_mb()
-        log.info("Disque apres: %.0f MB (libere: %.0f MB)", disk_after, disk_before - disk_after)
+        log.info(
+            "Job %s — RETURNING %d images, IDs=%s, disk freed: %.0f MB",
+            job_id, len(ordered_results), result_ids, disk_before - disk_after,
+        )
 
         return {"images": ordered_results}
 
