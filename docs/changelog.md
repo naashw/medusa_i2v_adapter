@@ -1,5 +1,17 @@
 # Changelog — Medusa I2V
 
+## 2026-04-07 — Fix Gemma config + auto-migration
+
+### Fix : `rope_local_base_freq` manquant dans Gemma config
+
+Le `config.json` de Gemma 3 12B sur le volume avait ete genere avec `transformers 4.50.0.dev0`, qui n'incluait pas le champ `rope_local_base_freq`. ltx-core commit `59ca828` accede a cet attribut dans `encoder_configurator.py:create_and_populate()` lors de l'encodage on-demand de prompts custom (cache miss). Les prompts pre-caches fonctionnaient car ils ne passent pas par le builder ltx-core.
+
+**Symptome** : `AttributeError: 'Gemma3TextConfig' object has no attribute 'rope_local_base_freq'` sur tout prompt custom non present dans le cache embeddings.
+
+**Corrections** :
+- Ajout `rope_local_base_freq: 10000.0` dans `text_config` du `config.json` sur le volume (fix immediat)
+- Ajout dans `start.sh` d'un re-save automatique du config via `AutoConfig.from_pretrained(local_files_only=True)` + `save_pretrained()` a chaque demarrage. Re-serialise le config avec les defaults de la version transformers installee, corrigeant automatiquement tout champ manquant lors de futures mises a jour
+
 ## 2026-04-02 — Version stable : Depth IC-LoRA + perf pipeline + guard idempotence
 
 > **Tag stable** — Cette version est validee en production sur RunPod H100 80GB.

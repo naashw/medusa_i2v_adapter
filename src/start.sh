@@ -291,6 +291,14 @@ snapshot_download(
 "
 fi
 
+# Re-sauvegarder config.json avec les defaults de la version transformers installee
+# (corrige les champs manquants comme rope_local_base_freq si config genere avec une ancienne version)
+python -c "
+from transformers import AutoConfig
+c = AutoConfig.from_pretrained('$GEMMA_DIR', local_files_only=True)
+c.save_pretrained('$GEMMA_DIR')
+" 2>/dev/null && echo "[medusa] Gemma config.json mis a jour (transformers $(python -c 'import transformers; print(transformers.__version__)'))" || true
+
 # --- IC-LoRA Union Control: Depth/Canny/Pose (~654MB) ---
 if [[ "${DEPTH_LORA:-1}" == "1" ]]; then
     download_model "Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control" \

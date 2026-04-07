@@ -45,7 +45,7 @@ Le mouvement de camera est controle par depth estimation metrique + IC-LoRA Unio
 
 ## Gotchas
 
-- Gemma DOIT etre format **HuggingFace** (pas Comfy-Org single file)
+- Gemma DOIT etre format **HuggingFace** (pas Comfy-Org single file). Le `config.json` doit contenir `rope_local_base_freq` dans `text_config` (auto-corrige par `start.sh` via `AutoConfig.save_pretrained`)
 - `num_frames` doit etre `k*8+1` (ex: 25, 49, 97)
 - `height/width` multiples de 64 (2-stage : half-res multiple de 32)
 - `huggingface-cli` absent de l'image Docker → utiliser `huggingface_hub.snapshot_download()`
