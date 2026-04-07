@@ -2,5 +2,5 @@ runpod>=1.8,<2.0
 requests>=2.31,<3.0
 boto3>=1.34,<2.0
 huggingface-hub[hf-xet]>=0.34
-transformers>=4.52
+transformers>=4.57,<5.0
 Pillow>=10.0
