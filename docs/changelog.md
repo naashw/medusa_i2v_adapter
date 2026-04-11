@@ -1,5 +1,34 @@
 # Changelog — Medusa I2V
 
+## 2026-04-11 — Phase A : Camera path 6-DOF avec Catmull-Rom (trajet cinématographique scriptable)
+
+Support trajectoires camera 6-DOF (translation X/Y/Z + rotation quaternion) via keyframes interpolees. Refactor warp depth dolly → generic 6-DOF avec fallback backward compat strict.
+
+### Fichiers ajoutes/modifies
+
+- `src/camera_path.py` : **NOUVEAU** (~200 lignes). Fonctions quaternion math (quat_to_matrix, slerp), Catmull-Rom vec3 + quat, interpolate_camera_path
+- `src/pipeline.py` :
+  - Imports : `import math`, `from camera_path import interpolate_camera_path, quat_to_matrix`
+  - Nouvelle fonction `_warp_depth_generic` : 6-DOF warp via unproject→transform→reproject + forward splatting (remplace `_warp_depth_dolly` pour cas general)
+  - `render_depth_sequence()` : nouvelle signature `camera_path`, `interpolation`, `focal_px`. Fallback dolly-in 2-kf si `camera_path=None`
+  - `create_depth_conditioning()` : params optionnels `camera_path`, `interpolation`, `fov_degrees`. Calcul `focal_px = width / (2 * tan(fov/2))`
+  - `generate_batch_frames()` : 2 appels `create_depth_conditioning` etendus pour lire et passer `camera_path`, `interpolation`, `fov_degrees` per-item
+- `src/handler.py` : enrichir `pipeline_items` avec passthrough `camera_path`, `interpolation`, `fov_degrees` (conditionnel si present)
+- `scripts/test_camera_path.py` : **NOUVEAU**. Unit tests quaternion math, Catmull-Rom, interpolate_camera_path, backward compat dolly-in
+- `CLAUDE.md` : section "Depth IC-LoRA" etendue avec "Camera path 6-DOF". Mise a jour "API Input" avec 3 nouveaux champs optionnels
+
+### Backward compatibility
+
+**Stricte** : si `camera_path` absent ou None, genere path dolly-in 2-kf identique ancien comportement (translation=[0,0,δ], rotation=identity, interpolation=linear). Aucune regression pixel-perfect.
+
+### Conventions
+
+- Axes : X=droite, Y=haut, Z=avant (main droite)
+- Quaternion : Hamilton [w, x, y, z]
+- Temps t : normalise [0, 1]
+- Catmull-Rom edge mode : clamped (duplication keyframe bord)
+- FOV par defaut 60°
+
 ## 2026-04-11 — Phase A : Support multi-mode (t2v, i2v, i2v_depth, flf2v)
 
 Refactor Python pour support 4 modes de generation avec auto-detection par champs presents. Suppression des CAMERA_PRESETS presets (legacy), activation depth via trigger explicite `camera_motion="depth"` uniquement.

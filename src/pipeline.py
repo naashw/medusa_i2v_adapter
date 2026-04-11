@@ -16,6 +16,7 @@ import dataclasses
 import gc
 import hashlib
 import logging
+import math
 import os
 import time
 import warnings
@@ -68,6 +69,7 @@ from ltx_pipelines.utils.helpers import (
 )
 from ltx_pipelines.utils.samplers import euler_denoising_loop
 
+from camera_path import interpolate_camera_path, quat_to_matrix
 from prompts import DEFAULT_NEGATIVE_PROMPT
 
 log = logging.getLogger("medusa")
@@ -858,6 +860,107 @@ class MedusaPipeline:
         return depth_meters, sky_mask
 
     @staticmethod
+    def _warp_depth_generic(
+        depth: torch.Tensor,
+        translation: torch.Tensor,
+        rotation_quat: torch.Tensor,
+        focal_px: float,
+        sky_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """6-DOF depth warp via unproject→transform→reproject + forward splatting.
+
+        Args:
+            depth: [H, W] profondeur metrique en metres (GPU)
+            translation: [3] deplacement camera en metres [x, y, z]
+            rotation_quat: [4] quaternion unit [w, x, y, z]
+            focal_px: focal length en pixels (stage1_w / (2 * tan(fov/2)))
+            sky_mask: [H, W] bool (True = ciel, pas warpe)
+
+        Returns:
+            [H, W] depth warpee en metres
+        """
+        H, W = depth.shape
+        device = depth.device
+
+        # Quaternion to rotation matrix
+        R = quat_to_matrix(rotation_quat.unsqueeze(0))[0]  # [3, 3]
+
+        cx, cy = (W - 1) / 2.0, (H - 1) / 2.0
+        f = focal_px
+
+        # Pixel grids
+        v_grid, u_grid = torch.meshgrid(
+            torch.arange(H, device=device, dtype=torch.float32),
+            torch.arange(W, device=device, dtype=torch.float32),
+            indexing="ij",
+        )
+
+        # Unproject 2D → 3D
+        X = (u_grid - cx) * depth / f
+        Y = (v_grid - cy) * depth / f
+        Z = depth
+        P = torch.stack([X, Y, Z], dim=-1)  # [H, W, 3]
+
+        # Transform inverse : P' = R^T @ (P - translation)
+        P_trans = P - translation.unsqueeze(0).unsqueeze(0)  # [H, W, 3]
+        # einsum: [H, W, 3] @ [3, 3]^T -> [H, W, 3]
+        P_prime = torch.einsum("hij,ji->hij", P_trans, R)
+
+        # Reproject 3D → 2D
+        u_new = cx + f * P_prime[..., 0] / torch.clamp(P_prime[..., 2], min=1e-6)
+        v_new = cy + f * P_prime[..., 1] / torch.clamp(P_prime[..., 2], min=1e-6)
+        d_new = P_prime[..., 2]
+
+        # Foreground: pas ciel ET pas derriere camera
+        fg = ~sky_mask & (d_new > 0.01)
+
+        # Valid: foreground ET dans les limites
+        valid = fg & (u_new >= 0) & (u_new < W) & (v_new >= 0) & (v_new < H)
+
+        # Z-buffer splatting (scatter_reduce amin = closest)
+        u_idx = torch.clamp(torch.round(u_new[valid]).long(), 0, W - 1)
+        v_idx = torch.clamp(torch.round(v_new[valid]).long(), 0, H - 1)
+        flat_idx = v_idx * W + u_idx
+        flat_d = d_new[valid]
+
+        output = torch.full((H * W,), float("inf"), device=device, dtype=torch.float32)
+        output.scatter_reduce_(0, flat_idx, flat_d, reduce="amin")
+        output = output.view(H, W)
+
+        # Hole filling via morphological dilation (weighted avg of neighbors)
+        holes = output.isinf()
+        if holes.any():
+            clean = output.clone()
+            clean[holes] = 0.0
+            mask = (~holes).float()
+            clean_4d = clean.unsqueeze(0).unsqueeze(0)
+            mask_4d = mask.unsqueeze(0).unsqueeze(0)
+
+            for _ in range(5):
+                sum_v = F.avg_pool2d(clean_4d, 3, 1, 1) * 9
+                sum_m = F.avg_pool2d(mask_4d, 3, 1, 1) * 9
+                avg = sum_v / torch.clamp(sum_m, min=1)
+                fill_mask = (mask_4d == 0) & (sum_m > 0)
+                clean_4d = torch.where(fill_mask, avg, clean_4d)
+                mask_4d = torch.where(fill_mask, torch.ones_like(mask_4d), mask_4d)
+                if mask_4d.all():
+                    break
+
+            output = clean_4d.squeeze(0).squeeze(0)
+
+            # Fallback: pixels still empty → max foreground
+            still_empty = output == 0.0
+            if still_empty.any():
+                fill_val = depth[fg].max() if fg.any() else depth.max()
+                output[still_empty] = fill_val
+
+        # Sky: non-warped, set to max depth
+        if sky_mask.any():
+            output[sky_mask] = output[~sky_mask].max() if (~sky_mask).any() else fill_val
+
+        return output
+
+    @staticmethod
     def _warp_depth_dolly(
         depth: torch.Tensor,
         delta: float,
@@ -957,40 +1060,51 @@ class MedusaPipeline:
         depth_meters: torch.Tensor,
         sky_mask: torch.Tensor,
         num_frames: int,
+        camera_path: list[dict] | None,
+        interpolation: str,
         camera_speed_ms: float,
+        focal_px: float,
         frame_rate: float,
         target_h: int,
         target_w: int,
     ) -> torch.Tensor:
-        """Genere une sequence depth par parallax warp 2D (forward splatting).
-
-        La camera avance en Z a camera_speed_ms m/s. Les objets proches
-        se deplacent plus du centre que les lointains (parallaxe).
-        Normalisation per-frame [0,1] (fonctionne car le pattern spatial change).
+        """Genere une sequence depth par 6-DOF warp (translation + rotation).
 
         Args:
             depth_meters: [H, W] profondeur metrique en metres
             sky_mask: [H, W] bool (True = pixels ciel)
             num_frames: nombre de frames a generer
-            camera_speed_ms: vitesse camera en m/s
-            frame_rate: fps (pour calculer la duree)
-            target_h, target_w: resolution de sortie (multiples de 32)
+            camera_path: list[dict] keyframes | None (fallback dolly-in si None)
+            interpolation: "linear" | "cubic" mode interpolation
+            camera_speed_ms: vitesse camera en m/s (fallback si camera_path None)
+            focal_px: focal length en pixels
+            frame_rate: fps
+            target_h, target_w: resolution de sortie
 
         Returns:
             [1, 3, F, target_h, target_w] tensor normalise [-1, 1]
         """
-        # Deplacement total en metres
-        duration_s = (num_frames - 1) / frame_rate
-        max_displacement = camera_speed_ms * duration_s
+        # Fallback backward compat : si pas de camera_path, generer dolly-in
+        if camera_path is None or len(camera_path) == 0:
+            duration_s = (num_frames - 1) / frame_rate
+            max_z = camera_speed_ms * duration_s
+            camera_path = [
+                {"t": 0.0, "translation": [0.0, 0.0, 0.0], "rotation_quat": [1.0, 0.0, 0.0, 0.0]},
+                {"t": 1.0, "translation": [0.0, 0.0, max_z], "rotation_quat": [1.0, 0.0, 0.0, 0.0]},
+            ]
+            interpolation = "linear"
+
         has_sky = sky_mask.any()
 
         frames = []
         for i in range(num_frames):
             t = i / max(num_frames - 1, 1)
-            delta = max_displacement * t
 
-            # Parallax warp 2D (proches bougent plus que lointains)
-            depth_frame = self._warp_depth_dolly(depth_meters, delta, sky_mask)
+            # Interpolate camera pose
+            trans, quat = interpolate_camera_path(camera_path, t, interpolation)
+
+            # 6-DOF depth warp
+            depth_frame = self._warp_depth_generic(depth_meters, trans, quat, focal_px, sky_mask)
 
             # Per-frame normalisation [0,1] sur foreground uniquement
             fg_vals = depth_frame[~sky_mask] if has_sky else depth_frame
@@ -1038,10 +1152,13 @@ class MedusaPipeline:
         num_frames: int,
         frame_rate: float,
         camera_speed_ms: float,
+        camera_path: list[dict] | None = None,
+        interpolation: str = "linear",
+        fov_degrees: float = 60.0,
     ) -> ConditioningItem:
         """Cree le conditioning IC-LoRA depth pour Stage 1.
 
-        Pipeline : DA3METRIC → depth metres + sky mask → shift lineaire N frames →
+        Pipeline : DA3METRIC → depth metres + sky mask → 6-DOF warp N frames →
         VAE encode → VideoConditionByReferenceLatent
         """
         t0 = time.perf_counter()
@@ -1049,21 +1166,27 @@ class MedusaPipeline:
         # 1. Depth estimation metrique
         depth_meters, sky_mask = self.estimate_depth_metric(image_path)
 
-        # 2. Render depth sequence (shift lineaire)
+        # 2. Compute focal length from FOV
         scale = self._depth_downscale_factor
         ref_h = (stage1_h // scale // 32) * 32  # multiples de 32
         ref_w = (stage1_w // scale // 32) * 32
+        focal_px = ref_w / (2 * math.tan(math.radians(fov_degrees) / 2))
+
+        # 3. Render depth sequence (6-DOF warp avec camera_path optionnel)
         depth_video = self.render_depth_sequence(
             depth_meters, sky_mask, num_frames,
+            camera_path=camera_path,
+            interpolation=interpolation,
             camera_speed_ms=camera_speed_ms,
+            focal_px=focal_px,
             frame_rate=frame_rate,
             target_h=ref_h, target_w=ref_w,
         )  # [1, 3, F, ref_h, ref_w]
 
-        # 3. VAE encode
+        # 4. VAE encode
         encoded = self._video_encoder(depth_video)
 
-        # 4. Wrap en conditioning IC-LoRA
+        # 5. Wrap en conditioning IC-LoRA
         cond = VideoConditionByReferenceLatent(
             latent=encoded,
             downscale_factor=scale,
@@ -1073,8 +1196,8 @@ class MedusaPipeline:
         dt = time.perf_counter() - t0
         log.info(
             "Depth conditioning: DA3METRIC+render+VAE en %.2fs "
-            "(%dx%d, %d frames, scale=%d, speed=%.2f m/s)",
-            dt, ref_w, ref_h, num_frames, scale, camera_speed_ms,
+            "(%dx%d, %d frames, scale=%d, speed=%.2f m/s, fov=%.1f)",
+            dt, ref_w, ref_h, num_frames, scale, camera_speed_ms, fov_degrees,
         )
         return cond
 
@@ -1449,9 +1572,15 @@ class MedusaPipeline:
                     use_depth = item.get("use_depth", False)
                     if use_depth and item.get("image_path"):
                         camera_speed = item.get("camera_speed_ms", self._camera_speed_ms_default)
+                        camera_path = item.get("camera_path")
+                        interpolation = item.get("interpolation", "linear")
+                        fov_degrees = item.get("fov_degrees", 60.0)
                         depth_conds.append(self.create_depth_conditioning(
                             item["image_path"], half_h, half_w, num_frames,
                             frame_rate=frame_rate, camera_speed_ms=camera_speed,
+                            camera_path=camera_path,
+                            interpolation=interpolation,
+                            fov_degrees=fov_degrees,
                         ))
                     else:
                         depth_conds.append(None)
@@ -1513,9 +1642,15 @@ class MedusaPipeline:
                     use_depth = item.get("use_depth", False)
                     if use_depth and item.get("image_path"):
                         camera_speed = item.get("camera_speed_ms", self._camera_speed_ms_default)
+                        camera_path = item.get("camera_path")
+                        interpolation = item.get("interpolation", "linear")
+                        fov_degrees = item.get("fov_degrees", 60.0)
                         depth_conds_1s.append(self.create_depth_conditioning(
                             item["image_path"], height, width, num_frames,
                             frame_rate=frame_rate, camera_speed_ms=camera_speed,
+                            camera_path=camera_path,
+                            interpolation=interpolation,
+                            fov_degrees=fov_degrees,
                         ))
                     else:
                         depth_conds_1s.append(None)

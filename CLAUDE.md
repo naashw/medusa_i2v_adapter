@@ -37,6 +37,9 @@ Voir `src/handler.py` pour le schema complet. Points cles :
 - `prompt` : optionnel, custom. Fallback sur `camera_motion` si absent
 - `camera_motion` : trigger depth via valeur `"depth"`. Alias `camera`. Autres valeurs ignorees
 - `camera_speed_ms` : vitesse camera en m/s (optionnel, defaut env `CAMERA_SPEED_MS=0.5`). Per-item ou shared
+- `camera_path` : list[dict] keyframes `{t, translation[3], rotation_quat[4]}` (optionnel, fallback dolly-in si absent). Mode 6-DOF
+- `interpolation` : "linear" | "cubic" (optionnel, defaut "linear"). Mode interpolation keyframes
+- `fov_degrees` : FOV camera source en degres (optionnel, defaut 60.0)
 - `last_image` + `last_image_strength` : optionnels, FLF2V guidage derniere frame
 - `resolution` : `"540p"` (1-stage preview), `"720p"` (defaut, 2-stage), `"1080p"` (2-stage). Suffixe `-portrait` pour 9:16
 - `items[]` : regroupes par prompt pour batching GPU, resultats reordonnes par `_original_index`
@@ -45,13 +48,26 @@ Voir `src/handler.py` pour le schema complet. Points cles :
 
 Declenche uniquement si `camera_motion == "depth"` sur un item I2V. Le mouvement de camera est controle par depth estimation metrique + IC-LoRA Union Control, pas par des camera LoRAs individuels.
 
-**Flow** : image source → DA3METRIC-LARGE (depth metres + sky mask) → parallax warp 2D N depth frames (forward splatting, camera_speed_ms m/s) → normalisation per-frame [0,1] → VAE encode a 0.5× resolution Stage 1 → `VideoConditionByReferenceLatent(downscale_factor=2)` → conditioning Stage 1 uniquement.
+**Flow** : image source → DA3METRIC-LARGE (depth metres + sky mask) → 6-DOF warp N depth frames → normalisation per-frame [0,1] → VAE encode a 0.5× resolution Stage 1 → `VideoConditionByReferenceLatent(downscale_factor=2)` → conditioning Stage 1 uniquement.
 
 **Modeles** :
 - `depth-anything/DA3METRIC-LARGE` : estimation profondeur metrique + sky segmentation (~1.64GB, offloadable CPU)
 - `Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control` (`ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors`) : IC-LoRA fuse permanent dans transformer (654MB)
 
-**Mecanisme** : le IC-LoRA est fuse une seule fois au demarrage (pas de swap, pas de unfuse). Le depth conditioning utilise un parallax warp 2D (forward splatting + z-buffer) : scale = d/(d-δ), les objets proches se deplacent plus du centre que les lointains. La focale s'annule dans la formule. Normalisation per-frame [0,1] (fonctionne car le pattern spatial change entre frames). Le ciel n'est pas warpe (sky_mask → 1.0 apres normalisation).
+**Mecanisme** : le IC-LoRA est fuse une seule fois au demarrage (pas de swap, pas de unfuse). Le depth conditioning utilise un warp 6-DOF (translation + rotation_quat) via unprojection 3D, transformation, reprojection, puis forward splatting + z-buffer. Normalisation per-frame [0,1] (fonctionne car le pattern spatial change entre frames). Le ciel n'est pas warpe (sky_mask → 1.0 apres normalisation).
+
+### Camera path 6-DOF avec Catmull-Rom
+
+Nouveau support pour trajectoires camera scriptes (via keyframes interpolees) : translation XYZ + rotation quaternion [w, x, y, z].
+
+**Format input** — item dict optionnel (fallback backward compat si absent) :
+- `camera_path` : list[dict] avec keyframes `{t, translation[3], rotation_quat[4]}`. Temps `t` normalise [0, 1]. Si absent, fallback sur dolly-in lineaire via `camera_speed_ms`
+- `interpolation` : "linear" | "cubic" (Catmull-Rom 3D + quaternion SLERP). Default "linear"
+- `fov_degrees` : FOV camera source en degres. Default 60°. Calcul focale : `focal_px = width / (2 * tan(fov/2))`
+
+**Backward compat stricte** : si `camera_path=None` ou absent, genere path dolly-in 2-kf interne identique ancien comportement (translation `[0,0,δ]`, rotation identity).
+
+**Implémentation** : module `src/camera_path.py` contient fonctions quaternion math (quat_to_matrix, slerp), Catmull-Rom vec3 + quat, interpolate_camera_path. Fonction `_warp_depth_generic` remplace `_warp_depth_dolly` pour support 6-DOF.
 
 ## Commits Git (override global)
 

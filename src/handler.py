@@ -477,6 +477,13 @@ def handler(job: dict) -> dict:
                     # Mode et gating depth
                     pi["mode"] = item.get("_mode", "i2v_depth")
                     pi["use_depth"] = (item.get("_mode") == "i2v_depth")
+                    # Camera path (6-DOF) — passthrough optionnel
+                    if item.get("camera_path") is not None:
+                        pi["camera_path"] = item["camera_path"]
+                    if item.get("interpolation"):
+                        pi["interpolation"] = item["interpolation"]
+                    if item.get("fov_degrees") is not None:
+                        pi["fov_degrees"] = float(item["fov_degrees"])
                     pipeline_items.append(pi)
 
                 # Callback : soumettre le MP4 encode + S3 upload des que
