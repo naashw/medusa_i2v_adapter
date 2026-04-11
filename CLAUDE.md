@@ -15,19 +15,35 @@ Inference directe Python, sans ComfyUI. Output H264 MP4, 3 tiers : 540p (1-stage
 | SDPA | cuDNN Fused Flash Attention | Natif PyTorch, H100 sm_90 |
 | Docker | Multi-stage cuda:12.8.1 | devel builder -> runtime |
 
+## Modes de génération
+
+4 modes supportes, auto-detectes par les champs presents dans l'item :
+
+| Mode | Champs requis | Description |
+|------|---------------|-------------|
+| **t2v** | `prompt` | Text-to-video (pas d'image source) |
+| **i2v** | `image`, `prompt` | Image-to-video standard |
+| **i2v_depth** | `image`, `camera_motion="depth"` | I2V avec depth IC-LoRA pour controle camera 3D |
+| **flf2v** | `image`, `last_image` | First+last frame guidance (optionnel: depth ignoré) |
+
+Auto-detection : `detect_mode(item)` cheche presence de `image`, `last_image`, et `camera_motion == "depth"`.
+Si un item a `last_image + camera_motion="depth"`, le depth est droppé (incompatible, FLF2V prioritaire).
+
 ## API Input
 
 3 formats retro-compatibles : `image` (single), `images[]` (batch), `items[]` (multi-client).
 Voir `src/handler.py` pour le schema complet. Points cles :
-- `camera_motion` : presets texte (`dolly-in`, `dolly-out`, `dolly-left`, `dolly-right`, `jib-up`, `jib-down`, `static`) pour prompt camera. Alias `camera`
+- `image` : optionnel (None pour t2v). URL https ou base64
+- `prompt` : optionnel, custom. Fallback sur `camera_motion` si absent
+- `camera_motion` : trigger depth via valeur `"depth"`. Alias `camera`. Autres valeurs ignorees
 - `camera_speed_ms` : vitesse camera en m/s (optionnel, defaut env `CAMERA_SPEED_MS=0.5`). Per-item ou shared
+- `last_image` + `last_image_strength` : optionnels, FLF2V guidage derniere frame
 - `resolution` : `"540p"` (1-stage preview), `"720p"` (defaut, 2-stage), `"1080p"` (2-stage). Suffixe `-portrait` pour 9:16
-- `last_image` + `last_image_strength` : optionnels, guidage derniere frame
 - `items[]` : regroupes par prompt pour batching GPU, resultats reordonnes par `_original_index`
 
 ## Depth IC-LoRA (controle camera 3D)
 
-Le mouvement de camera est controle par depth estimation metrique + IC-LoRA Union Control, pas par des camera LoRAs individuels.
+Declenche uniquement si `camera_motion == "depth"` sur un item I2V. Le mouvement de camera est controle par depth estimation metrique + IC-LoRA Union Control, pas par des camera LoRAs individuels.
 
 **Flow** : image source → DA3METRIC-LARGE (depth metres + sky mask) → parallax warp 2D N depth frames (forward splatting, camera_speed_ms m/s) → normalisation per-frame [0,1] → VAE encode a 0.5× resolution Stage 1 → `VideoConditionByReferenceLatent(downscale_factor=2)` → conditioning Stage 1 uniquement.
 

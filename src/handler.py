@@ -31,7 +31,6 @@ from PIL import Image
 from video_encoder import encode_video_fast
 
 from pipeline import MedusaPipeline
-from prompts import CAMERA_PRESETS
 
 logging.basicConfig(level=logging.INFO, format="[handler] %(message)s")
 log = logging.getLogger("handler")
@@ -236,7 +235,29 @@ def postprocess_and_upload(
     return output_meta
 
 
-# --- Normalisation input ---
+# --- Mode detection et normalisation input ---
+
+
+def detect_mode(item: dict) -> str:
+    """Detecte le mode de generation selon les champs presents dans l'item.
+
+    Modes: t2v (text-to-video), i2v (image-to-video),
+    i2v_depth (i2v avec depth IC-LoRA), flf2v (first+last frame).
+    """
+    has_image = bool(item.get("image"))
+    has_last = bool(item.get("last_image"))
+    camera = item.get("camera_motion")
+
+    if not has_image:
+        return "t2v"
+    if has_last:
+        if camera == "depth":
+            log.warning("Item %s: last_image + camera_motion=depth incompatible, dropping depth", item.get("id"))
+            item["camera_motion"] = None
+        return "flf2v"
+    if camera == "depth":
+        return "i2v_depth"
+    return "i2v"
 
 
 def normalize_items(job_input: dict) -> tuple[list[dict], str | None]:
@@ -244,7 +265,7 @@ def normalize_items(job_input: dict) -> tuple[list[dict], str | None]:
 
     Returns (items, error_message). error_message is None on success.
     Chaque item normalise: id, image, camera_motion, seed, last_image,
-    last_image_strength, _original_index.
+    last_image_strength, _original_index. image peut etre None (t2v mode).
     """
     raw_items = job_input.get("items")
     raw_images = job_input.get("images")
@@ -258,14 +279,12 @@ def normalize_items(job_input: dict) -> tuple[list[dict], str | None]:
     shared_prompt = job_input.get("prompt")
 
     if raw_items:
-        # Format items[] — per-item params
+        # Format items[] — per-item params, image optionnel (t2v)
         items = []
         for i, raw in enumerate(raw_items):
             if not isinstance(raw, dict):
                 return [], f"items[{i}] doit etre un objet"
             image = raw.get("image")
-            if not image:
-                return [], f"items[{i}].image est requis"
             items.append({
                 "id": raw.get("id"),
                 "image": image,
@@ -379,26 +398,37 @@ def handler(job: dict) -> dict:
     tmp_files: list[str] = []
 
     try:
-        # --- Download ALL images en parallele (image + last_image) ---
+        # --- Detect mode par item ---
+        for item in normalized:
+            item["_mode"] = detect_mode(item)
+
+        # --- Download ALL images en parallele (image + last_image) — skip si None ---
         all_urls: list[str] = []
         url_map: list[tuple[int, str]] = []  # (item_index, field_name)
         for i, item in enumerate(normalized):
-            all_urls.append(item["image"])
-            url_map.append((i, "_image_path"))
+            if item.get("image"):
+                all_urls.append(item["image"])
+                url_map.append((i, "_image_path"))
             if item.get("last_image"):
                 all_urls.append(item["last_image"])
                 url_map.append((i, "_last_image_path"))
 
-        with ThreadPoolExecutor(max_workers=min(len(all_urls), 8)) as dl_pool:
-            paths = list(dl_pool.map(resolve_image, all_urls))
+        if all_urls:
+            with ThreadPoolExecutor(max_workers=min(len(all_urls), 8)) as dl_pool:
+                paths = list(dl_pool.map(resolve_image, all_urls))
 
-        for (item_idx, field), path in zip(url_map, paths):
-            normalized[item_idx][field] = path
-            tmp_files.append(path)
+            for (item_idx, field), path in zip(url_map, paths):
+                normalized[item_idx][field] = path
+                tmp_files.append(path)
 
-        # --- Resolution cible (une seule fois, premiere image) ---
+        # --- Resolution cible (premiere image avec image_path, sinon resolution fixe) ---
+        first_image_path = None
+        for item in normalized:
+            if item.get("_image_path"):
+                first_image_path = item["_image_path"]
+                break
         height, width = compute_target_resolution(
-            resolution=resolution, image_path=normalized[0]["_image_path"], dynamic=dynamic_resolution,
+            resolution=resolution, image_path=first_image_path, dynamic=dynamic_resolution,
         )
         log.info(
             "Resolution cible: %dx%d (%s, %s%s)",
@@ -406,11 +436,11 @@ def handler(job: dict) -> dict:
             ", dynamic" if dynamic_resolution else "",
         )
 
-        # --- Groupement par prompt (camera_motion → texte) ---
+        # --- Groupement par prompt (prompt ou camera_motion) ---
         groups: dict[str, list[dict]] = {}
         for item in normalized:
             custom = item.get("prompt")
-            prompt_text = custom if custom else CAMERA_PRESETS.get(item["camera_motion"], item["camera_motion"])
+            prompt_text = custom if custom else item.get("camera_motion", "")
             item["_prompt_text"] = prompt_text
             groups.setdefault(prompt_text, []).append(item)
 
@@ -436,12 +466,17 @@ def handler(job: dict) -> dict:
 
                 pipeline_items = []
                 for item in sub_batch:
-                    pi: dict = {"image_path": item["_image_path"], "seed": item["seed"]}
+                    pi: dict = {"seed": item["seed"]}
+                    if item.get("_image_path"):
+                        pi["image_path"] = item["_image_path"]
                     if item.get("_last_image_path"):
                         pi["last_image_path"] = item["_last_image_path"]
                         pi["last_image_strength"] = item.get("last_image_strength", 1.0)
                     if item.get("camera_speed_ms") is not None:
                         pi["camera_speed_ms"] = float(item["camera_speed_ms"])
+                    # Mode et gating depth
+                    pi["mode"] = item.get("_mode", "i2v_depth")
+                    pi["use_depth"] = (item.get("_mode") == "i2v_depth")
                     pipeline_items.append(pi)
 
                 # Callback : soumettre le MP4 encode + S3 upload des que

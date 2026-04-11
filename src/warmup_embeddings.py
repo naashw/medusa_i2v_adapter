@@ -27,7 +27,7 @@ import torch
 from safetensors import safe_open
 
 sys.path.insert(0, os.path.dirname(__file__) if "__file__" in dir() else "/app")
-from prompts import CAMERA_PRESETS, DEFAULT_NEGATIVE_PROMPT  # noqa: E402
+from prompts import DEFAULT_NEGATIVE_PROMPT  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -195,9 +195,9 @@ def main() -> int:
     # Construire text encoder + embeddings processor (GPU si disponible)
     te, emb_proc = build_encoder_and_processor(checkpoint_path, gemma_root)
 
-    # Encoder tous les prompts : 7 cameras + 1 negative
-    all_prompts = list(CAMERA_PRESETS.values()) + [DEFAULT_NEGATIVE_PROMPT]
-    all_keys = list(CAMERA_PRESETS.keys()) + ["_negative"]
+    # Encoder uniquement le prompt negative
+    all_prompts = [DEFAULT_NEGATIVE_PROMPT]
+    all_keys = ["_negative"]
     log.info("Encoding %d prompts...", len(all_prompts))
 
     cache_data: dict[str, dict[str, torch.Tensor]] = {}

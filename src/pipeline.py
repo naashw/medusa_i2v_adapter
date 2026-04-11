@@ -63,12 +63,12 @@ from ltx_pipelines.utils.helpers import (
     cleanup_memory,
     create_noised_state,
     image_conditionings_by_replacing_latent,
+    image_conditionings_by_adding_guiding_latent,
     modality_from_latent_state,
 )
 from ltx_pipelines.utils.samplers import euler_denoising_loop
-from video_encoder import encode_video_fast
 
-from prompts import CAMERA_PRESETS, DEFAULT_NEGATIVE_PROMPT
+from prompts import DEFAULT_NEGATIVE_PROMPT
 
 log = logging.getLogger("medusa")
 
@@ -257,9 +257,9 @@ class MedusaPipeline:
 
         log.info("Pas de cache embeddings — generation avec text encoder sur GPU...")
 
-        # Encoder tous les prompts : 7 presets camera + 1 negative
-        all_prompts = list(CAMERA_PRESETS.values()) + [DEFAULT_NEGATIVE_PROMPT]
-        all_keys = list(CAMERA_PRESETS.keys()) + ["_negative"]
+        # Encoder uniquement le prompt negative
+        all_prompts = [DEFAULT_NEGATIVE_PROMPT]
+        all_keys = ["_negative"]
 
         log.info("Encoding %d prompts...", len(all_prompts))
         results = self._encode_prompts_with_gemma(all_prompts)
@@ -319,8 +319,26 @@ class MedusaPipeline:
         self._log_vram("apres spatial upsampler")
 
     def _load_embeddings_cache(self, cache_path: str) -> None:
-        """Charge les embeddings depuis un fichier .pt."""
+        """Charge les embeddings depuis un fichier .pt.
+
+        Si le cache contient des cles legacy (presets camera), le supprime et regenere.
+        """
         cache_data = torch.load(cache_path, map_location="cpu", weights_only=True)
+
+        # Check version schéma : si legacy presets detectes, invalider le cache
+        legacy_keys = {"dolly-in", "dolly-out", "dolly-left", "dolly-right", "jib-up", "jib-down", "static"}
+        has_legacy = any(k in cache_data for k in legacy_keys)
+
+        if has_legacy:
+            log.warning("Cache embeddings contient presets camera legacy — suppression et regeneration")
+            try:
+                os.unlink(cache_path)
+            except OSError:
+                pass
+            # Regenerer a chaud
+            self.warmup_embeddings(os.path.dirname(cache_path))
+            return
+
         for key, tensors in cache_data.items():
             self._embeddings_cache[key] = (
                 tensors["video"].to(self.device),
@@ -468,9 +486,9 @@ class MedusaPipeline:
         tmp_path = "/tmp/warmup_compile_dummy.png"
         Image.new("RGB", (64, 64), (128, 128, 128)).save(tmp_path)
 
-        # Embeddings depuis le cache (premier preset disponible)
-        first_key = next(iter(self._embeddings_cache))
-        v_ctx, a_ctx = self._embeddings_cache[first_key]
+        # Prompt stub fixe pour warmup (pas de preset)
+        warmup_prompt = "A test scene for compilation warmup"
+        v_ctx, a_ctx = self.encode_prompt(warmup_prompt)
 
         gen = torch.Generator(device=self.device).manual_seed(0)
         noiser = GaussianNoiser(generator=gen)
@@ -1223,20 +1241,12 @@ class MedusaPipeline:
     def encode_prompt(self, prompt: str, negative: str | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode un prompt (cache hit ou Gemma GPU on-demand).
 
-        Lookup 3-step :
-        1. Preset connu (cache RAM par nom de preset)
-        2. Custom en RAM (cache par hash du prompt)
-        3. Custom sur volume (fichier prompt_{hash}.pt)
-        4. Sinon Gemma GPU → encode → cache RAM + volume → cleanup VRAM
+        Lookup steps :
+        1. Cache RAM (par hash du prompt)
+        2. Cache volume (fichier prompt_{hash}.pt)
+        3. Sinon Gemma GPU → encode → cache RAM + volume → cleanup VRAM
         """
-        # 1. Chercher dans les presets (par valeur puis par key)
-        for key, preset_text in CAMERA_PRESETS.items():
-            if prompt == preset_text and key in self._embeddings_cache:
-                return self._embeddings_cache[key]
-        if prompt in self._embeddings_cache:
-            return self._embeddings_cache[prompt]
-
-        # 2. Check RAM cache (custom, par hash)
+        # 1. Check RAM cache (par hash)
         prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:16]
         if prompt_hash in self._embeddings_cache:
             log.info("Prompt cache hit (RAM): %s", prompt[:40])
@@ -1283,208 +1293,6 @@ class MedusaPipeline:
         return self.encode_prompt(DEFAULT_NEGATIVE_PROMPT)
 
     @torch.inference_mode()
-    def generate_frames(
-        self,
-        image_path: str,
-        prompt: str,
-        seed: int,
-        height: int,
-        width: int,
-        num_frames: int,
-        frame_rate: float,
-        image_strength: float = 1.0,
-        last_image_path: str | None = None,
-        last_image_strength: float = 1.0,
-        negative_override: str | None = None,
-        two_stage: bool = False,
-    ) -> list[torch.Tensor]:
-        """Genere les frames I2V sans encoder en MP4.
-
-        Retourne les frames decodees sur CPU pour post-processing async.
-        """
-        generator = torch.Generator(device=self.device).manual_seed(seed)
-
-        # 1. Embeddings (cache hit si preset, Gemma on-demand sinon)
-        v_context_p, a_context_p = self.encode_prompt(prompt)
-
-        # 2. Transformer (deja build au startup)
-        self._log_vram("debut generate")
-        transformer = self.get_transformer()
-
-        # 3. Setup denoising
-        noiser = GaussianNoiser(generator=generator)
-        use_res2s = os.environ.get("SAMPLER", "euler") == "res2s"
-        stepper = Res2sDiffusionStep() if use_res2s else EulerDiffusionStep()
-
-        # 4. Image list
-        images = [ImageConditioningInput(path=image_path, frame_idx=0, strength=image_strength)]
-        if last_image_path is not None:
-            last_latent_idx = (num_frames - 1) // 8
-            images.append(ImageConditioningInput(path=last_image_path, frame_idx=last_latent_idx, strength=last_image_strength))
-
-        # 5. Denoiser (no guidance — CFG=1.0, STG=0.0)
-        denoiser = _MedusaDenoiser(v_context_p, a_context_p)
-
-        if two_stage:
-            # --- 2-stage pipeline (1080p) ---
-            half_h = height // 2
-            half_w = width // 2
-
-            # Stage 1 — denoise at half-res (8 steps)
-            log.info("Stage 1: denoise %dx%d (half-res, 8 steps)...", half_w, half_h)
-            conditionings_s1 = image_conditionings_by_replacing_latent(
-                images=images,
-                height=half_h,
-                width=half_w,
-                video_encoder=self._video_encoder,
-                dtype=self.dtype,
-                device=self.device,
-            )
-
-            output_shape_s1 = VideoPixelShape(
-                batch=1, frames=num_frames, width=half_w, height=half_h, fps=frame_rate,
-            )
-            v_tools_s1 = self._make_video_tools(output_shape_s1)
-            a_tools_s1 = self._make_audio_tools(output_shape_s1)
-            video_state_s1 = create_noised_state(v_tools_s1, conditionings_s1, noiser, self.dtype, self.device)
-            audio_state_s1 = create_noised_state(a_tools_s1, [], noiser, self.dtype, self.device)
-
-            video_state_s1, audio_state_s1 = euler_denoising_loop(
-                self._sigmas, video_state_s1, audio_state_s1, stepper, transformer, denoiser,
-            )
-            video_state_s1 = v_tools_s1.clear_conditioning(video_state_s1)
-            video_state_s1 = v_tools_s1.unpatchify(video_state_s1)
-            audio_state_s1 = a_tools_s1.clear_conditioning(audio_state_s1)
-            audio_state_s1 = a_tools_s1.unpatchify(audio_state_s1)
-            self._log_vram("apres stage 1")
-            torch.cuda.empty_cache()
-
-            # Spatial upscale x2 in latent space
-            log.info("Upscale latent x2...")
-            upscaled_latent = upsample_video(
-                latent=video_state_s1.latent[:1],
-                video_encoder=self._video_encoder,
-                upsampler=self._spatial_upsampler,
-            )
-            self._log_vram("apres upscale")
-            torch.cuda.empty_cache()
-
-            # Stage 2 — refine at full-res (3 steps)
-            log.info("Stage 2: refine %dx%d (full-res, 3 steps)...", width, height)
-            conditionings_s2 = image_conditionings_by_replacing_latent(
-                images=images,
-                height=height,
-                width=width,
-                video_encoder=self._video_encoder,
-                dtype=self.dtype,
-                device=self.device,
-            )
-
-            output_shape_s2 = VideoPixelShape(
-                batch=1, frames=num_frames, width=width, height=height, fps=frame_rate,
-            )
-            v_tools_s2 = self._make_video_tools(output_shape_s2)
-            a_tools_s2 = self._make_audio_tools(output_shape_s2)
-            noise_scale_s2 = self._stage2_sigmas[0].item()
-            video_state = create_noised_state(
-                v_tools_s2, conditionings_s2, noiser, self.dtype, self.device,
-                noise_scale=noise_scale_s2, initial_latent=upscaled_latent,
-            )
-            _audio_state = create_noised_state(
-                a_tools_s2, [], noiser, self.dtype, self.device,
-                noise_scale=noise_scale_s2, initial_latent=audio_state_s1.latent,
-            )
-
-            video_state, _audio_state = euler_denoising_loop(
-                self._stage2_sigmas, video_state, _audio_state, stepper, transformer, denoiser,
-            )
-            video_state = v_tools_s2.clear_conditioning(video_state)
-            video_state = v_tools_s2.unpatchify(video_state)
-            self._log_vram("apres stage 2")
-
-        else:
-            # --- 1-stage pipeline (720p) ---
-            log.info("1-stage: denoise %dx%d (8 steps)...", width, height)
-            conditionings = image_conditionings_by_replacing_latent(
-                images=images,
-                height=height,
-                width=width,
-                video_encoder=self._video_encoder,
-                dtype=self.dtype,
-                device=self.device,
-            )
-
-            output_shape = VideoPixelShape(
-                batch=1, frames=num_frames, width=width, height=height, fps=frame_rate,
-            )
-            v_tools = self._make_video_tools(output_shape)
-            a_tools = self._make_audio_tools(output_shape)
-            video_state = create_noised_state(v_tools, conditionings, noiser, self.dtype, self.device)
-            _audio_state = create_noised_state(a_tools, [], noiser, self.dtype, self.device)
-
-            video_state, _audio_state = euler_denoising_loop(
-                self._sigmas, video_state, _audio_state, stepper, transformer, denoiser,
-            )
-            video_state = v_tools.clear_conditioning(video_state)
-            video_state = v_tools.unpatchify(video_state)
-
-        torch.cuda.empty_cache()
-
-        # 7. VAE decode (tiling optionnel pour 1080p)
-        tiling = TilingConfig.default() if os.environ.get("VAE_TILING", "0") == "1" else None
-        log.info("VAE decode%s...", " (tiled)" if tiling else "")
-        decoded_video: Iterator[torch.Tensor] = self._video_decoder.decode_video(
-            video_state.latent,
-            tiling,
-            generator,
-        )
-
-        # 8. Materialiser frames sur CPU pour post-processing async
-        frames = [chunk.cpu() for chunk in decoded_video]
-        log.info("Frames generees: %d chunks", len(frames))
-        return frames
-
-    @torch.inference_mode()
-    def generate(
-        self,
-        image_path: str,
-        prompt: str,
-        seed: int,
-        height: int,
-        width: int,
-        num_frames: int,
-        frame_rate: float,
-        output_path: str,
-        image_strength: float = 1.0,
-        last_image_path: str | None = None,
-        last_image_strength: float = 1.0,
-        negative_override: str | None = None,
-        two_stage: bool = False,
-    ) -> None:
-        """Genere une video I2V et sauvegarde en MP4 (retro-compatible).
-
-        Delegue a generate_frames() puis encode le MP4.
-        """
-        frames = self.generate_frames(
-            image_path=image_path,
-            prompt=prompt,
-            seed=seed,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            frame_rate=frame_rate,
-            image_strength=image_strength,
-            last_image_path=last_image_path,
-            last_image_strength=last_image_strength,
-            negative_override=negative_override,
-            two_stage=two_stage,
-        )
-
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        encode_video_fast(video=iter(frames), fps=int(frame_rate), output_path=output_path)
-        log.info("Video sauvegardee: %s", output_path)
-
-    @torch.inference_mode()
     def generate_batch_frames(
         self,
         items: list[dict],
@@ -1500,8 +1308,10 @@ class MedusaPipeline:
         """Genere les frames pour un batch d'items (meme prompt, images/seeds differents).
 
         Chaque item dict doit avoir:
-            image_path: str (fichier local)
+            image_path: str | None (optionnel pour t2v)
             seed: int
+            mode: str (optionnel, default "i2v_depth": t2v, i2v, i2v_depth, flf2v)
+            use_depth: bool (optionnel, gere le depth conditioning par item)
         Optionnel:
             last_image_path: str
             last_image_strength: float (defaut 1.0)
@@ -1560,13 +1370,10 @@ class MedusaPipeline:
             for i, item in enumerate(items):
                 noiser_i = GaussianNoiser(generator=generators[i])
 
-                # Conditionings per item (batch=1)
-                images_i = [ImageConditioningInput(path=item["image_path"], frame_idx=0, strength=image_strength)]
-                last_img = item.get("last_image_path")
-                if last_img:
-                    last_idx = (num_frames - 1) // 8
-                    last_str = item.get("last_image_strength", 1.0)
-                    images_i.append(ImageConditioningInput(path=last_img, frame_idx=last_idx, strength=last_str))
+                # Conditionings per item (batch=1) — premier frame optionnel
+                images_i = []
+                if item.get("image_path"):
+                    images_i.append(ImageConditioningInput(path=item["image_path"], frame_idx=0, strength=image_strength))
 
                 conds_i = image_conditionings_by_replacing_latent(
                     images=images_i,
@@ -1577,8 +1384,23 @@ class MedusaPipeline:
                     device=self.device,
                 )
 
-                # IC-LoRA conditionings (depth) — per-item, Stage 1 only
-                if extra_conditionings:
+                # Last frame optionnel (FLF2V) — ajouté avec guiding latent
+                last_img = item.get("last_image_path")
+                if last_img:
+                    last_idx = (num_frames - 1) // 8
+                    last_str = item.get("last_image_strength", 1.0)
+                    last_conds = image_conditionings_by_adding_guiding_latent(
+                        images=[ImageConditioningInput(path=last_img, frame_idx=last_idx, strength=last_str)],
+                        height=h,
+                        width=w,
+                        video_encoder=self._video_encoder,
+                        dtype=self.dtype,
+                        device=self.device,
+                    )
+                    conds_i = conds_i + last_conds
+
+                # IC-LoRA depth conditioning — gating per-item
+                if extra_conditionings and item.get("use_depth", False):
                     conds_i = conds_i + [extra_conditionings[i]]
 
                 init_vid_i = initial_video_latents[i:i+1] if initial_video_latents is not None else None
@@ -1618,18 +1440,22 @@ class MedusaPipeline:
             # --- 2-stage batch pipeline ---
             half_h, half_w = height // 2, width // 2
 
-            # IC-LoRA depth conditioning per-item (Stage 1 only)
-            depth_conds: list[ConditioningItem] | None = None
+            # IC-LoRA depth conditioning per-item (Stage 1 only) — gating par item
+            depth_conds: list[ConditioningItem | None] | None = None
             if self._depth_lora_enabled and self._depth_model is not None:
                 t0_depth = time.perf_counter()
                 depth_conds = []
                 for item in items:
-                    camera_speed = item.get("camera_speed_ms", self._camera_speed_ms_default)
-                    depth_conds.append(self.create_depth_conditioning(
-                        item["image_path"], half_h, half_w, num_frames,
-                        frame_rate=frame_rate, camera_speed_ms=camera_speed,
-                    ))
-                log.info("Depth conditioning: %d items (%.1fs)", len(depth_conds), time.perf_counter() - t0_depth)
+                    use_depth = item.get("use_depth", False)
+                    if use_depth and item.get("image_path"):
+                        camera_speed = item.get("camera_speed_ms", self._camera_speed_ms_default)
+                        depth_conds.append(self.create_depth_conditioning(
+                            item["image_path"], half_h, half_w, num_frames,
+                            frame_rate=frame_rate, camera_speed_ms=camera_speed,
+                        ))
+                    else:
+                        depth_conds.append(None)
+                log.info("Depth conditioning: %d items (%.1fs)", sum(1 for c in depth_conds if c is not None), time.perf_counter() - t0_depth)
 
             # Stage 1 — half-res batch denoise
             log.info("Batch Stage 1: denoise %dx%d (half-res, 8 steps)...", half_w, half_h)
@@ -1678,18 +1504,22 @@ class MedusaPipeline:
 
         else:
             # --- 1-stage batch pipeline ---
-            # IC-LoRA depth conditioning per-item
-            depth_conds_1s: list[ConditioningItem] | None = None
+            # IC-LoRA depth conditioning per-item — gating par item
+            depth_conds_1s: list[ConditioningItem | None] | None = None
             if self._depth_lora_enabled and self._depth_model is not None:
                 t0_depth = time.perf_counter()
                 depth_conds_1s = []
                 for item in items:
-                    camera_speed = item.get("camera_speed_ms", self._camera_speed_ms_default)
-                    depth_conds_1s.append(self.create_depth_conditioning(
-                        item["image_path"], height, width, num_frames,
-                        frame_rate=frame_rate, camera_speed_ms=camera_speed,
-                    ))
-                log.info("Depth conditioning: %d items (%.1fs)", len(depth_conds_1s), time.perf_counter() - t0_depth)
+                    use_depth = item.get("use_depth", False)
+                    if use_depth and item.get("image_path"):
+                        camera_speed = item.get("camera_speed_ms", self._camera_speed_ms_default)
+                        depth_conds_1s.append(self.create_depth_conditioning(
+                            item["image_path"], height, width, num_frames,
+                            frame_rate=frame_rate, camera_speed_ms=camera_speed,
+                        ))
+                    else:
+                        depth_conds_1s.append(None)
+                log.info("Depth conditioning: %d items (%.1fs)", sum(1 for c in depth_conds_1s if c is not None), time.perf_counter() - t0_depth)
 
             log.info("Batch 1-stage: denoise %dx%d (8 steps)...", width, height)
             batched_video, batched_audio, (vtools, atools) = create_batched_states(

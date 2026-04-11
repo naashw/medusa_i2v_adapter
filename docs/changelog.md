@@ -1,5 +1,37 @@
 # Changelog — Medusa I2V
 
+## 2026-04-11 — Phase A : Support multi-mode (t2v, i2v, i2v_depth, flf2v)
+
+Refactor Python pour support 4 modes de generation avec auto-detection par champs presents. Suppression des CAMERA_PRESETS presets (legacy), activation depth via trigger explicite `camera_motion="depth"` uniquement.
+
+### Fichiers modifies
+
+- `src/prompts.py` : Suppression dict `CAMERA_PRESETS` (lignes 9-17)
+- `src/pipeline.py` :
+  - Import `image_conditionings_by_adding_guiding_latent` (support FLF2V last_image)
+  - `warmup_embeddings()` : encode uniquement `DEFAULT_NEGATIVE_PROMPT` (pas de presets)
+  - `_load_embeddings_cache()` : check legacy presets, regenere si detectes
+  - `warmup_compile()` : prompt stub fixe `"A test scene for compilation warmup"` au lieu de presets
+  - `encode_prompt()` : lookup presets supprime, docstring simplifiee
+  - `generate_frames()` : signature `image_path: str | None = None`, param `mode`, refactor conditioning (replacement + guiding latent pour last_image)
+  - `generate_batch_frames()` : signature items avec optionnel `image_path`, `mode`, `use_depth` per-item, gating depth par item
+- `src/handler.py` :
+  - `normalize_items()` : accepter items sans `image` (t2v)
+  - Nouvelle fonction `detect_mode()` : auto-detection t2v/i2v/i2v_depth/flf2v
+  - Download parallele : skip items sans `image`, gestion resolution cible sans premiere image
+  - Groupement par prompt : direct (pas lookup CAMERA_PRESETS)
+  - Ajout `mode` et `use_depth` par item aux pipeline_items
+- `src/warmup_embeddings.py` : encode uniquement `DEFAULT_NEGATIVE_PROMPT`
+- `CLAUDE.md` : ajout section "Modes de generation" (4 modes), mise a jour "API Input" et "Depth IC-LoRA"
+
+### Backward compatibility
+
+Default `mode="i2v_depth"` preserve comportement actuel (image requise, depth active). Items sans `use_depth` sont treated comme `False` (pas de depth).
+
+### Trigger depth explicite
+
+Depth IC-LoRA s'active seulement si `camera_motion == "depth"` sur un item I2V (pas d'image → t2v, image+last → flf2v, sinon i2v standard).
+
 ## 2026-04-07 — Fix Gemma config + auto-migration
 
 ### Fix : `rope_local_base_freq` manquant dans Gemma config

@@ -132,9 +132,8 @@ handler(job)
   │
   ├─ 6. Pour chaque groupe de prompt:
   │     ├─ Decouper en sub-batches de BATCH_SIZE
-  │     ├─ 1 item  → pipeline.generate_frames()
-  │     ├─ N items → pipeline.generate_batch_frames()
-  │     └─ Post-processing async par item
+  │     ├─ pipeline.generate_batch_frames() (1 ou N items)
+  │     └─ Post-processing async par item (callback on_item_decoded)
   │
   ├─ 7. Reordonner resultats par index original
   ├─ 8. Ajouter "id" dans chaque result (si fourni)
