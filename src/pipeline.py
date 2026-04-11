@@ -869,11 +869,21 @@ class MedusaPipeline:
     ) -> torch.Tensor:
         """6-DOF depth warp via unproject→transform→reproject + forward splatting.
 
+        Convention: translation et rotation_quat sont fournis en repere monde
+        Y-up, right-handed, Z-forward (CLAUDE.md). L'unprojection pixel utilise
+        Y-down (convention image standard), donc on convertit en interne via
+        F = diag(1, -1, 1):
+          - translation_pix = F @ translation
+          - R_pix = F @ R_user @ F
+
+        Pour une translation Z pure (dolly), F @ R @ F = R et le Y-flip de
+        translation n'a aucun effet → compat totale avec l'ancien comportement.
+
         Args:
             depth: [H, W] profondeur metrique en metres (GPU)
-            translation: [3] deplacement camera en metres [x, y, z]
-            rotation_quat: [4] quaternion unit [w, x, y, z]
-            focal_px: focal length en pixels (stage1_w / (2 * tan(fov/2)))
+            translation: [3] deplacement camera en metres [x, y, z] (Y-up)
+            rotation_quat: [4] quaternion unit [w, x, y, z] (Y-up)
+            focal_px: focal length en pixels, doit correspondre a depth.shape[1]
             sky_mask: [H, W] bool (True = ciel, pas warpe)
 
         Returns:
@@ -882,8 +892,14 @@ class MedusaPipeline:
         H, W = depth.shape
         device = depth.device
 
-        # Quaternion to rotation matrix
-        R = quat_to_matrix(rotation_quat.unsqueeze(0))[0]  # [3, 3]
+        # Convention flip : user (Y-up) → pixel (Y-down)
+        # F = diag(1, -1, 1), involution : F @ F = I
+        flip = torch.tensor([1.0, -1.0, 1.0], device=device, dtype=torch.float32)
+        translation = translation * flip  # [tx, -ty, tz]
+
+        # Quaternion to rotation matrix puis F @ R @ F → convention pixel
+        R_user = quat_to_matrix(rotation_quat.unsqueeze(0))[0]  # [3, 3]
+        R = R_user * flip.unsqueeze(0) * flip.unsqueeze(1)  # F @ R_user @ F
 
         cx, cy = (W - 1) / 2.0, (H - 1) / 2.0
         f = focal_px
@@ -901,10 +917,11 @@ class MedusaPipeline:
         Z = depth
         P = torch.stack([X, Y, Z], dim=-1)  # [H, W, 3]
 
-        # Transform inverse : P' = R^T @ (P - translation)
+        # Transform inverse : P' = R^T @ (P - translation) pour chaque point colonne.
+        # Avec P_trans[H,W,3] (dernier axe = vecteur), appliquer R^T au vecteur colonne
+        # equivaut a post-multiplier par R : (R^T @ p_col)[d] = sum_c R[c,d] * p[c] = (p_row @ R)[d]
         P_trans = P - translation.unsqueeze(0).unsqueeze(0)  # [H, W, 3]
-        # einsum: [H, W, 3] @ [3, 3]^T -> [H, W, 3]
-        P_prime = torch.einsum("hij,ji->hij", P_trans, R)
+        P_prime = P_trans @ R  # [H, W, 3] @ [3, 3] -> [H, W, 3]
 
         # Reproject 3D → 2D
         u_new = cx + f * P_prime[..., 0] / torch.clamp(P_prime[..., 2], min=1e-6)
@@ -926,6 +943,9 @@ class MedusaPipeline:
         output = torch.full((H * W,), float("inf"), device=device, dtype=torch.float32)
         output.scatter_reduce_(0, flat_idx, flat_d, reduce="amin")
         output = output.view(H, W)
+
+        # Fallback global (utilise si image 100% ciel ou trous non comblables)
+        fallback_val = depth[fg].max() if fg.any() else depth.max()
 
         # Hole filling via morphological dilation (weighted avg of neighbors)
         holes = output.isinf()
@@ -951,12 +971,14 @@ class MedusaPipeline:
             # Fallback: pixels still empty → max foreground
             still_empty = output == 0.0
             if still_empty.any():
-                fill_val = depth[fg].max() if fg.any() else depth.max()
-                output[still_empty] = fill_val
+                output[still_empty] = fallback_val
 
         # Sky: non-warped, set to max depth
         if sky_mask.any():
-            output[sky_mask] = output[~sky_mask].max() if (~sky_mask).any() else fill_val
+            if (~sky_mask).any():
+                output[sky_mask] = output[~sky_mask].max()
+            else:
+                output[sky_mask] = fallback_val
 
         return output
 
@@ -1169,10 +1191,15 @@ class MedusaPipeline:
         depth_meters, sky_mask = self.estimate_depth_metric(image_path)
 
         # 2. Compute focal length from FOV
+        # IMPORTANT: focal_px doit correspondre a la resolution sur laquelle
+        # l'unprojection/reprojection est faite, soit depth_meters.shape.
+        # Utiliser ref_w ici introduirait un facteur focal_wrong/focal_correct
+        # sur les translations X/Y et rotations (invisible pour dolly-in Z pur).
         scale = self._depth_downscale_factor
-        ref_h = (stage1_h // scale // 32) * 32  # multiples de 32
+        ref_h = (stage1_h // scale // 32) * 32  # multiples de 32 (target resize)
         ref_w = (stage1_w // scale // 32) * 32
-        focal_px = ref_w / (2 * math.tan(math.radians(fov_degrees) / 2))
+        depth_w = depth_meters.shape[1]
+        focal_px = depth_w / (2 * math.tan(math.radians(fov_degrees) / 2))
 
         # 3. Render depth sequence (6-DOF warp avec camera_path optionnel)
         depth_video = self.render_depth_sequence(
