@@ -294,6 +294,9 @@ def normalize_items(job_input: dict) -> tuple[list[dict], str | None]:
                 "last_image": raw.get("last_image"),
                 "last_image_strength": raw.get("last_image_strength", shared_last_image_strength),
                 "prompt": raw.get("prompt"),
+                "camera_path": raw.get("camera_path"),
+                "interpolation": raw.get("interpolation"),
+                "fov_degrees": raw.get("fov_degrees"),
                 "_original_index": i,
             })
         return items, None
