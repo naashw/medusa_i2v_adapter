@@ -1100,8 +1100,10 @@ class MedusaPipeline:
         for i in range(num_frames):
             t = i / max(num_frames - 1, 1)
 
-            # Interpolate camera pose
+            # Interpolate camera pose (CPU tensors → move to depth device)
             trans, quat = interpolate_camera_path(camera_path, t, interpolation)
+            trans = trans.to(depth_meters.device)
+            quat = quat.to(depth_meters.device)
 
             # 6-DOF depth warp
             depth_frame = self._warp_depth_generic(depth_meters, trans, quat, focal_px, sky_mask)
