@@ -32,7 +32,6 @@ import torch.nn.functional as F
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module=r"torch\._dynamo")
 warnings.filterwarnings("ignore", message=".*To copy construct from a tensor.*", module=r"torch\.")
 from safetensors import safe_open
-from safetensors.torch import load_file as load_safetensors
 from safetensors.torch import save_file as save_safetensors
 
 from ltx_core.components.diffusion_steps import EulerDiffusionStep, Res2sDiffusionStep
@@ -43,6 +42,7 @@ from ltx_core.conditioning import (
     ConditioningItem,
     VideoConditionByReferenceLatent,
 )
+from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP
 from ltx_core.loader.sd_ops import SDOps
 from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
 from ltx_core.model.transformer import LTXModelConfigurator, LTXV_MODEL_COMFY_RENAMING_MAP, X0Model
@@ -80,7 +80,7 @@ if torch.cuda.is_available():
 
 
 # Version du cache transformer (incrementer pour invalider tous les caches existants)
-CACHE_VERSION = "v4"
+CACHE_VERSION = "v5"
 
 
 class _MedusaDenoiser:
@@ -674,111 +674,6 @@ class MedusaPipeline:
                         total_sz = sum(os.path.getsize(os.path.join(dp, f)) for f in files)
                         log.debug("    fxgraph/%s: %d files, %.1f KB", d, len(files), total_sz / 1024)
 
-    def _get_orig_module(self) -> torch.nn.Module:
-        """Unwrap torch.compile OptimizedModule si besoin."""
-        mod = self._transformer
-        if hasattr(mod, "_orig_mod"):
-            return mod._orig_mod
-        return mod
-
-    # ------------------------------------------------------------------
-    # Depth IC-LoRA : load / fuse
-    # ------------------------------------------------------------------
-
-    def _load_lora_deltas(self, name: str, filename: str, strength: float) -> dict[str, torch.Tensor]:
-        """Pre-calcule les deltas LoRA (B @ A * strength).
-
-        Charge le safetensors, renomme les cles si necessaire, et retourne
-        les deltas pre-calcules pour fusion immediate.
-        """
-        lora_path = os.path.join(self._lora_dir, filename)
-        if not os.path.isfile(lora_path):
-            log.warning("LoRA '%s' introuvable: %s", name, lora_path)
-            return {}
-
-        log.info(
-            "Chargement LoRA '%s': %s (strength=%.2f)",
-            name, filename, strength,
-        )
-        raw = load_safetensors(lora_path, device=str(self.device))
-
-        # Log les cles pour diagnostic
-        sample_keys = list(raw.keys())[:5]
-        log.info("LoRA '%s' sample keys: %s", name, sample_keys)
-
-        # Grouper les paires lora_A/lora_B par cle de base
-        # Convention : strip "diffusion_model." prefix (renaming Comfy → ltx-core interne)
-        pairs: dict[str, dict[str, torch.Tensor]] = {}
-        for key, tensor in raw.items():
-            clean = key.replace("diffusion_model.", "", 1) if key.startswith("diffusion_model.") else key
-
-            if ".lora_A.weight" in clean:
-                base = clean.replace(".lora_A.weight", "")
-                pairs.setdefault(base, {})["A"] = tensor
-            elif ".lora_B.weight" in clean:
-                base = clean.replace(".lora_B.weight", "")
-                pairs.setdefault(base, {})["B"] = tensor
-            elif ".alpha" in clean:
-                base = clean.replace(".alpha", "")
-                pairs.setdefault(base, {})["alpha"] = tensor
-
-        # Calculer delta = (B @ A) * (alpha/rank) * strength
-        deltas: dict[str, torch.Tensor] = {}
-        for base_key, pair in pairs.items():
-            if "A" not in pair or "B" not in pair:
-                continue
-            a_tensor = pair["A"].to(dtype=self.dtype)
-            b_tensor = pair["B"].to(dtype=self.dtype)
-            delta = b_tensor @ a_tensor
-
-            if "alpha" in pair:
-                rank = a_tensor.shape[0]
-                alpha_val = pair["alpha"].item()
-                delta = delta * (alpha_val / rank)
-
-            delta = delta * strength
-            # Prepend velocity_model. pour matcher named_parameters() du X0Model
-            deltas[f"velocity_model.{base_key}.weight"] = delta
-            del a_tensor, b_tensor
-
-        if not deltas:
-            log.warning("LoRA '%s': aucun delta compute (format inconnu ?)", name)
-
-        log.info("LoRA '%s': %d parametres affectes", name, len(deltas))
-        return deltas
-
-    def _apply_lora_delta(self, param: torch.nn.Parameter, delta: torch.Tensor) -> None:
-        """Applique un delta LoRA in-place (add), en gerant le dtype (FP8 cast safe)."""
-        original_dtype = param.data.dtype
-        if original_dtype != torch.bfloat16:
-            param_bf16 = param.data.to(torch.bfloat16)
-            param_bf16.add_(delta)
-            param.data.copy_(param_bf16.to(original_dtype))
-        else:
-            param.data.add_(delta)
-
-    def _fuse_lora(self, name: str, deltas: dict[str, torch.Tensor]) -> None:
-        """Fuse un LoRA dans le transformer (add deltas in-place)."""
-        if not deltas:
-            return
-        transformer = self._get_orig_module()
-        state_dict = dict(transformer.named_parameters())
-        applied = 0
-        for param_name, delta in deltas.items():
-            if param_name in state_dict:
-                self._apply_lora_delta(state_dict[param_name], delta)
-                applied += 1
-            elif log.isEnabledFor(logging.DEBUG):
-                log.debug("LoRA fuse skip: %s (pas dans le transformer)", param_name)
-        log.info("LoRA '%s' fused: %d/%d params", name, applied, len(deltas))
-        if applied == 0 and deltas:
-            expected = list(deltas.keys())[:3]
-            available = list(state_dict.keys())[:3]
-            log.warning(
-                "LoRA '%s': AUCUN parametre fuse — cles LoRA: %s, transformer: %s",
-                name, expected, available,
-            )
-
     # --- Depth estimation (DA3) + IC-LoRA conditioning ---
 
     def load_depth_model(self) -> None:
@@ -1230,14 +1125,18 @@ class MedusaPipeline:
         )
         return cond
 
-    def _cache_fingerprint(self) -> str:
-        """Hash d'invalidation pour le cache transformer pre-fusionne.
+    def _cache_fingerprint(self, lora_path: str | None = None, lora_strength: float = 1.0) -> str:
+        """Hash d'invalidation pour le cache transformer (avec LoRA fuse).
 
-        Combine CACHE_VERSION et taille du checkpoint. Retourne un hash court (16 chars).
+        Combine CACHE_VERSION, taille checkpoint, et LoRA path/strength.
+        Retourne un hash court (16 chars).
         """
         h = hashlib.sha256()
         h.update(CACHE_VERSION.encode())
         h.update(str(os.path.getsize(self._checkpoint_path)).encode())
+        if lora_path is not None:
+            h.update(str(os.path.getsize(lora_path)).encode())
+            h.update(str(lora_strength).encode())
         return h.hexdigest()[:16]
 
     def _save_transformer_cache(self, cache_path: str) -> None:
@@ -1248,8 +1147,7 @@ class MedusaPipeline:
         et copie les metadonnees du checkpoint original.
         Ecriture atomique via .tmp + os.replace().
         """
-        module = self._get_orig_module()
-        raw_sd = module.velocity_model.state_dict()
+        raw_sd = self._transformer.velocity_model.state_dict()
 
         # Re-ajouter le prefixe checkpoint (inverse du renaming COMFY fait au chargement)
         sd = {f"model.diffusion_model.{k}": v.cpu() for k, v in raw_sd.items()}
@@ -1275,10 +1173,16 @@ class MedusaPipeline:
                 pass
             raise
 
-    def _build_transformer_from_checkpoint(self, checkpoint_path: str) -> torch.nn.Module:
+    def _build_transformer_from_checkpoint(
+        self,
+        checkpoint_path: str,
+        lora_path: str | None = None,
+        lora_strength: float = 1.0,
+    ) -> torch.nn.Module:
         """Build le transformer avec SingleGPUModelBuilder + FP8 quantization.
 
-        Reproduit la logique de DiffusionStage._build_transformer() (blocks.py:179-206).
+        Si lora_path est fourni, le LoRA est fuse pendant le build via le
+        kernel Triton natif de ltx-core (apply_loras).
         """
         quantization = QuantizationPolicy.fp8_cast()
         base_sd_ops = LTXV_MODEL_COMFY_RENAMING_MAP
@@ -1292,7 +1196,10 @@ class MedusaPipeline:
             model_sd_ops=sd_ops,
             module_ops=quantization.module_ops,
         )
-        return X0Model(builder.build(device=self.device, dtype=self.dtype)).to(self.device).eval()
+        if lora_path is not None:
+            builder = builder.lora(lora_path, strength=lora_strength, sd_ops=LTXV_LORA_COMFY_RENAMING_MAP)
+        transformer = X0Model(builder.build(device=self.device, dtype=self.dtype))
+        return transformer.to(self.device)
 
     def _load_transformer_cache(self, cache_path: str) -> torch.nn.Module:
         """Charge le transformer pre-fusionne depuis le cache."""
@@ -1300,22 +1207,44 @@ class MedusaPipeline:
         return self._build_transformer_from_checkpoint(cache_path)
 
     def get_transformer(self) -> torch.nn.Module:
-        """Retourne le transformer distilled avec FP8 Cast.
+        """Retourne le transformer distilled avec FP8 Cast + LoRA fuse.
 
         Checkpoint distilled BF16 + QuantizationPolicy.fp8_cast() → stockage FP8, compute BF16.
-        Compatible torch.compile (SDPA natif, FlashAttention2 sur H100).
+        Si DEPTH_LORA=1, le IC-LoRA est fuse nativement par le builder (kernel Triton).
+        Le cache contient le transformer avec LoRA deja fuse.
         """
         if self._transformer is not None:
             return self._transformer
 
+        # Determiner LoRA path
+        lora_path = None
+        lora_strength = self._depth_lora_strength
+        if self._depth_lora_enabled:
+            lp = os.path.join(self._lora_dir, self._depth_lora_file)
+            if os.path.isfile(lp):
+                lora_path = lp
+
         cache_dir = os.path.join(os.path.dirname(self.models_dir), "cache", "transformer")
         os.makedirs(cache_dir, exist_ok=True)
-        fingerprint = self._cache_fingerprint()
-        cache_path = os.path.join(cache_dir, f"transformer_{fingerprint}.safetensors")
+        fingerprint = self._cache_fingerprint(lora_path=lora_path, lora_strength=lora_strength)
+        cache_filename = f"transformer_{fingerprint}.safetensors"
+        cache_path = os.path.join(cache_dir, cache_filename)
         cache_enabled = os.environ.get("TRANSFORMER_CACHE", "1") == "1"
+
+        # Purger les anciens caches transformer (fingerprint different)
+        for old_file in os.listdir(cache_dir):
+            if old_file.startswith("transformer_") and old_file.endswith(".safetensors") and old_file != cache_filename:
+                old_path = os.path.join(cache_dir, old_file)
+                try:
+                    size_gb = os.path.getsize(old_path) / 2**30
+                    os.unlink(old_path)
+                    log.info("Purge ancien cache transformer: %s (%.1fGB)", old_file, size_gb)
+                except OSError as e:
+                    log.warning("Echec purge %s: %s", old_file, e)
 
         if cache_enabled and os.path.isfile(cache_path):
             try:
+                # Cache FP8 avec LoRA deja fuse — pas besoin de re-fuser
                 self._transformer = self._load_transformer_cache(cache_path)
             except Exception as e:
                 log.warning("Cache transformer invalide, rebuild: %s", e)
@@ -1325,19 +1254,16 @@ class MedusaPipeline:
                     pass
 
         if self._transformer is None:
-            log.info("Build transformer distilled (FP8 cast)...")
-            self._transformer = self._build_transformer_from_checkpoint(self._checkpoint_path)
+            log.info("Build transformer distilled (FP8 cast%s)...",
+                     " + LoRA depth" if lora_path else "")
+            self._transformer = self._build_transformer_from_checkpoint(
+                self._checkpoint_path,
+                lora_path=lora_path,
+                lora_strength=lora_strength,
+            )
 
             if cache_enabled:
                 self._save_transformer_cache(cache_path)
-
-        # --- Depth IC-LoRA ---
-        if self._depth_lora_enabled:
-            deltas = self._load_lora_deltas(
-                self._depth_lora_name, self._depth_lora_file, self._depth_lora_strength,
-            )
-            self._fuse_lora(self._depth_lora_name, deltas)
-            del deltas
 
         # torch.compile sur les blocs transformer
         if os.environ.get("TORCH_COMPILE", "1") == "1":
