@@ -5,6 +5,10 @@
 # ==========================================
 
 # 🔑 Configuration
+# Charge automatiquement scripts/.env s'il existe (cf. scripts/.env.example)
+__ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+set -a; [ -f "$__ENV_DIR/.env" ] && . "$__ENV_DIR/.env"; set +a
+
 API_KEY="${RUNPOD_API_KEY:?RUNPOD_API_KEY non definie}"
 ENDPOINT_ID="${RUNPOD_ENDPOINT_ID:?RUNPOD_ENDPOINT_ID non definie}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

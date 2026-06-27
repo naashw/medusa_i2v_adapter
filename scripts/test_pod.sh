@@ -15,8 +15,11 @@ echo "Build parallelism: $CPU_COUNT jobs"
 export TORCH_CUDA_ARCH_LIST="9.0"
 
 PIP="pip install --break-system-packages --no-cache-dir"
-# Deploy token GitLab injecte via variable d'env (ne JAMAIS hardcoder le token)
-REPO_URL="https://gitlab+deploy-token-12677264:${GITLAB_DEPLOY_TOKEN:?GITLAB_DEPLOY_TOKEN non definie}@gitlab.com/medusa7293008/medusa_i2v_adapter.git"
+# Identifiants de clone GitLab injectes via variables d'env (a passer dans l'env SSH du pod).
+# Ne JAMAIS hardcoder le token. Cf. scripts/.env.example
+GITLAB_DEPLOY_USER="${GITLAB_DEPLOY_USER:?GITLAB_DEPLOY_USER non definie}"
+GITLAB_REPO="${GITLAB_REPO:-medusa7293008/medusa_i2v_adapter}"
+REPO_URL="https://${GITLAB_DEPLOY_USER}:${GITLAB_DEPLOY_TOKEN:?GITLAB_DEPLOY_TOKEN non definie}@gitlab.com/${GITLAB_REPO}.git"
 LTX_COMMIT="9e8a28e17ac4dd9e49695223d50753a1ebda36fe"
 APP_DIR="/root/medusa_i2v_adapter"
 LTX_DIR="/tmp/LTX-2"
